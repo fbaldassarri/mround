@@ -1,0 +1,70 @@
+# Copyright 2026 The MRound Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Development environment for MRound.
+#
+#   conda env create -f environment.yml
+#   conda activate mround-dev
+#   pre-commit install
+#
+# To update after changing dependencies:
+#
+#   conda env update -f environment.yml --prune
+#
+# If you would rather manage the environment yourself, the file is not required.
+# Any native arm64 Python 3.11 or later works, and the only step that matters is
+# installing the project into it:
+#
+#   conda create -n <name> python=3.11 && conda activate <name>
+#   pip install -e '.[dev]'
+#
+# Creating an environment with `conda create` alone is the one trap: it never
+# runs the pip section below, so numpy, pytest, and the package itself are all
+# absent and every subsequent command fails for the same single reason.
+#
+# Why conda supplies only the interpreter
+# ---------------------------------------
+# Every MRound dependency installs cleanly from PyPI, and MLX has no conda
+# package at all. Taking NumPy from conda-forge while taking MLX from pip is the
+# classic way to end up with two NumPy builds and an ABI mismatch that surfaces
+# as an unrelated-looking crash. So conda provides Python and pip, and pip
+# provides everything else. That keeps one source of truth for the numerical
+# stack.
+#
+# Why conda at all
+# ----------------
+# MLX requires a NATIVE arm64 Python. A Python running under Rosetta cannot
+# install it, and the failure is confusing rather than explicit. MLX's own
+# installation guide recommends conda for exactly this reason. Verify with:
+#
+#   python -c "import platform; print(platform.processor())"
+#
+# That must print `arm`. If it prints `i386` on an M-series Mac, the environment
+# is emulated and MLX will not work. `pytest tests/unit` enforces this check on
+# macOS so it fails loudly rather than mysteriously.
+
+name: mround-dev
+
+channels:
+  - conda-forge
+
+dependencies:
+  # 3.11 matches the primary continuous integration target, so local runs and
+  # CI agree on the canonical path. 3.12 and 3.13 also work; the package
+  # requires >= 3.11 and MLX requires a native >= 3.10.
+  - python=3.11
+  - pip
+
+  - pip:
+      # The project itself, editable, with the development tools.
+      - -e .[dev]
+
+      # MLX and mlx-lm arrive through the project's own dependencies and the
+      # `models` extra above: mlx is a runtime dependency in pyproject.toml, so
+      # `-e .[dev]` installs it on every platform that has a wheel (macOS arm64
+      # and Linux x86_64 both do). Nothing here needs uncommenting.
+
+      # Uncomment to generate the reference parity corpus. This pulls in
+      # PyTorch and Intel AutoRound, which are development-time tools only and
+      # must never become runtime dependencies of the quantizer.
+      # - -e .[parity]

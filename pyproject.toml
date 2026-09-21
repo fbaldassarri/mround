@@ -1,0 +1,230 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mround"
+description = "Weight-only quantization for large language models, built for Apple Silicon"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE.md", "NOTICE"]
+requires-python = ">=3.11"
+dynamic = ["version"]
+authors = [{ name = "The MRound Authors" }]
+keywords = [
+    "quantization",
+    "llm",
+    "apple-silicon",
+    "mlx",
+    "metal",
+    "signround",
+    "weight-only-quantization",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+# Runtime dependencies are the numerical core and nothing else. Model loading
+# needs a much heavier stack (transformers pulls in a great deal), and the unit
+# suite never imports it: `mround/pipeline/loader.py` imports mlx-lm lazily, at
+# call time, so `api.quantize` needs the `models` extra while the mathematics
+# and the tests do not. Declaring the stack here would mean waiting on a large
+# download to run a test suite that never touches it.
+dependencies = [
+    "mlx>=0.32",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# Model loading and checkpoint IO. Required by `mround/pipeline/` and the export
+# paths once those exist; not needed to run the quantization mathematics.
+models = [
+    "mlx-lm>=0.31",
+    "safetensors>=0.4.3",
+    "huggingface-hub>=0.24",
+    "transformers>=4.44",
+    # Calibration, not evaluation: `api.quantize` builds its corpus from a named
+    # dataset unless it is handed a local text file, so quantizing with the
+    # default `calibration="auto"` needs this. It is in the `eval` extra as well
+    # because the perplexity harness reads its corpora the same way.
+    "datasets>=2.20",
+]
+# Generating the parity corpus requires the reference implementation's stack.
+# This is a development-time extra and must never become a runtime dependency.
+# See MEMORY.md D-002.
+parity = ["torch>=2.4", "auto-round>=0.14"]
+eval = ["datasets>=2.20", "lm-eval>=0.4.3"]
+dev = [
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pre-commit>=3.8",
+    "hatchling>=1.24",
+]
+
+[project.urls]
+Homepage = "https://github.com/fbaldassarri/mround"
+Documentation = "https://github.com/fbaldassarri/mround/blob/main/DOCUMENTATION.md"
+Changelog = "https://github.com/fbaldassarri/mround/blob/main/CHANGELOG.md"
+Issues = "https://github.com/fbaldassarri/mround/issues"
+
+[project.scripts]
+mround = "mround.cli.main:main"
+
+[tool.hatch.version]
+path = "mround/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mround"]
+
+[tool.hatch.build.targets.sdist]
+# The vendored reference implementation is a development-time parity oracle.
+# It is never shipped.
+exclude = [
+    "/auto-round-*",
+    "/tests/fixtures",
+    "/.github",
+]
+
+# ---------------------------------------------------------------------------
+# Ruff: linting and formatting
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# The vendored reference tree is read-only and is not ours to lint. github/ is
+# the generated public tree: linting a build output duplicates every finding,
+# and `ruff format .` would rewrite a tree that the next export overwrites.
+extend-exclude = ["auto-round-*", "github"]
+
+[tool.ruff.lint]
+select = [
+    "A",    # shadowing builtins
+    "ARG",  # unused arguments
+    "B",    # bugbear
+    "C4",   # comprehensions
+    "D",    # pydocstyle
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # import sorting
+    "N",    # pep8 naming
+    "NPY",  # numpy-specific rules
+    "PL",   # pylint
+    "PT",   # pytest style
+    "PTH",  # use pathlib
+    "RET",  # return statements
+    "RUF",  # ruff-specific
+    "SIM",  # simplify
+    "TID",  # tidy imports
+    "UP",   # pyupgrade
+    "W",    # pycodestyle warnings
+]
+ignore = [
+    "D107",    # __init__ docstring: covered by the class docstring
+    "D203",    # incompatible with D211
+    "D213",    # incompatible with D212
+    "PLR0913", # quantization entry points legitimately take many parameters
+    "PLR0917", # the same judgement, for the positional form of that rule
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests document themselves through their names; assert is the point.
+"tests/**" = ["D100", "D101", "D102", "D103", "D104", "PLR2004"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# ---------------------------------------------------------------------------
+# Mypy: type checking
+# ---------------------------------------------------------------------------
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+warn_no_return = true
+disallow_any_generics = true
+exclude = ["auto-round-.*"]
+
+[[tool.mypy.overrides]]
+# These ship no type information, or none that is complete enough to be useful.
+# Two settings, because they cover different situations and the gate must
+# behave identically in both. `ignore_missing_imports` applies on a machine
+# where the package is absent (the framework-free CI path). `follow_imports =
+# "skip"` applies where it is installed: newer MLX releases ship partial type
+# information whose star re-exports strict mypy refuses to follow
+# (`nn.Module` unresolvable) and whose stubs can disagree with runtime
+# (mlx_lm's `load` really does return a third value with `return_config`), so
+# following them makes the gate's verdict depend on which MLX happens to be
+# installed. MRound's stance is that the framework boundary is dynamically
+# typed and MRound's own code is strict; this encodes it. The bare names sit
+# beside the dotted patterns because `mlx.*` does not match `mlx` itself, and
+# `follow_imports_for_stubs` must accompany the skip because `follow_imports`
+# alone does not apply to stub files, which is exactly what mlx.core ships.
+# Verified empirically: without it, skip leaves `mx.array` fully typed.
+module = [
+    "mlx",
+    "mlx.*",
+    "mlx_lm",
+    "mlx_lm.*",
+    "transformers.*",
+    "safetensors.*",
+    "datasets.*",
+    "lm_eval.*",
+    "auto_round.*",
+    "torch",
+    "torch.*",
+]
+ignore_missing_imports = true
+follow_imports = "skip"
+follow_imports_for_stubs = true
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "-ra",
+]
+markers = [
+    "parity: compares against the dumped reference corpus; requires fixtures",
+    "integration: runs an end-to-end quantization; slow",
+    "slow: takes more than a few seconds",
+    "needs_mlx: requires a working MLX installation on Apple Silicon",
+]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["mround"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "@overload",
+]

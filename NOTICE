@@ -1,0 +1,81 @@
+MRound
+Copyright 2026 The MRound Authors
+
+This product includes software developed by the MRound Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this file except in compliance with the License. You may obtain a copy of
+the License at http://www.apache.org/licenses/LICENSE-2.0
+
+
+------------------------------------------------------------------------------
+ATTRIBUTION AND PROVENANCE
+------------------------------------------------------------------------------
+
+MRound is an independent reimplementation of the SignRound and SignRound v2
+weight-only quantization methods, written for Apple Silicon from the published
+descriptions of those methods. It is not a fork of, and contains no source code
+copied from, any prior implementation.
+
+MRound implements methods described in the following publications:
+
+1. Cheng, W., Zhang, W., Shen, H., Cai, Y., He, X., Lv, K., Liu, Y.
+   "Optimize Weight Rounding via Signed Gradient Descent for the Quantization
+   of LLMs." arXiv:2309.05516. Published at EMNLP 2024 (Findings).
+   https://arxiv.org/abs/2309.05516
+
+2. Cheng, W., Zhang, W., Guo, H., Shen, H., Ma, Z.
+   "SignRoundV2: Toward Closing the Performance Gap in Extremely Low-Bit
+   Post-Training Quantization for LLMs." arXiv:2512.04746.
+   https://arxiv.org/abs/2512.04746
+
+The reference implementation of these methods is Intel AutoRound
+(https://github.com/intel/auto-round), Copyright Intel Corporation, licensed
+under the Apache License, Version 2.0.
+
+MRound uses Intel AutoRound as a behavioral reference and numerical parity
+oracle during development and testing. Where MRound must interoperate with
+formats that AutoRound defines or consumes, MRound implements those formats from
+their observable on-disk structure and copies no source code from any
+implementation of them.
+
+Any file in this repository that does incorporate code from a third-party
+Apache-2.0 project carries, in its own header, the original copyright line, the
+upstream project name, and a statement of what was changed, as required by
+Section 4 of the License. The authoritative list of such files is maintained in
+THIRD_PARTY_ATTRIBUTIONS.md. If that file is absent or empty, no third-party
+code is present in this repository.
+
+
+------------------------------------------------------------------------------
+TRADEMARKS
+------------------------------------------------------------------------------
+
+Apple, Apple Silicon, Mac, macOS, Metal, Core ML, and Neural Engine are
+trademarks of Apple Inc. Intel is a trademark of Intel Corporation. Use of
+these names is descriptive and does not imply endorsement, sponsorship, or
+affiliation. MRound is not affiliated with, endorsed by, or sponsored by Apple
+Inc. or Intel Corporation.
+
+
+------------------------------------------------------------------------------
+RUNTIME DEPENDENCIES
+------------------------------------------------------------------------------
+
+MRound depends on, but does not redistribute, the following projects. Their
+licenses govern their own use.
+
+  Runtime (pyproject.toml `dependencies`):
+  MLX                    MIT License          Apple Inc.
+  NumPy                  BSD 3-Clause         NumPy Developers
+
+  Model loading and checkpoint IO (the `models` extra, needed by
+  `api.quantize` and the examples, not by the mathematics or the unit suite):
+  mlx-lm                 MIT License          Apple Inc.
+  Hugging Face           Apache License 2.0   Hugging Face, Inc.
+    transformers
+  huggingface-hub        Apache License 2.0   Hugging Face, Inc.
+  safetensors            Apache License 2.0   Hugging Face, Inc.
+
+pyproject.toml is the authoritative dependency set and this list is a summary
+refreshed whenever dependencies change.

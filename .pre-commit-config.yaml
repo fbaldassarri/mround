@@ -1,0 +1,46 @@
+# Copyright 2026 The MRound Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Install with: pre-commit install
+#
+# The vendored reference implementation is excluded everywhere. It is a
+# development-time parity oracle, read-only, and not ours to reformat.
+
+exclude: '^auto-round-.*/'
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=512]
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: trailing-whitespace
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.2
+    hooks:
+      - id: mypy
+        files: ^(mround|tests|scripts|ubuntu-24\.04)/
+        additional_dependencies: [pytest]
+
+  - repo: local
+    hooks:
+      - id: module-layout
+        name: package tree matches DOCUMENTATION.md section 4
+        entry: python scripts/check_module_layout.py
+        language: system
+        pass_filenames: false
+        files: ^(mround/.*\.py|DOCUMENTATION\.md)$
