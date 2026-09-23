@@ -6,6 +6,66 @@ Notable changes to MRound, newest first. The format follows
 caveat that public interfaces may change between pre-release versions without a
 major bump. Each version is dated by its release tag.
 
+## 0.1.0a2
+
+A corrections release, one day after the first. A full audit of the repository
+found statements in the published documents that the ledger contradicted and
+one default the project had already decided against. No measurement changed;
+every figure in RESULTS.md is the same ledger row it was.
+
+### Corrected
+
+RESULTS.md said the reference implementation's arms were produced on a Linux
+machine. For three of the rows it cites, rows 29, 30 and 35, they were produced
+on the Mac's own CPU, as the ledger's `cost.reference_host` recorded. The
+document now says which rows ran where. It also described wall clock ratios it
+never printed; it now states that no cost ratio is reported, and why.
+
+The mixed precision example in README.md and GETTING-STARTED.md named
+`mlx-community/Qwen2.5-0.5B-Instruct`, a repository no measurement used. It
+now names `Qwen/Qwen2.5-0.5B-Instruct`, the model every result was produced
+with.
+
+`mround.api.plan_mixed_precision` hard coded the searched scale initialization
+where `quantize` resolves it from the narrowest width a run can assign, so an
+asymmetric plan raised an error about a search nobody asked for. Both entry
+points now default to `None` and resolve the same way. The command line's
+preview of that resolution includes the remainder width, and `--iters` defers
+to the standard recipe as the other recipe flags always did.
+
+### Changed
+
+`TuningResult.losses` from the layer level `tune_layer`, in both the NumPy
+reference and the MLX implementation, has one entry per step: the initial loss
+was measured once before the loop and again at step zero, and the duplicate is
+gone. `initial_loss` is `losses[0]`. Parameters, best step and every loss value
+are bit identical to 0.1.0a1, verified on 48 layers across four widths and two
+step budgets.
+
+DOCUMENTATION.md fixes three conventions the code already followed and the
+specification did not state: which parameters a layer keeps and why the final
+update is never scored (5.4), the floor of at least one excluded element in the
+outlier suppressed loss (5.5), and the candidate grid, anchor and tie rules of
+the searched scale initialization (5.10). Each follows the reference
+implementation where the published method is silent and is named as such.
+
+### Tests
+
+Eight tests added and several tightened. The projection bound on the rounding
+perturbation is checked at loop level in both implementations and fails when
+the projection is removed. The rule that no residual is formed by subtracting
+two matrix products is enforced structurally on the numerical layers. The
+license header, status marker and no torch checks parse rather than grep, and
+the header check covers every authored directory. A Mac without MLX fails a
+test instead of skipping the MLX suite. The learning rate excursion tests
+assert the exact closed form.
+
+### Infrastructure
+
+Continuous integration and pre-commit pin ruff 0.16.2 and mypy 2.3.0, the
+versions the maintainer's gate runs; pre-commit's mypy hook now covers
+`examples/` as the gate always did.
+
 ## 0.1.0a1
 
 The first public release. Everything below is new, so this entry describes the
