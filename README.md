@@ -81,7 +81,7 @@ Mixed precision, choosing a width per layer from a menu under an exact size
 budget:
 
 ```bash
-mround quantize mlx-community/Qwen2.5-0.5B-Instruct -o ./qwen-mixed \
+mround quantize Qwen/Qwen2.5-0.5B-Instruct -o ./qwen-mixed \
     --average-bits 2.5 --options 2,3,4
 ```
 
@@ -91,7 +91,7 @@ The same thing from Python:
 from mround import api
 
 result = api.quantize(
-    "mlx-community/Qwen2.5-0.5B-Instruct",
+    "Qwen/Qwen2.5-0.5B-Instruct",
     output="./qwen-mixed",
     average_bits=2.5,
 )

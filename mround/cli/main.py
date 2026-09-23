@@ -115,8 +115,8 @@ def build_parser() -> argparse.ArgumentParser:
     quantize.add_argument(
         "--iters",
         type=int,
-        default=200,
-        help="Optimization steps per block (default: 200).",
+        default=None,
+        help="Optimization steps per block (default: the standard recipe's 200).",
     )
     quantize.add_argument(
         "--samples",
@@ -375,7 +375,7 @@ def _tuning(args: argparse.Namespace) -> Any:
 
     standard = TuningConfig()
     return TuningConfig(
-        iters=args.iters,
+        iters=standard.iters if args.iters is None else args.iters,
         n_samples=standard.n_samples if args.samples is None else args.samples,
         seq_len=standard.seq_len if args.seq_len is None else args.seq_len,
         batch_size=standard.batch_size if args.batch_size is None else args.batch_size,
@@ -398,7 +398,15 @@ def _describe_request(args: argparse.Namespace, candidates: tuple[int, ...]) -> 
     from mround.schemes import ScaleInit, Symmetry, TuningConfig  # noqa: PLC0415
 
     mixed = args.average_bits is not None
-    narrowest = min(candidates) if mixed else args.bits
+    # The same widths ``api.quantize`` resolves against: the base width, every
+    # candidate, and the remainder width when one was asked for, since the
+    # remainder tensors take that width and one initialization covers them all.
+    widths = {args.bits}
+    if mixed:
+        widths.update(candidates)
+        if args.remainder_bits is not None:
+            widths.add(int(args.remainder_bits))
+    narrowest = min(widths)
     width = (
         f"an average of {args.average_bits:g} bits over {list(candidates)}"
         if mixed
@@ -408,6 +416,7 @@ def _describe_request(args: argparse.Namespace, candidates: tuple[int, ...]) -> 
     start = default_scale_init(narrowest, symmetry)
     scale = "searched per group" if start is ScaleInit.SEARCHED else "from the observed range"
     standard = TuningConfig()
+    steps = standard.iters if args.iters is None else args.iters
     samples = standard.n_samples if args.samples is None else args.samples
     sequence = standard.seq_len if args.seq_len is None else args.seq_len
     batch = standard.batch_size if args.batch_size is None else args.batch_size
@@ -418,7 +427,7 @@ def _describe_request(args: argparse.Namespace, candidates: tuple[int, ...]) -> 
         f"  {'scheme':<{_LABEL}}{width}, {group}, {symmetry.value}, scale {scale}",
         f"  {'calibration':<{_LABEL}}{args.calibration}, {samples} sequences of "
         f"{sequence} tokens, batches of {batch}",
-        f"  {'tuning':<{_LABEL}}{args.iters} steps per block",
+        f"  {'tuning':<{_LABEL}}{steps} steps per block",
         f"  {'writing to':<{_LABEL}}{args.output_dir}",
         "",
     ]

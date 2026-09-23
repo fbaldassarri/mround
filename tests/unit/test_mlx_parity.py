@@ -26,6 +26,8 @@ rather than inherited from whichever framework got there first (D-013).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import numpy as np
 import pytest
 
@@ -425,7 +427,8 @@ class TestOptimizer:
     def test_excursion_budget_matches(self, iters: int) -> None:
         config = TuningConfig(iters=iters)
         lr = config.resolved_lr(4)
-        assert mlx_sgd.total_excursion(lr, iters) == pytest.approx(ref_quant.V_BOUND, abs=0.01)
+        expected = ref_quant.V_BOUND * (1 + 1 / iters)
+        assert mlx_sgd.total_excursion(lr, iters) == pytest.approx(expected, rel=1e-9)
 
     def test_schedule_reaches_zero(self) -> None:
         schedule = mlx_sgd.LinearDecay(0.005, 200)
@@ -519,6 +522,32 @@ class TestTuning:
             f"{expected.final_loss:.4e}; more than 25 percent apart suggests a "
             "defect rather than float32 drift"
         )
+
+    def test_the_loop_projects_after_every_update(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Same mechanism test as the reference's: the bounded test below reads
+        # the best step, which a dropped projection would usually leave inside
+        # the bound. Pin that the MLX loop projects once per update and that
+        # every projected parameter set is in range.
+        seen: list[float] = []
+
+        def spy(params: Mapping[str, mx.array], scheme: QuantScheme) -> mlx_quant.Params:
+            projected = mlx_quant.project_params(params, scheme)
+            mx.eval(*projected.values())
+            lo, hi = scheme.coefficient_bounds
+            assert float(mx.abs(projected["v"]).max()) <= mlx_quant.V_BOUND + 1e-6
+            assert float(projected["alpha"].min()) >= lo - 1e-6
+            assert float(projected["alpha"].max()) <= hi + 1e-6
+            assert float(projected["beta"].min()) >= lo - 1e-6
+            assert float(projected["beta"].max()) <= hi + 1e-6
+            seen.append(float(mx.abs(projected["v"]).max()))
+            return projected
+
+        monkeypatch.setattr("mround.core.tuning.project_params", spy)
+        weight, activations = synthetic(seed=700)
+        scheme = QuantScheme(bits=2, group_size=32)
+        mlx_tuning.tune_layer(to_mx(weight), to_mx(activations), scheme, TuningConfig(iters=4))
+        assert len(seen) == 4
+        assert max(seen) == pytest.approx(mlx_quant.V_BOUND, abs=1e-6)
 
     def test_parameters_stay_bounded(self) -> None:
         weight, activations = synthetic(seed=700)

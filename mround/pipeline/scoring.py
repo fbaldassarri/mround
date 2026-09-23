@@ -310,8 +310,11 @@ def score_widths(
         gradient_source: Where the gradients that multiply each width's
             perturbation come from. ``"own_width"`` is the reference's
             procedure: each width gets its own backward on the model quantized
-            at that width. ``"widest"`` takes one backward per batch at the
-            widest candidate and scores every width's perturbation against it,
+            at that width. It is this function's default so that a bare call
+            measures the control; the entry points in :mod:`mround.api` pass
+            ``"widest"``, the measured default (MEMORY.md D-035). ``"widest"``
+            takes one backward per batch at the widest candidate and scores
+            every width's perturbation against it,
             targeting the mechanism the first measured allocation exposed
             (MEMORY.md D-033): gradients taken through a network the lowest
             width has largely destroyed discriminate poorly and starve the

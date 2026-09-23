@@ -29,9 +29,11 @@ signature changed from the stub it replaced, which imagined the planner
 receiving whole gradient dictionaries.
 
 Where the gradients come from is the pipeline's business, specified in
-DOCUMENTATION.md section 1.5: one causal-LM backward per candidate width, on
-the model round-to-nearest quantized at that width, which is the reference
-implementation's procedure. Scores from different calibration passes are not
+DOCUMENTATION.md section 1.5: by default one causal-LM backward per batch at
+the widest candidate width, scoring every width's perturbation against it
+(MEMORY.md D-035), with the reference implementation's procedure, one backward
+per width on the model round-to-nearest quantized at that width, kept as the
+``own_width`` control. Scores from different calibration passes are not
 comparable, and nothing here can detect that mistake.
 
 Specification: DOCUMENTATION.md section 1.5.

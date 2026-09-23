@@ -420,13 +420,13 @@ def quantize(
             less than this share of the block stack. Zero permits any coverage,
             for the caller who really does want a mostly dense checkpoint.
         scoring_samples: Sequences drawn for the mixed precision scoring pass,
-            or ``None`` for the reference's 16. Ignored without
+            or ``None`` for ``SENSITIVITY_SAMPLES``. Ignored without
             ``average_bits``.
-        scoring_seq_len: Tokens per scoring sequence, or ``None`` for the
-            reference's 256. Ignored without ``average_bits``. Both defaults
-            came from the reference (D-031), and the reference now warns that
-            they are too small below 3 bits, so they are exposed to be
-            measured rather than inherited.
+        scoring_seq_len: Tokens per scoring sequence, or ``None`` for
+            ``SENSITIVITY_SEQ_LEN``. Ignored without ``average_bits``. Both
+            defaults are the budget every published measurement used, not the
+            reference's own 16 by 256, which they were until D-031 measured
+            the difference at 4.70 percent.
         scoring_batch_size: Sequences per scoring batch, or ``None`` to derive
             it from the budget at a fixed token count per batch. Overriding it
             is for reproducing a measurement taken before that derivation
@@ -761,7 +761,7 @@ def plan_mixed_precision(
     bits: int = 4,
     group_size: int = 64,
     symmetry: Symmetry | str = Symmetry.SYMMETRIC,
-    scale_init: ScaleInit | str = ScaleInit.SEARCHED,
+    scale_init: ScaleInit | str | None = None,
     scheme: QuantScheme | None = None,
     calibration: str = "auto",
     sensitivity_gradients: str = "widest",
@@ -790,7 +790,10 @@ def plan_mixed_precision(
             candidates share; the allocator overrides the width itself.
         group_size: Weights sharing one scale.
         symmetry: Signed or unsigned code range.
-        scale_init: How each group's scale starts.
+        scale_init: How each group's scale starts. ``None``, the default,
+            resolves it from the narrowest width the plan can assign, exactly
+            as :func:`quantize` does (D-046), so a plan and the run it
+            predicts score the same grid.
         scheme: A complete scheme, overriding the four fields above.
         calibration: Corpus identifier, or ``"auto"`` for the project default.
         sensitivity_gradients: ``"widest"`` or ``"own_width"``; see
@@ -822,11 +825,21 @@ def plan_mixed_precision(
     from mround.pipeline.device import reset_peak_memory  # noqa: PLC0415
     from mround.pipeline.loader import load_model  # noqa: PLC0415
 
+    # The same resolution as ``quantize``: one scale initialization covers
+    # every layer, so it keys on the narrowest width the plan can assign.
+    widths = {scheme.bits if scheme is not None else bits}
+    widths.update(int(width) for width in candidate_bits)
+    if remainder_bits is not None:
+        widths.add(int(remainder_bits))
     resolved = scheme or QuantScheme(
         bits=bits,
         group_size=group_size,
         symmetry=Symmetry(symmetry),
-        scale_init=ScaleInit(scale_init),
+        scale_init=(
+            default_scale_init(min(widths), Symmetry(symmetry))
+            if scale_init is None
+            else ScaleInit(scale_init)
+        ),
     )
     reset_peak_memory()
     bundle = load_model(model)
@@ -966,22 +979,25 @@ def _plan_mixed(
 ) -> tuple[dict[str, QuantScheme], dict[str, Any]]:
     """Score, allocate, and return per-layer schemes plus what was decided.
 
-    The procedure is DOCUMENTATION.md 1.5's: one causal-LM backward per
-    candidate width on its own small calibration draw, the cancellation-free
-    DeltaLoss per layer, and the exact allocator under the budget the average
-    implies. The scoring draw comes from the same corpus and seed as the main
-    calibration, at the reference's scoring size, so the plan's identity is
+    The procedure is DOCUMENTATION.md 1.5's: by default one causal-LM backward
+    per batch at the widest candidate, scoring every width's perturbation
+    against it (D-035; the reference's own-width backward stays available as
+    the control), the cancellation-free DeltaLoss per layer, and the exact
+    allocator under the budget the average implies. The scoring draw comes from
+    the same corpus and seed as the main calibration, so the plan's identity is
     fixed by the run configuration alone.
 
-    **The scoring size is now an argument rather than a constant**, because the
-    reference has started warning that its own default is too small: "2-bit
-    scheme(s) detected. For better results, consider nsamples>=128 and
-    seqlen>=1024 (current: nsamples=16, seqlen=256)". Those current values are
-    where D-031 took MRound's from, so every mixed measurement in this project,
-    D-034 and D-035 included, was made on a budget the reference now calls
-    inadequate at the widths that matter most. Scoring cost is linear in the
-    product, so the recommended budget is thirty two times the work of the
-    default: on a 0.5B model, an hour and a half rather than three minutes.
+    **The scoring size is an argument, and its default is the measured one.**
+    D-031 first took the reference's own 16 sequences of 256 tokens; the
+    reference then began warning that this is too small once a 2 bit option is
+    on the menu ("consider nsamples>=128 and seqlen>=1024"), and D-031 amended
+    measured the difference at 4.70 percent on the same model, seed and
+    reference checkpoint (ledger rows 32 and 38). The defaults are therefore
+    ``SENSITIVITY_SAMPLES`` and ``SENSITIVITY_SEQ_LEN``, 128 by 1024, which is
+    what every published mixed row from row 38 onwards used. Scoring cost is
+    linear in the product, so the budget is thirty two times the work of the
+    reference's default: with the token constant batch below it is 6 to 10
+    percent of a run rather than the 41 percent the fixed batch cost.
 
     **The batch size follows from the budget rather than standing still.** It
     was a hard coded 8, which at 256 tokens is 2048 tokens per batch and at

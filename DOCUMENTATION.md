@@ -187,8 +187,10 @@ The reference procedure remains available as the ``own_width`` control, where
 the gradient is evaluated at each width's own quantized operating point. In
 either mode the loss is the mean shifted
 causal cross-entropy, labels being the inputs themselves, on a small
-calibration draw whose defaults (16 sequences of 256 tokens) are the
-reference's; `quantize` and `plan_mixed_precision` take the draw as
+calibration draw whose defaults are 128 sequences of 1024 tokens, the budget
+every published mixed measurement used (D-031 amended; the reference's own 16
+by 256 was the default until that budget measured 4.70 percent better on the
+same model and seed); `quantize` and `plan_mixed_precision` take the draw as
 `scoring_samples` and `scoring_seq_len`, and the reference now warns that its
 own former default is too small once a 2 bit option is on the menu, so the
 published mixed 2.5 head to heads were scored at 128 by 1024 on both sides.
@@ -625,12 +627,16 @@ planner assigned; every published mixed run was produced that way and the
 choice is recorded as D-043 rather than changed under them.
 
 Default step budget: 200 iterations per block, batch size 8, sequence length
-2048, 128 calibration samples; group size 64 in every measured run and in
-`quantize_round_to_nearest` and `plan_mixed_precision`, while `QuantScheme`
-and `quantize` still default to 128 (pass it explicitly; unifying the default
-is an open decision). The reference's own higher-quality recipe uses 1000
-iterations and 512 samples; MEMORY.md D-028 measured five times the steps on
-a fixed corpus as harmful, and that recipe has not been measured here.
+2048, 128 calibration samples; group size 64 everywhere, in every measured
+run and in `QuantScheme`, `quantize`, `quantize_round_to_nearest`,
+`plan_mixed_precision` and the command line, a default settled on generality
+rather than quality (MEMORY.md, 2026-09-20: every dimension divisible by 128 is
+divisible by 64 and the converse fails, so 128 leaves most of SmolLM2 dense).
+The reference's own higher-quality recipe, 1000 iterations over 512 samples,
+has been measured on both sides at mixed 2.5 on Qwen2.5-0.5B (ledger row 48):
+MRound 22.3231 against the reference's 25.8199, a margin that narrows from
+19.22 to 13.54 percent and holds, while MEMORY.md D-028 records that five
+times the steps on a fixed small corpus is harmful.
 
 ### 5.5 Outlier-suppressed loss
 

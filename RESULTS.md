@@ -28,6 +28,14 @@ original. One evaluator scores all of them in one process. A perplexity is only
 comparable to another perplexity measured the same way, which is why the
 original is reported next to every result rather than assumed.
 
+One wrinkle in the ledger is worth naming, since anyone checking these numbers
+against it will find it. Rows before 45 record that window as 65,536, which was
+the count requested rather than the count scored; from row 45 the rows carry
+both, `requested_tokens` and `tokens`. The evaluation itself never changed, and
+the rows on either side of that boundary prove it: they report the same model's
+original perplexity as the same fifteen significant figures, which two different
+token counts could not produce.
+
 **Both sides quantize the same tensors.** The reference leaves the language
 model head at full precision. On a model that ties its embedding to its head,
 matching that is the only way to compare like with like, so MRound is told to
@@ -43,11 +51,16 @@ bytes. MRound's checkpoints run 2.4 to 4.9 percent larger than the reference's
 at the same nominal width, because it stores its scales differently, and that
 difference is stated in every table below rather than left out.
 
-**Cost is the weakest number here and is labelled as such.** MRound runs on the
-Apple GPU through MLX; the reference has no Metal path, so it runs on a Linux
-CPU. Every wall clock ratio below therefore compares two machines as much as two
-implementations. It is reported because it is what a user experiences, not
-because it isolates anything.
+**Cost is the weakest number here and is not reported as a ratio.** MRound
+runs on the Apple GPU through MLX; the reference has no Metal path, so its arms
+ran on a CPU, on the Linux machine for most rows and on the Mac's own CPU for
+rows 29, 30 and 35, and every row records which under `cost.reference_host`. A
+wall clock ratio between a GPU and a CPU compares two devices as much as two
+implementations, and one between two machines compares those as well, so no
+table below carries one. The one pair with both arms on the same machine, 4 bit
+Qwen2.5-0.5B-Instruct, is 3,495.7 s for MRound on Metal against 6,718.3 s for
+the reference on the Mac's CPU (row 44), and even that compares a GPU with a
+CPU.
 
 ## Uniform 4 bits
 
@@ -159,7 +172,8 @@ corpus, scored by perplexity alone. No zero shot task suite has been run. The
 largest model measured is Qwen2.5-1.5B and it shows the smallest margin, so
 nothing here should be read as a claim about what happens at seven billion.
 
-Cost ratios compare an Apple GPU against a Linux CPU, as above.
+Cost is not reported, as above: every available comparison crosses a device or
+a machine.
 
 Perplexity is a proxy. It is the standard one in this literature and it is what
 makes these results comparable to published work, but a model that scores well
@@ -170,8 +184,10 @@ on it can still be worse in ways a user notices.
 Every row names its model, scheme, calibration seed and recipe, and every run
 writes a configuration file beside its checkpoint that reproduces it. The
 reference arms were produced with Intel AutoRound at the version the row's notes
-name, on a Linux machine whose package inventory is recorded in
-`benchmarks/environments/` under the hash the row cites. The scoring harness
+name, on the Linux machine for most rows and on the Mac's own CPU for rows 29,
+30 and 35; each row's `cost.reference_host` says which, and the producing
+machine's package inventory is recorded in `benchmarks/environments/` under the
+hash the row's notes cite. The scoring harness
 that produced the comparisons is not part of this repository, because it drives
 the reference implementation; what is here is enough to reproduce MRound's side
 and to score any two checkpoints against each other.

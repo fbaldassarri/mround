@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import importlib.util
 import json
 import pkgutil
 import platform
@@ -34,9 +35,47 @@ def _module_names() -> list[str]:
     ]
 
 
+# Every directory whose Python this repository authors, as glob patterns so the
+# Linux machine's folder is found without its name appearing here (the public
+# export forbids that name in the tree it builds). The vendored reference trees
+# and the generated public tree are not listed: the first is not ours to edit
+# and the second is a build output of files already checked here.
+AUTHORED_DIRECTORY_PATTERNS = (
+    "mround",
+    "tests",
+    "scripts",
+    "examples",
+    "paper",
+    "analysis",
+    "ubuntu-*",
+)
+
+# The directories that exist in every checkout, private or published.
+ALWAYS_AUTHORED = ("mround", "tests", "scripts", "examples")
+
+HEADER = ("# Copyright 2026 The MRound Authors", "# SPDX-License-Identifier: Apache-2.0")
+
+
+def _authored_directories() -> list[Path]:
+    """The authored directories present in this checkout."""
+    return sorted(
+        {
+            path
+            for pattern in AUTHORED_DIRECTORY_PATTERNS
+            for path in REPO_ROOT.glob(pattern)
+            if path.is_dir()
+        }
+    )
+
+
 def _source_files() -> list[Path]:
-    """Every Python source file in the package and the test suite."""
-    return sorted([*PACKAGE_ROOT.rglob("*.py"), *(REPO_ROOT / "tests").rglob("*.py")])
+    """Every Python source file this repository authors."""
+    return sorted(
+        path
+        for directory in _authored_directories()
+        for path in directory.rglob("*.py")
+        if "__pycache__" not in path.parts
+    )
 
 
 # The layers that must run on a machine with no MLX at all. Directories and
@@ -74,7 +113,16 @@ def _declares_unfinished(path: Path) -> bool:
     below, so a separate test checks it against which modules actually raise.
     """
     docstring = ast.get_docstring(ast.parse(path.read_text())) or ""
-    return "Status:" in docstring
+    status = [line for line in docstring.splitlines() if line.startswith("Status:")]
+    if not status:
+        return False
+    # A marker that does not say so is not an admission. The earlier version
+    # granted the exemption for any ``Status:`` line at all, so a module saying
+    # ``Status: fully implemented`` while still raising would have passed.
+    assert all("not implemented" in line.lower() for line in status), (
+        f"{path.name}: a Status line must say what is not implemented: {status}"
+    )
+    return True
 
 
 def _raises_not_implemented(path: Path) -> bool:
@@ -85,6 +133,31 @@ def _raises_not_implemented(path: Path) -> bool:
         and "NotImplementedError" in ast.dump(node.exc)
         for node in ast.walk(ast.parse(path.read_text()))
     )
+
+
+def _imports_package(path: Path, package: str) -> bool:
+    """Whether this module imports ``package`` anywhere, parsed rather than grepped."""
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.Import) and any(
+            alias.name == package or alias.name.startswith(package + ".") for alias in node.names
+        ):
+            return True
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module == package or module.startswith(package + "."):
+                return True
+    return False
+
+
+def _is_matrix_product(node: ast.expr) -> bool:
+    """Whether an expression is ``a @ b`` or a call to a ``matmul``."""
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.MatMult):
+        return True
+    if isinstance(node, ast.Call):
+        function = node.func
+        name = function.attr if isinstance(function, ast.Attribute) else getattr(function, "id", "")
+        return name == "matmul"
+    return False
 
 
 def _imports_mlx_at_runtime(path: Path) -> bool:
@@ -211,12 +284,24 @@ class TestPackage:
 
 class TestLicenseHeaders:
     def test_every_source_file_carries_the_header(self) -> None:
+        # Both lines, in order, as the first two lines of the file: CLAUDE.md
+        # says "exactly this header, before the module docstring", and a check
+        # for the SPDX substring anywhere in the first 400 characters would
+        # have accepted a header buried under a shebang or inside a docstring.
         missing = [
             path.relative_to(REPO_ROOT)
             for path in _source_files()
-            if "SPDX-License-Identifier: Apache-2.0" not in path.read_text()[:400]
+            if tuple(path.read_text().splitlines()[:2]) != HEADER
         ]
-        assert not missing, f"missing SPDX header: {missing}"
+        assert not missing, f"missing or misplaced license header: {missing}"
+
+    def test_the_header_check_covers_every_authored_directory(self) -> None:
+        # The directories every checkout has are found, so a directory renamed
+        # or moved does not quietly leave the check, and the walk reaches
+        # beyond the package itself.
+        found = {path.name for path in _authored_directories()}
+        assert set(ALWAYS_AUTHORED) <= found, found
+        assert len(_source_files()) > len(list(PACKAGE_ROOT.rglob("*.py")))
 
 
 class TestLayering:
@@ -230,11 +315,11 @@ class TestLayering:
         # The planner consumes scores and costs and produces an allocation.
         # Keeping MLX out of its runtime path is what makes it testable
         # without a model. Type-only imports under TYPE_CHECKING are fine.
-        offenders = []
-        for path in (PACKAGE_ROOT / "planner").rglob("*.py"):
-            source = path.read_text()
-            if "import mlx" in source and "TYPE_CHECKING" not in source:
-                offenders.append(path.relative_to(REPO_ROOT))
+        offenders = [
+            path.relative_to(REPO_ROOT)
+            for path in (PACKAGE_ROOT / "planner").rglob("*.py")
+            if _imports_mlx_at_runtime(path)
+        ]
         assert not offenders, f"planner imports MLX at runtime: {offenders}"
 
     def test_allocator_has_no_mlx_reference_at_all(self) -> None:
@@ -276,9 +361,30 @@ class TestLayering:
         offenders = [
             path.relative_to(REPO_ROOT)
             for path in PACKAGE_ROOT.rglob("*.py")
-            if "import torch" in path.read_text()
+            if _imports_package(path, "torch") or _imports_package(path, "auto_round")
         ]
-        assert not offenders, f"package imports torch: {offenders}"
+        assert not offenders, f"package imports torch or auto_round: {offenders}"
+
+    def test_no_residual_is_formed_by_subtracting_two_products(self) -> None:
+        # MEMORY.md D-014: ``mx.matmul`` on float32 loses four orders of
+        # magnitude on Metal, so a small residual is formed by multiplying the
+        # difference of the operands, never by subtracting two large products.
+        # A numerical test cannot pin this, because on the CPU backend both
+        # forms agree to float32 and on Metal the difference sits under the
+        # parity tolerance that D-014 itself set. So the shape of the
+        # expression is what gets checked: no subtraction anywhere in the
+        # numerical layers may have a matrix product as either operand.
+        offenders = []
+        for directory in ("core", "reference"):
+            for path in (PACKAGE_ROOT / directory).rglob("*.py"):
+                for node in ast.walk(ast.parse(path.read_text())):
+                    if (
+                        isinstance(node, ast.BinOp)
+                        and isinstance(node.op, ast.Sub)
+                        and any(_is_matrix_product(side) for side in (node.left, node.right))
+                    ):
+                        offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
+        assert not offenders, f"a residual is formed from two products: {offenders}"
 
 
 class TestEnvironment:
@@ -288,6 +394,22 @@ class TestEnvironment:
     layers are meant to run on any host and continuous integration exercises
     them on Linux.
     """
+
+    @pytest.mark.skipif(
+        sys.platform != "darwin" or platform.machine() != "arm64",
+        reason="Apple Silicon only",
+    )
+    def test_mlx_is_installed_where_it_is_the_gate(self) -> None:
+        # On Apple Silicon a missing MLX must fail, not skip. Every MLX gated
+        # test collapses to a skip when the framework is absent, so without
+        # this check a Mac with a broken environment reports a green suite of
+        # about two hundred skips, which is the one outcome the gate exists to
+        # rule out. Linux without MLX is the framework-free path and is not
+        # gated here.
+        assert importlib.util.find_spec("mlx.core") is not None, (
+            "MLX is not importable on this Mac: the MLX suite has silently "
+            "become skips. Install it with pip install -e '.[dev]'."
+        )
 
     @pytest.mark.skipif(sys.platform != "darwin", reason="macOS only")
     def test_python_is_native_arm64(self) -> None:
@@ -390,7 +512,11 @@ class TestCLI:
         assert "checks" in printed
         ready = "quantization      ready" in printed
         assert code == (0 if ready else 1)
-        assert ("reference layer   ready" in printed) or ("numpy" in printed)
+        # The reference layer needs only numpy, which this suite imports, so on
+        # any machine that runs this test the verdict is ready. The earlier
+        # form of this assertion also accepted the word "numpy", which doctor
+        # prints unconditionally, and so could not fail.
+        assert "reference layer   ready" in printed
 
     def test_doctor_json_carries_the_same_verdict(self, capsys: pytest.CaptureFixture[str]) -> None:
         code = main(["doctor", "--json"])

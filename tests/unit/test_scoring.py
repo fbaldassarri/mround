@@ -60,8 +60,12 @@ class Block(nn.Module):  # type: ignore[misc]
 class Toy(nn.Module):  # type: ignore[misc]
     """Embedding, two discoverable blocks, and a head outside the stack."""
 
-    def __init__(self) -> None:
+    def __init__(self, seed: int = 0) -> None:
         super().__init__()
+        # Seeded: MLX's global key differs per process, and a finite difference
+        # check that failed on an unrepeatable set of weights could never be
+        # reproduced.
+        mx.random.seed(seed)
         self.embedding = nn.Embedding(VOCAB, DIM)
         self.layers = [Block(), Block()]
         self.head = nn.Linear(DIM, VOCAB, bias=False)

@@ -76,8 +76,15 @@ class TestExcursionBudget:
 
     @pytest.mark.parametrize("iters", [50, 200, 500, 1000, 4000])
     def test_budget_is_half_the_constant_regardless_of_step_count(self, iters: int) -> None:
+        # The exact sum of a linear decay from c/T to zero over T steps is
+        # c/2 * (1 + 1/T): half the constant plus one half step, which is why
+        # the budget is "about" half regardless of the step count. Pinned to
+        # the closed form rather than to 0.5 within 0.01, because at T = 50 the
+        # exact value is 0.51 and a tolerance of 0.01 passed only through the
+        # rounding of a naive float sum.
         config = TuningConfig(iters=iters)
-        assert total_excursion(config.resolved_lr(4), iters) == pytest.approx(0.5, abs=0.01)
+        expected = 0.5 * (1 + 1 / iters)
+        assert total_excursion(config.resolved_lr(4), iters) == pytest.approx(expected, rel=1e-9)
 
     @pytest.mark.parametrize("iters", [200, 1000])
     def test_low_bit_widths_get_twice_the_budget(self, iters: int) -> None:
@@ -91,7 +98,9 @@ class TestExcursionBudget:
         # exactly the width of the rounding perturbation's permitted range in
         # one direction. The schedule and the bound are the same statement.
         config = TuningConfig(iters=200)
-        assert total_excursion(config.resolved_lr(4), 200) == pytest.approx(V_BOUND, abs=0.01)
+        excursion = total_excursion(config.resolved_lr(4), 200)
+        assert excursion == pytest.approx(V_BOUND * (1 + 1 / 200), rel=1e-9)
+        assert abs(excursion - V_BOUND) < 0.01
 
     def test_changing_iterations_without_the_rate_changes_the_budget(self) -> None:
         # The failure mode the coupling guards against: an implementation that

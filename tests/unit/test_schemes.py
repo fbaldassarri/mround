@@ -164,7 +164,8 @@ class TestLearningRate:
         config = TuningConfig(iters=iters)
         lr = config.resolved_lr(4)
         excursion = sum(lr * (1 - step / iters) for step in range(iters))
-        assert excursion == pytest.approx(0.5, abs=0.01)
+        # Exactly c/2 * (1 + 1/iters); the 0.5 is the limit, not the value.
+        assert excursion == pytest.approx(0.5 * (1 + 1 / iters), rel=1e-9)
 
     def test_low_bit_widths_get_twice_the_excursion(self) -> None:
         config = TuningConfig(iters=200)

@@ -171,3 +171,34 @@ class TestCoverage:
         assert "30 of 210" in message
         assert "576" in message
         assert "32, 64" in message
+
+
+def test_the_entry_points_leave_the_scale_initialization_to_resolution() -> None:
+    # D-046: a default that nobody who measures anything uses is a trap, so
+    # the entry points ship ``None`` and resolve from the narrowest width the
+    # run can assign. ``plan_mixed_precision`` once hard coded ``SEARCHED``,
+    # which raised on an asymmetric scheme nobody had asked to search.
+    assert _keyword_default(api.quantize, "scale_init") is None
+    assert _keyword_default(api.plan_mixed_precision, "scale_init") is None
+
+
+def test_the_mixed_precision_levers_default_to_the_measured_values() -> None:
+    # D-035: the candidate menu and the gradient source are measured decisions,
+    # and the CLI must defer to them rather than restate them.
+    for entry_point in (api.quantize, api.plan_mixed_precision):
+        candidates = _keyword_default(entry_point, "candidate_bits")
+        assert isinstance(candidates, tuple)
+        assert candidates == (2, 3, 4)
+    assert _keyword_default(api.quantize, "sensitivity_gradients") == "widest"
+    assert _keyword_default(api.plan_mixed_precision, "sensitivity_gradients") == "widest"
+    parsed = build_parser().parse_args(["quantize", "a-model", "-o", "out"])
+    assert tuple(int(width) for width in parsed.options.split(",")) == (2, 3, 4)
+
+
+def test_the_cli_recipe_flags_defer_to_the_standard_recipe() -> None:
+    # D-047: the command line is thin. Every recipe flag ships unset and is
+    # resolved against ``TuningConfig`` at run time, so the recipe has one
+    # definition. ``--iters`` used to restate 200.
+    parsed = build_parser().parse_args(["quantize", "a-model", "-o", "out"])
+    for flag in ("iters", "samples", "seq_len", "batch_size"):
+        assert getattr(parsed, flag) is None, flag

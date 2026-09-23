@@ -11,10 +11,12 @@ group and keeping the one with the lowest weighted reconstruction error.
 The candidate family is a one-dimensional line search over the effective code
 range. The anchor maps the group's signed largest-magnitude element onto
 ``-nmax`` exactly, which is D-009's signed symmetric scale; each candidate
-replaces ``nmax`` by ``nmax - step * i``, so positive steps clip further into
-the tail (raising resolution for the bulk) and negative steps compress the
-range (wasting codes on values that never occur). The clamp bounds never move;
-only the mapping slope does.
+replaces ``nmax`` by ``nmax - step * i``. A negative ``i`` widens the effective
+range, so the mapping slope shrinks and the largest elements land beyond the
+clamp: it clips the tail and raises resolution for the bulk. A positive ``i``
+narrows it, so the largest element lands inside the code range and the outer
+codes go unused: coarser everywhere, never clipped. The clamp bounds never
+move; only the mapping slope does.
 
 Fidelity notes, each verified against the reference implementation's source
 (analysis 04, sections 5.2 and 4.3) and each a place where a plausible

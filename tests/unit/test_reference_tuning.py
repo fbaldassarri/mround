@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from mround.reference.quantize import V_BOUND, fake_quantize
+from mround.reference.quantize import V_BOUND, QuantParams, fake_quantize, project_params
 from mround.reference.tuning import round_to_nearest, tune_layer
 from mround.schemes import QuantScheme, Symmetry, TuningConfig
 
@@ -125,6 +125,33 @@ class TestTrajectory:
 
 
 class TestConstraints:
+    def test_the_loop_projects_after_every_update(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The bound test below reads the best step's parameters, and the best
+        # step is usually early enough that a dropped projection would still
+        # pass it (verified by neutralizing project_params: best_step 17, max
+        # |v| 0.085). So pin the mechanism itself: the loop must project once
+        # after every one of its updates, and every projected parameter set
+        # must lie inside the ranges the projection exists to enforce.
+        seen: list[float] = []
+
+        def spy(params: QuantParams, scheme: QuantScheme) -> None:
+            project_params(params, scheme)
+            lo, hi = scheme.coefficient_bounds
+            assert np.abs(params.v).max() <= V_BOUND + 1e-12
+            assert params.alpha.min() >= lo - 1e-12
+            assert params.alpha.max() <= hi + 1e-12
+            assert params.beta.min() >= lo - 1e-12
+            assert params.beta.max() <= hi + 1e-12
+            seen.append(float(np.abs(params.v).max()))
+
+        monkeypatch.setattr("mround.reference.tuning.project_params", spy)
+        weight, activations = synthetic_layer(seed=15)
+        # Four steps at 2 bits: the first rate is 2 / 4 = 0.5, so a single
+        # update reaches the bound and every later one would cross it.
+        tune_layer(weight, activations, QuantScheme(bits=2, group_size=32), TuningConfig(iters=4))
+        assert len(seen) == 4
+        assert max(seen) == pytest.approx(V_BOUND)
+
     def test_the_rounding_perturbation_stays_bounded(self) -> None:
         # If the projection were dropped, signed descent would walk v past a
         # full code and the method would quietly become unconstrained weight
