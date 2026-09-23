@@ -40,7 +40,8 @@ one that pays platform precision. Near-exact ties can therefore resolve
 differently between the two; the parity suite compares the quality of the
 chosen scales rather than demanding identical choices.
 
-Specification: DOCUMENTATION.md sections 1.5 and 5.3.
+Specification: DOCUMENTATION.md sections 1.5, 5.3 and 5.10, the last fixing the
+grid, the anchor convention and the tie rules (MEMORY.md D-048).
 """
 
 from __future__ import annotations

@@ -37,6 +37,7 @@ than two. See MEMORY.md D-014.
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
@@ -64,8 +65,11 @@ class TuningResult:
         initial_loss: Output error before tuning, which is exactly what
             round-to-nearest achieves.
         final_loss: Output error at the best step.
-        losses: The loss at every step, for inspecting the trajectory.
-        best_step: Which step produced ``final_loss``.
+        losses: The loss measured at each step, before that step's update,
+            so ``losses[0]`` is ``initial_loss`` and the parameters left by
+            the final update are never measured (DOCUMENTATION.md 5.4).
+        best_step: The step whose measurement is ``final_loss``; its
+            parameters are the ones after that many updates.
     """
 
     params: Params
@@ -153,14 +157,15 @@ def tune_layer(
     schedule = LinearDecay(config.resolved_lr(scheme.bits), config.iters)
     optimizer = SignSGD(schedule)
 
-    initial = objective(params)
-    mx.eval(initial)
-    initial_loss = float(initial)
-
-    best_loss = initial_loss
+    # Measured before each update, best taken from those measurements, the
+    # final update never scored: the reference implementation's semantics,
+    # adopted deliberately (MEMORY.md D-048, DOCUMENTATION.md 5.4). Step zero
+    # measures the untouched parameters, so the initial loss needs no forward
+    # of its own.
+    best_loss = math.inf
     best_params = dict(params)
     best_step = 0
-    losses: list[float] = [initial_loss]
+    losses: list[float] = []
 
     for step in range(config.iters):
         loss, grads = loss_and_grad(params)
@@ -188,7 +193,7 @@ def tune_layer(
     return TuningResult(
         params=best_params,
         qdq=qdq,
-        initial_loss=initial_loss,
+        initial_loss=losses[0],
         final_loss=best_loss,
         losses=losses,
         best_step=best_step,

@@ -616,6 +616,20 @@ carries the field but refuses any value other than `None`, because no tuning
 loop consumes it yet, and the same holds for `gradient_accumulate_steps`
 other than 1.
 
+**Which parameters a layer keeps.** The loop measures the loss with the
+current parameters, records them if that measurement is the lowest so far, and
+only then applies the update. The parameters a layer keeps are therefore the
+ones behind the lowest measurement, `best_step` counts the updates that
+produced them, and the parameters left by the final update are never measured
+and can never be kept. Step zero measures the untouched parameters, so
+`initial_loss` is `losses[0]` and needs no forward of its own. This is the
+reference implementation's semantics (its block loop evaluates, records the
+best, then steps, and its `init_loss` is the loss at iteration zero), adopted
+rather than "improved": scoring the final update would make MRound keep
+parameters the reference never considers, for no gain the method describes.
+The reference also offers a switch to keep the last step's parameters
+regardless; MRound does not expose one. MEMORY.md D-048.
+
 Two divergences from the reference in this rule are deliberate and recorded.
 The reference applies `c = 2.0` only when `iters >= 1000` as well as
 `b <= 3`; MRound applies it at every step budget below 4 bits, so at the
@@ -644,8 +658,17 @@ At bit widths below 4, or when the configuration requests it, the largest
 absolute errors are excluded from the objective. The specification, which must
 be honored exactly because each choice changes the gradient:
 
-- The excluded fraction is 0.1 percent of elements.
-- Selection is over the flattened batch, not per row.
+- The excluded fraction is 0.1 percent of elements, floored at one: the count
+  is `max(1, floor(n / 1000))`, so at least one element is always excluded
+  however small the batch. This is the reference's own rule
+  (`topk = max(1, int(numel / 1000))`); below 1,000 elements it excludes one
+  element where 0.1 percent would exclude none, which only a synthetic layer
+  or a unit test ever sees (MEMORY.md D-048).
+- Selection is over the flattened batch, not per row. The reference and the
+  NumPy implementation exclude exactly that many elements; the MLX
+  implementation selects by a threshold comparison, because MLX has no boolean
+  mask assignment, and excludes every element tied at the threshold, a
+  documented and measure zero deviation on real residuals.
 - Excluded elements are zeroed in the numerator; the denominator remains the
   full element count. Excluded elements therefore dilute the mean rather than
   being removed from it.
@@ -768,6 +791,50 @@ still holds.
 Whether to pay three times the arithmetic is a Phase 2 decision with a stated
 criterion in MEMORY.md D-016, not a default. The accuracy question is settled; the
 quality-per-second question is not.
+
+### 5.10 The searched scale grid
+
+Section 5.2 says the v2 search produces `s_init` per group; this section fixes
+the search itself, which the published method leaves open and which the
+reference implementation decides in code. MRound follows the reference's
+choices, candidate for candidate, so that the two searched initializations
+start every layer from the same grid (MEMORY.md D-048).
+
+```
+    nmax          = 2^(b - 1)
+    anchor        = the element of largest magnitude in the group, at the
+                    first index on an exact tie, mapped onto -nmax
+    candidate i   effective range  r_i = nmax - step * i
+                  inverse scale    1/s_i = -r_i / anchor
+                  codes            clamp(round_half_to_even(w / s_i), -nmax, nmax - 1)
+                  loss             sum over the group of qw * (s_i * codes - w)^2
+```
+
+- At 2 bits the window is fixed: `i` runs over `[-90, 90]` excluding zero at
+  `step = 0.01`, so 180 candidates spanning effective ranges 1.10 to 2.90
+  around `nmax = 2`. The ratio below does not apply.
+- At every other width there are 200 candidates: `step = nmax * ratio / 100`
+  and `i` runs over `[-100, 100]` excluding zero, with `ratio = 0.75`. The
+  reference exposes the ratio through an environment variable; MRound exposes
+  it as `SearchGrid.ratio` and changes nothing else.
+- The anchor's own scale (`i = 0`) is evaluated first and a candidate replaces
+  it only on strict improvement; among candidates, iteration runs from the
+  widest effective range to the narrowest and ties keep the earlier one.
+- `qw` is the per input channel importance where the search is importance
+  weighted, and 1 otherwise.
+- An all zero group returns scale 0, which no candidate can beat.
+
+Two conventions are worth naming because they look like inconsistencies and
+are not. First, the anchor's tie rule (first index of the largest magnitude)
+differs from the observed range scale's rule in section 5.2, where the positive
+extreme wins a tie; each mirrors the reference code path it reimplements, and
+the two agree everywhere except on exact ties, which have measure zero on
+float32 weights. Second, a negative `i` widens the effective range, so the
+largest elements land beyond the clamp: it clips the tail and buys resolution
+for the bulk. A positive `i` narrows it, so the largest element lands inside
+the code range and the outer codes go unused: coarser everywhere, never
+clipped. The module docstring once described this backwards and was corrected
+in the audit of 2026-09-23.
 
 ---
 

@@ -16,6 +16,7 @@ orchestration around this; it does not add mathematics.
 from __future__ import annotations
 
 import dataclasses
+import math
 
 import numpy as np
 import numpy.typing as npt
@@ -46,8 +47,11 @@ class TuningResult:
         initial_loss: Output error before tuning, which is exactly what
             round-to-nearest achieves, since the initial parameters reproduce it.
         final_loss: Output error at the best step.
-        losses: The loss at every step, for inspecting the trajectory.
-        best_step: Which step produced ``final_loss``.
+        losses: The loss measured at each step, before that step's update,
+            so ``losses[0]`` is ``initial_loss`` and the parameters left by
+            the final update are never measured (DOCUMENTATION.md 5.4).
+        best_step: The step whose measurement is ``final_loss``; its
+            parameters are the ones after that many updates.
     """
 
     params: QuantParams
@@ -143,17 +147,17 @@ def tune_layer(
     schedule = LinearDecay(config.resolved_lr(scheme.bits), config.iters)
     optimizer = SignSGD(schedule)
 
-    initial_loss, _ = _layer_loss(
-        activations,
-        fake_quantize(weight, params, scheme, eps=eps, init_scale=init_scale).qdq,
-        weight,
-        suppress_outliers=suppress,
-    )
-
-    best_loss = initial_loss
+    # The loss is measured before each update and the best parameters are the
+    # ones that produced the lowest measurement, so the parameters left by the
+    # final update are never scored and can never be the best. That is the
+    # reference implementation's semantics, adopted deliberately (MEMORY.md
+    # D-048, DOCUMENTATION.md 5.4). Step zero measures the untouched
+    # parameters, which is the initial loss; measuring it separately first
+    # would cost one forward per layer for the same number.
+    best_loss = math.inf
     best_params = params.copy()
     best_step = 0
-    losses: list[float] = [initial_loss]
+    losses: list[float] = []
 
     for step in range(config.iters):
         result = fake_quantize(weight, params, scheme, eps=eps, init_scale=init_scale)
@@ -180,7 +184,7 @@ def tune_layer(
     return TuningResult(
         params=best_params,
         qdq=fake_quantize(weight, best_params, scheme, eps=eps, init_scale=init_scale).qdq,
-        initial_loss=initial_loss,
+        initial_loss=losses[0],
         final_loss=best_loss,
         losses=losses,
         best_step=best_step,

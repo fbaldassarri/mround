@@ -4,7 +4,7 @@
 
 Mirrors :mod:`mround.reference.scale_search` candidate for candidate; the
 algorithm, the grid, the anchor convention, and every fidelity note live there
-and in DOCUMENTATION.md sections 1.5 and 5.3. When the two disagree, the
+and in DOCUMENTATION.md sections 1.5, 5.3 and 5.10. When the two disagree, the
 reference is presumed right.
 
 Two things here are MLX design decisions rather than translations.
