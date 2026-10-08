@@ -64,11 +64,12 @@ class TestDeltaLoss:
 
     def test_the_scoring_defaults_are_the_measured_ones(self) -> None:
         # 128 sequences of 1024 tokens. These were the reference's own 16x256,
-        # adopted for comparability; they are now the budget every measurement
-        # in this repository was actually taken at, which is what a default
+        # adopted for comparability; they are now the budget every mixed head
+        # to head from ledger row 38 on was taken at, which is what a default
         # should be. Same model, same seed, same reference checkpoint: 24.2539
-        # at the old values against 23.1140 at these, or 4.70 percent, and not
-        # one ledger row was produced at the old ones (MEMORY.md D-031).
+        # at the old values (row 32) against 23.1140 at these (row 38), 4.70
+        # percent lower, and the mixed rows before row 38 (15 to 20, 22, 23, 26
+        # and 32) were all scored at the old ones (MEMORY.md D-031).
         # A change here is a deliberate departure, not a tidy-up.
         assert SENSITIVITY_SAMPLES == 128
         assert SENSITIVITY_SEQ_LEN == 1024

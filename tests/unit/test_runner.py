@@ -23,8 +23,9 @@ MIXED = {"attn": 2, "mlp": 3, "head": 4}
 
 class TestBlockRecipe:
     def test_the_base_width_sets_everything_by_default(self) -> None:
-        # What every published mixed measurement was produced with: a 4 bit
-        # base means 1.0/iters and no outlier mask for the 2 bit layers too.
+        # What every published mixed measurement but row 47 was produced with
+        # (D-043): a 4 bit base means 1.0/iters and no outlier mask for the 2
+        # bit layers too.
         suppress, rates = block_recipe(CONFIG, 4, MIXED, per_layer=False)
         assert suppress is False
         assert set(rates) == set(MIXED)

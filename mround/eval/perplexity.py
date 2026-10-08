@@ -147,9 +147,11 @@ def _encode_prefix(tokenizer: object, text: str, needed: int | None) -> list[int
     exactly like a real problem and appears on every run.
 
     Growing the slice rather than guessing a bytes-per-token ratio keeps this
-    correct for any tokenizer and any language. Byte-level tokenizers on dense
-    scripts can fall well below the four characters per token that English
-    suggests, and a wrong guess here would silently truncate the evaluation.
+    correct for any tokenizer and any language. A fixed guess silently
+    truncates the evaluation when the text packs more characters into a token
+    than the guess allows, as long runs of whitespace or repeated characters
+    can; dense scripts, well below the four characters per token English
+    suggests, only make the first slice longer than it needs to be.
     """
     encode = tokenizer.encode  # type: ignore[attr-defined]
     if needed is None:
@@ -208,8 +210,16 @@ def evaluate_perplexity(
 
     Raises:
         CalibrationError: If the evaluation set cannot be resolved, or is too
-            short to score even one window.
+            short to score even one window, or if ``seq_len`` is below 2 or
+            ``max_tokens`` below 1, neither of which can score a token.
     """
+    if seq_len < 2:  # noqa: PLR2004
+        msg = f"seq_len must be at least 2, since a one token window scores nothing; got {seq_len}"
+        raise CalibrationError(msg)
+    if max_tokens is not None and max_tokens < 1:
+        msg = f"max_tokens must be at least 1, or None for the whole set; got {max_tokens}"
+        raise CalibrationError(msg)
+
     import mlx.core as mx  # noqa: PLC0415
     from mlx import nn as nn_  # noqa: PLC0415
 

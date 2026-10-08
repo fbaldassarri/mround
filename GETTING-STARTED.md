@@ -18,13 +18,16 @@ an MLX checkpoint that `mlx-lm` loads directly.
 
 **You can run the quantization mathematics on any machine, with no model and no
 MLX.** `mround.reference` is a complete NumPy implementation of SignRound v2:
-the quantizers, the learned rounding, signed gradient descent, both losses, bit
-packing at every supported width, and the mixed-precision allocator. It is the
-oracle the MLX implementation is checked against, and it is the fastest way to
-understand what the method does.
+the quantizers, the learned rounding, signed gradient descent, both losses and
+bit packing at every supported width, with the mixed-precision allocator beside
+it in `mround.planner`. It is the oracle the MLX implementation is checked
+against, and it is the fastest way to understand what the method does.
 
-**You cannot export GGUF or Core ML, and there is no zero-shot task
-evaluation.** Each raises with a pointer rather than approximating.
+**You cannot export GGUF or Core ML.** `quantize` refuses any format but MLX
+rather than approximating, and the two exporter modules are stubs that raise.
+Zero-shot task evaluation runs, and five comparisons have been through it so
+far (RESULTS.md: the 4 bit Qwen2.5-0.5B-Instruct table and its 2 bit and mixed
+2.5 bit tables against each of the reference's two tunings).
 
 ---
 
@@ -45,7 +48,7 @@ Creating one yourself works equally well as long as you finish the job:
 
 ```bash
 conda create -n mround-dev python=3.11 && conda activate mround-dev
-pip install -e '.[models]'
+pip install -e '.[dev,models,eval]'
 ```
 
 Stopping after `conda create` is the one trap worth naming: it never runs the
@@ -124,11 +127,18 @@ mround quantize mlx-community/SmolLM2-135M-Instruct -o ./smollm2-4bit --bits 4
 mround eval ./smollm2-4bit
 ```
 
-`quantize` prints what it is about to do before it does it: the widths, the
-recipe, the calibration corpus and how many of the model's blocks it recognized.
-That last number matters, and the command refuses rather than proceeding when it
-is too low. A run that silently quantizes a third of a model and reports success
-is worse than one that stops.
+`eval` measures perplexity on wikitext2 unless told otherwise. With
+`--zeroshot` it runs a task suite instead, the reference implementation's own
+default tasks less wikitext, through `lm_eval`'s task definitions (install the
+`eval` extra for it); `--limit 20` scores the first twenty documents of each
+task, which is a quick look and not a result.
+
+`quantize` prints what it is about to do before it does it: the model, the
+widths and group size, the scale initialization, the calibration corpus and the
+recipe. Once the model is loaded it checks how much of the block stack the group
+size can reach, and it refuses rather than proceeding when that share is below
+half. A run that silently quantizes a third of a model and reports success is
+worse than one that stops.
 
 Mixed precision chooses a width per layer from a menu, under an exact size
 budget:
@@ -151,7 +161,7 @@ from mround import api
 
 result = api.quantize(
     "Qwen/Qwen2.5-0.5B-Instruct",
-    output="./qwen-mixed",
+    output_dir="./qwen-mixed",
     average_bits=2.5,
 )
 ```
@@ -191,8 +201,8 @@ That is not a bug and not something to normalize away: it maps the dominant
 extreme onto the code `-2**(bits-1)`, the one extra code that the two's
 complement range provides, so the largest weight in each group reconstructs
 exactly instead of clipping. Removing the sign inversion costs 50 percent of
-that weight's magnitude at 2 bits. DOCUMENTATION.md section 5.2.1 works through
-it.
+that weight's magnitude at 2 bits in every group where it is positive, about
+half of them. DOCUMENTATION.md section 5.2.1 works through it.
 
 ### Learn the rounding
 
@@ -274,7 +284,7 @@ mround/
 ├── pipeline/      loading, calibration, and the block loop
 ├── formats/       MLX export works; GGUF and Core ML are stubs
 ├── kernels/       custom Metal: empty by design, none justified yet
-├── eval/          perplexity works; zero-shot tasks are a stub
+├── eval/          perplexity and zero-shot tasks
 └── cli/           quantize, eval, doctor, version
 
 examples/          runnable demonstrations
@@ -324,6 +334,7 @@ wrong.
 | Implement or change any numerics | [DOCUMENTATION.md](DOCUMENTATION.md) sections 1 and 5 |
 | Contribute | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
-Section 7 of DOCUMENTATION.md is the one to read before debugging anything
-numerical. It lists the hazards that have actually cost this project time, and
-three of them look like edge cases and are not.
+Sections 1.2, 1.4, 5.2, 5.7 and 5.8 of DOCUMENTATION.md, with section 7 on MLX
+itself, are the ones to read before debugging anything numerical. They cover
+the hazards that have actually cost this project time, and two of them look
+like edge cases and are not.

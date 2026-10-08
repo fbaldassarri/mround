@@ -4,7 +4,7 @@
 
 Mirrors :mod:`mround.reference.scale_search` candidate for candidate; the
 algorithm, the grid, the anchor convention, and every fidelity note live there
-and in DOCUMENTATION.md sections 1.5, 5.3 and 5.10. When the two disagree, the
+and in DOCUMENTATION.md sections 1.5, 5.2 and 5.10. When the two disagree, the
 reference is presumed right.
 
 Two things here are MLX design decisions rather than translations.
@@ -17,10 +17,11 @@ losses, and folded into the running best, which bounds memory at ``chunk x
 weight`` while keeping the evaluation count small.
 
 **Losses accumulate in float32.** The reference oracle uses float64, which the
-GPU does not have. The parity suite therefore compares the quality of the chosen
-scales rather than demanding identical choices, since a near-exact tie can
-resolve differently across that precision gap; the property that matters, that
-neither implementation's choice reconstructs measurably worse, survives it.
+GPU does not have. The parity suite therefore demands the same choice in at
+least 98 percent of groups (95 under importance) rather than all of them, since
+a near exact tie can resolve differently across that precision gap, and where
+the unweighted choices differ it checks that the MLX choice reconstructs no
+worse than the reference's.
 
 The search is forward-only. Nothing here is differentiated, so plain ``mx.clip``
 is correct and ``clip_ste`` deliberately does not appear.
@@ -42,8 +43,10 @@ if TYPE_CHECKING:
 __all__ = ["SearchGrid", "search_scales"]
 
 # Candidates evaluated per graph launch. Memory per chunk is roughly
-# chunk x weight in float32; sixteen keeps a 50k x 576 embedding under one
-# gigabyte per step while cutting launches to about thirteen per layer.
+# chunk x weight in float32: sixteen puts about 1.8 GB in each float32
+# intermediate for a 50k x 576 embedding (8.7 GB for 151936 x 896), with several
+# intermediates live at once, while cutting launches to about thirteen per
+# layer.
 _CHUNK = 16
 
 

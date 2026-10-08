@@ -8,9 +8,9 @@ analytic gradients.
 The single most important detail in this file is the sign of the symmetric
 scale, which is inverted relative to the group's dominant extreme. That is not a
 quirk to be normalized away; it is the mechanism that makes the asymmetric
-two's-complement code range work, and removing it costs 50 percent of every
-group's largest weight at 2 bits. See :func:`symmetric_scale` and
-DOCUMENTATION.md section 5.2.1.
+two's-complement code range work, and removing it costs 50 percent of the
+largest weight at 2 bits in every group where that weight is positive, about
+half of them. See :func:`symmetric_scale` and DOCUMENTATION.md section 5.2.1.
 """
 
 from __future__ import annotations
@@ -270,7 +270,7 @@ def fake_quantize(
     grouped, pad = regroup(weight, scheme.group_size)
     q_min, q_max = scheme.code_range
 
-    # The searched parameterization (DOCUMENTATION.md 5.3): the scale is the
+    # The searched parameterization (DOCUMENTATION.md 5.2): the scale is the
     # searched value times the learned coefficient, and the observed extremes
     # play no part. beta is the multiplier and alpha is inert, mirroring the
     # reference, whose searched branch reads max_scale and ignores min_scale.
@@ -336,9 +336,10 @@ def init_params(weight: Array, scheme: QuantScheme) -> QuantParams:
     """Create learnable parameters at their initial values.
 
     The rounding perturbation starts at zero (round to nearest) and both
-    clipping coefficients start at one (no clipping), so the initial
-    reconstruction is exactly round-to-nearest. That property is what makes the
-    tuning improvement measurable: the loss at step zero is the RTN baseline.
+    clipping coefficients start at one (no clipping on the observed range, the
+    search result under a searched scale), so the initial reconstruction is
+    exactly round-to-nearest. That property is what makes the tuning improvement
+    measurable: the loss at step zero is the RTN baseline.
     """
     grouped, _ = regroup(weight, scheme.group_size)
     group_shape = (grouped.shape[0], grouped.shape[1], 1)
@@ -414,11 +415,12 @@ def quantize_grad(
     an observation from the reference implementation: in symmetric mode only ONE
     of ``alpha`` and ``beta`` receives gradient in each group, namely the one on
     the dominant side. The other has no influence on the scale at all, so its
-    gradient is exactly zero and the optimizer moves it on the sign of nothing.
+    gradient is exactly zero and the optimizer leaves it where it is, since
+    ``sign(0) == 0``.
 
     Under the searched parameterization the scale is the searched value times
     ``beta`` alone, so ``beta`` takes the whole scale gradient through the
-    searched value and ``alpha`` receives exactly zero (DOCUMENTATION.md 5.3,
+    searched value and ``alpha`` receives exactly zero (DOCUMENTATION.md 5.2,
     MEMORY.md D-030). Until this branch existed a searched scheme was
     silently differentiated as an observed-range one here, which is the
     opposite assignment of the two coefficients.

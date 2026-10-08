@@ -108,10 +108,10 @@ class TestResultReporting:
         # A perplexity without its settings is not a number anyone can check,
         # so the settings travel with it rather than living in a log line.
         result = PerplexityResult(
-            perplexity=12.5, n_tokens=2048, dataset="wikitext2", seq_len=2048, stride=512
+            perplexity=12.5, n_tokens=4096, dataset="wikitext2", seq_len=2048, stride=512
         )
         described = result.describe()
-        for fragment in ("12.5", "2048", "wikitext2", "512"):
+        for fragment in ("12.5", "4096", "2048", "wikitext2", "512"):
             assert fragment in described
 
 
@@ -174,11 +174,18 @@ class TestPrefixEncoding:
         assert _encode_prefix(tokenizer, text, needed) == tokenizer.encode(text)[:needed]
 
     def test_a_dense_tokenizer_is_not_truncated(self) -> None:
-        # One token per character defeats any fixed bytes-per-token guess, which
-        # is why the slice grows rather than being estimated. Byte-level
-        # tokenizers on non-Latin scripts land here.
+        # One token per character, as byte level tokenizers give on non Latin
+        # scripts: the first slice, eight characters per token, is longer than
+        # this text, so the whole text is encoded and cut to the budget.
         tokenizer = FakeTokenizer(1)
         assert len(_encode_prefix(tokenizer, "y" * 50_000, 40_000)) == 40_000
+
+    def test_a_sparse_tokenizer_is_not_truncated(self) -> None:
+        # More characters per token than the first slice assumes: the slice has
+        # to grow, twice here, or a quarter of the budget comes back and the
+        # evaluation shrinks without a word.
+        tokenizer = FakeTokenizer(32)
+        assert len(_encode_prefix(tokenizer, "y" * 50_000, 1_000)) == 1_000
 
     def test_no_budget_encodes_everything(self) -> None:
         tokenizer = FakeTokenizer(4)

@@ -526,7 +526,7 @@ def save_calibration_set(calibration: CalibrationSet, path: str | Path) -> Path:
 
     destination = Path(path)
     if destination.suffix != ".safetensors":
-        destination = destination.with_suffix(".safetensors")
+        destination = destination.with_name(destination.name + ".safetensors")
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     tokens = mx.concatenate(calibration.batches, axis=0)

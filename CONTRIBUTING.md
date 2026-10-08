@@ -19,7 +19,7 @@ active. Creating one yourself works equally well as long as you finish the job:
 
 ```bash
 conda create -n mround-dev python=3.11 && conda activate mround-dev
-pip install -e '.[dev]'
+pip install -e '.[dev,models,eval]'
 ```
 
 Stopping after `conda create` is the one trap worth naming. It never runs the
@@ -64,7 +64,8 @@ suite and makes a useful pre-flight, but it is not the gate.
 
 ## Constraints a change has to respect
 
-These are not style preferences. Each one has a recorded reason and a test.
+These are not style preferences. Each one has a recorded reason, and most have a
+test.
 
 **Apple Silicon only.** No CUDA path, no ROCm path, no device abstraction layer
 whose purpose is portability to other vendors' hardware. If a design feels
@@ -72,8 +73,8 @@ awkward because it assumes unified memory and a Metal GPU, that is the design
 working correctly.
 
 **MLX is the framework.** Nothing under `mround/` may import PyTorch; a test
-enforces it. PyTorch appears only in parity tooling that generates reference
-fixtures, and is never a runtime dependency.
+enforces it. PyTorch appears only in tooling that runs the reference
+implementation, and is never a runtime dependency.
 
 **`mround/reference/` never imports MLX.** It is the oracle the MLX
 implementation is checked against, not scaffolding to be replaced. A test
@@ -109,11 +110,12 @@ in an issue and let it be decided explicitly. A plausible default filled in
 silently produces models that are subtly worse in ways no test catches, which is
 the characteristic failure mode of this kind of code.
 
-Section 7 lists the hazards. Three of them have already cost real time and are
-worth reading even if you are only passing through: the rounding tie rule and
-the clamp boundary gradient, both of which look like edge cases and are not,
-because the value reaching the clamp has already been rounded and lands on the
-boundary constantly; the bounded rounding perturbation, whose projection is
+Sections 1.2, 1.4, 5.2, 5.7 and 5.8, with section 7 on MLX itself, cover the
+hazards. Three of them have already cost real time and are worth reading even
+if you are only passing through: the rounding tie rule and the clamp boundary
+gradient, both of which look like edge cases and are not, because the value
+reaching the clamp has already been rounded and lands on the boundary
+constantly; the bounded rounding perturbation, whose projection is
 load-bearing rather than hygiene, since omitting it gives a plausible
 implementation of a different algorithm that passes every test you thought to
 write; and the fact that float32 does not mean float32 inside a matrix product,
@@ -123,8 +125,10 @@ noise.
 ## Tests
 
 Anything mathematical gets a unit test against a hand computed result on
-synthetic data, with no model loaded. Anything that must match reference
-behavior gets a parity test against the fixture corpus. Do not write a test that
+synthetic data, with no model loaded. Agreement with the reference
+implementation is checked at the model level, by producing both sides'
+checkpoints and scoring them with one evaluator; the layer level fixture corpus
+is planned and not built (`tests/parity/README.md`). Do not write a test that
 loads a real model to verify arithmetic.
 
 Small models first, always. Prove it under a billion parameters before trying it

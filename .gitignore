@@ -6,7 +6,7 @@ tests/fixtures/calibration/
 
 # Vendored reference implementations, kept for reading and never altered
 # (MEMORY.md D-001). Every version scanned lives beside the last one, so the
-# pattern covers the versions that are not here yet as well as the two that
+# pattern covers the versions that are not here yet as well as the three that
 # are. They are large, they are somebody else's release artifact, and the
 # parity harness installs its own copy from the index rather than from these.
 /auto-round-*/
@@ -60,6 +60,11 @@ htmlcov/
 /cli-smoke-*/
 /smoke-*/
 /should-refuse*/
+# The output folders the README, GETTING-STARTED and the API docstring tell a
+# reader to type.
+/out/
+/smollm2-*/
+/qwen-*/
 
 # Files this session could not delete itself, left for you to remove.
 /_to_delete/

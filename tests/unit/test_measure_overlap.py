@@ -38,13 +38,14 @@ def quantize_group(weight, bits, group_size):
     return codes, scale
 '''
 
-# The same function with every identifier, every constant and the docstring
-# changed. A transcription disguised exactly as far as renaming can disguise it.
+# The same function with its name, its parameters, its locals, its docstring
+# and the spelling of two constants changed. A transcription disguised exactly
+# as far as renaming can disguise it.
 RENAMED = '''
 def pack_block(tensor, width, block):
     """Something else entirely."""
     chunks = tensor.reshape(-1, block)
-    bound = 2 ** (width - 1) - 1
+    bound = 2.0 ** (width - 1) - 1.0
     factor = chunks.abs().max(axis=1) / bound
     indices = (chunks / factor).round().clip(-bound - 1, bound)
     return indices, factor

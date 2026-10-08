@@ -186,8 +186,9 @@ def _parse() -> argparse.Namespace:
         default=None,
         help=(
             "target average code bits per weight over the block layers, which "
-            "engages mixed precision: a sensitivity scoring pass per candidate "
-            "width, then exact allocation under the size budget the average "
+            "engages mixed precision: a sensitivity scoring pass (one backward "
+            "at the widest candidate under the default --scoring-gradients), "
+            "then exact allocation under the size budget the average "
             "implies. An integer average competes under exactly the uniform "
             "width's ceiling, so --avg-bits 3 against a --bits 3 run is the "
             "controlled comparison. --bits still sets the RTN baseline and the "
@@ -203,7 +204,8 @@ def _parse() -> argparse.Namespace:
             "separated. Read only with --avg-bits. The graded default is a "
             "measured decision (MEMORY.md D-035): a menu without the "
             "intermediate width forces extreme demotions and lost to uniform "
-            "at the standard recipe. Each width costs one scoring pass"
+            "at the standard recipe. Under own_width each width costs one "
+            "scoring pass; under widest, the default, the menu shares one"
         ),
     )
     parser.add_argument(
@@ -223,9 +225,10 @@ def _parse() -> argparse.Namespace:
         default=None,
         help=(
             "width for the tensors outside the block loop in a mixed run, "
-            "overriding the nearest-to-average default. At the exact midpoint "
-            "the default put a tied output head at the lower width, a "
-            "measured confound. Read only with --avg-bits"
+            "overriding the default, the supported width nearest the average, "
+            "which ties toward more bits since D-034: ties toward fewer put a "
+            "tied output head at the lower width, a measured confound. Read "
+            "only with --avg-bits"
         ),
     )
     parser.add_argument(

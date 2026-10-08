@@ -38,9 +38,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 import numpy.typing as npt
 
-# Run from a plain checkout without an editable install. Every other entry point
-# gets the package from `pip install -e .`; this one is typed by hand at a moment
-# when something is already confusing, so it should not also fail on setup.
+# Run from a plain checkout without an editable install, as the other probes
+# that import the package do too: this one is typed by hand at a moment when
+# something is already confusing, so it should not also fail on setup.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))

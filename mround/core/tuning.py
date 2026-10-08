@@ -5,10 +5,12 @@
 Mirrors :mod:`mround.reference.tuning`, and operates on a single linear layer
 for the same reason: it is the smallest unit containing the whole method, it
 needs no model, and it is the granularity at which comparison against the
-reference is meaningful. The block loop adds orchestration around this; it does
-not add mathematics.
+reference is meaningful. The block loop in :mod:`mround.pipeline.runner` is a
+separate loop over the same functions, and it keeps the last parameters with a
+revert to round to nearest rather than the best measured ones (DOCUMENTATION.md
+5.4, MEMORY.md D-026).
 
-Two things here are MLX design decisions rather than translations.
+Three things here are MLX design decisions rather than translations.
 
 **Where ``mx.eval`` is called.** MLX evaluates lazily, and both failure modes are
 reachable from a loop like this one: reading a scalar every step forces a
@@ -25,7 +27,7 @@ a whole class of error. That the two agree is then a real cross-check.
 
 **The layer error is one matrix product, not the difference of two.** Writing it
 the obvious way, as ``x @ Wq.T`` minus a cached ``x @ W.T``, subtracts two nearly
-equal quantities, and MLX's matrix product does not run at full float32: measured
+equal quantities, and MLX's GPU matrix product does not run at full float32: measured
 relative error is 8.5e-4, roughly four orders of magnitude worse than float32.
 That error is proportional to the large product, not to the small difference, so
 the subtraction hands the whole of it to the residual. At 8 bits it amounts to 20

@@ -15,17 +15,20 @@ replaces ``nmax`` by ``nmax - step * i``. A negative ``i`` widens the effective
 range, so the mapping slope shrinks and the largest elements land beyond the
 clamp: it clips the tail and raises resolution for the bulk. A positive ``i``
 narrows it, so the largest element lands inside the code range and the outer
-codes go unused: coarser everywhere, never clipped. The clamp bounds never
-move; only the mapping slope does.
+codes go unused: coarser everywhere; the anchor is never clipped, though an
+opposite extreme within half a code of ``nmax`` still can be. The clamp bounds
+never move; only the mapping slope does.
 
 Fidelity notes, each verified against the reference implementation's source
 (analysis 04, sections 5.2 and 4.3) and each a place where a plausible
 alternative would silently change the result:
 
-- **The candidate count is fixed** at 200 plus the anchor for every width
-  except 2 bits, where a hard-coded finer window applies: 180 candidates at
-  step 0.01, spanning effective ranges 1.10 to 2.90. The ``ratio`` parameter
-  moves the span, never the count.
+- **The candidate count is 200** plus the anchor at the default ratio for
+  every width except 2 bits, where a hard-coded finer window applies: 180
+  candidates at step 0.01, spanning effective ranges 1.10 to 2.90. The
+  ``ratio`` parameter moves the span; truncation makes the count 198 at some
+  ratios (0.45 and 0.9 among them), exactly as the reference's expression
+  does.
 - **Ties break toward the earliest candidate**, and the iteration runs from the
   widest effective range to the narrowest, with the anchor winning all ties.
   Strict improvement is required to replace it.
@@ -37,10 +40,11 @@ alternative would silently change the result:
 One deliberate divergence: losses accumulate in float64 here rather than the
 reference's float32, because this module is the oracle and the MLX port is the
 one that pays platform precision. Near-exact ties can therefore resolve
-differently between the two; the parity suite compares the quality of the
-chosen scales rather than demanding identical choices.
+differently between the two; the parity suite demands the same choice in at
+least 98 percent of groups (95 under importance) and, where the unweighted
+choices differ, that the MLX choice reconstructs no worse.
 
-Specification: DOCUMENTATION.md sections 1.5, 5.3 and 5.10, the last fixing the
+Specification: DOCUMENTATION.md sections 1.5, 5.2 and 5.10, the last fixing the
 grid, the anchor convention and the tie rules (MEMORY.md D-048).
 """
 
@@ -64,8 +68,9 @@ Array = npt.NDArray[np.float64]
 _TWO_BIT_HALF_COUNT = 90
 _TWO_BIT_STEP = 0.01
 
-# Elsewhere the half-count is always grid/2 = 100 regardless of width or ratio:
-# step = (nmax * ratio) / grid * 2, then half_count = int(nmax * ratio / step).
+# Elsewhere the half-count is grid/2 = 100 at the default ratio, whatever the
+# width: step = (nmax * ratio) / grid * 2, then half_count = int(nmax * ratio /
+# step), which truncation makes 99 at some ratios (0.45 and 0.9 among them).
 _GRID = 200
 
 
@@ -75,7 +80,8 @@ class SearchGrid:
 
     Attributes:
         ratio: How far the perturbation extends, as a fraction of ``nmax``.
-            Controls the span only; the candidate count is fixed by the grid.
+            Controls the span; the grid fixes the count at 200 at the default,
+            and truncation makes it 198 at some ratios.
             The reference's default, and the span measurements behind it, are
             in analysis 04 section 5.2.
     """

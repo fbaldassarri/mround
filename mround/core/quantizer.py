@@ -2,32 +2,39 @@
 # SPDX-License-Identifier: Apache-2.0
 """Differentiable fake quantization, in MLX.
 
-The Metal implementation of DOCUMENTATION.md section 5.2. It mirrors
-:mod:`mround.reference.quantize` function for function and argument for
-argument, deliberately, so that the two can be compared directly and any
-disagreement localizes to a single call rather than to "somewhere in the port".
+The Metal implementation of DOCUMENTATION.md section 5.2. It mirrors the
+mathematics of :mod:`mround.reference.quantize` function for function,
+deliberately, so that the two can be compared directly and any disagreement
+localizes to a single call rather than to "somewhere in the port". The
+signatures differ where MLX differentiates for us: ``fake_quantize`` returns
+only the reconstruction and accepts ``None`` for round-to-nearest,
+``symmetric_scale`` does not return the branch mask, ``project_params`` returns
+a new mapping, and ``quantize_codes`` supplies what the reference returns in its
+``QuantResult``.
 
-Three MLX-specific decisions are made here and each is load-bearing.
+Four MLX-specific decisions are made here and each is load-bearing.
 
 **Rounding does not use ``mx.round``.** The tie rule matters (DOCUMENTATION.md
-section 5.1) and depending on another framework's default is exactly the kind of
+section 5.2) and depending on another framework's default is exactly the kind of
 assumption that produces a silent divergence. :func:`round_half_to_even` builds
 the rule from floor and a parity test instead, so it is correct regardless of
 what ``mx.round`` happens to do.
 
 **Gradients come from ``mx.value_and_grad``, not from hand derivation.** The
 reference implementation derives them by hand because NumPy has no autodiff, and
-doing that caught a real error there (a missing term where the lower clipping
-coefficient reaches the reconstruction through the zero point as well as through
-the scale). MLX can differentiate the forward pass directly, so it should. The
-two routes agreeing is then a genuine cross-check rather than a tautology.
+its finite difference tests caught a real error in that derivation (a missing
+term where the lower clipping coefficient reaches the reconstruction through the
+zero point as well as through the scale; MEMORY.md D-011). MLX can differentiate
+the forward pass directly, so it should. The two routes agreeing is then a
+genuine cross check rather than a tautology.
 
 **The clamp counts its own boundary as inside.** ``mx.clip`` does not, and the
 difference is not cosmetic: the value reaching the clamp here has already been
 rounded, so it is an integer, and landing exactly on a boundary is the common
-case rather than a measure-zero one. At 2 bits it happens to 43 percent of
-weights. :func:`clip_ste` therefore supplies the boundary convention explicitly
-instead of inheriting one. See MEMORY.md D-013.
+case rather than a measure-zero one: in the parity suite's gradient test it
+happened to 43 percent of symmetric codes at 2 bits. :func:`clip_ste` therefore
+supplies the boundary convention explicitly instead of inheriting one. See
+MEMORY.md D-013.
 
 **Nothing is mutated in place.** MLX arrays are immutable, and the projection
 that bounds the learnable quantities happens after the optimizer step rather
@@ -56,6 +63,7 @@ __all__ = [
     "fake_quantize",
     "init_params",
     "project_params",
+    "quantize_codes",
     "regroup",
     "round_half_to_even",
     "round_ste",
@@ -85,9 +93,9 @@ def round_half_to_even(x: mx.array) -> mx.array:
     The construction: split the input into its floor and its fraction, round
     up where the fraction exceeds a half, and on an exact half round up only
     where the floor is odd. An earlier form took ``floor(x + 0.5)`` and stepped
-    back on ties, and the addition made it wrong for exactly one float32 value
-    in every unit interval, ``0.5 + 1 ulp``, where ``x + 0.5`` rounds to the
-    integer and is mistaken for a tie: the value rounded to 0 instead of 1.
+    back on ties, and the addition made it wrong for a float32 value,
+    ``0.5 + 1 ulp``, where ``x + 0.5`` rounds to the integer and is mistaken for
+    a tie: the value rounded to 0 instead of 1.
     Brute force over every float32 in ``[0.25, 16]`` agrees with ``np.rint``
     with this form and disagrees once with the old one.
     """
@@ -118,9 +126,10 @@ def clip_ste(x: mx.array, lo: float, hi: float) -> mx.array:
     value sitting exactly on ``lo`` or ``hi`` receives nothing. That would be an
     irrelevant detail if the boundary were reached only by coincidence, but here
     the input has already been rounded, so it is an integer and hitting the
-    boundary exactly is the ordinary case. At 2 bits it is 43 percent of weights,
-    at 4 bits 7 percent, at 8 bits none, which is exactly the bit-width pattern
-    the parity suite reported before this function existed.
+    boundary exactly is the ordinary case. In the parity suite's gradient test
+    (group size 8, perturbed coefficients) it was 43 percent of symmetric codes
+    at 2 bits, 7 percent at 4 bits and none at 8 (asymmetric: 45, 17 and none),
+    the bit width pattern that suite reported before this function existed.
 
     Mathematically either convention is a valid subgradient: the straight-through
     surrogate is ``clip(w/s + v + c, lo, hi)`` with the rounding residual ``c``
@@ -308,7 +317,7 @@ def fake_quantize(
 
     # The searched parameterization: scale is the searched value times the
     # learned beta, alpha is inert, and the observed extremes play no part.
-    # Mirrors the reference's searched branch. See DOCUMENTATION.md 5.3.
+    # Mirrors the reference's searched branch. See DOCUMENTATION.md 5.2.
     _check_init_scale(scheme, init_scale)
     if scheme.scale_init is ScaleInit.SEARCHED:
         assert init_scale is not None

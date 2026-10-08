@@ -424,10 +424,11 @@ class TestGradients:
 
     @pytest.mark.parametrize("bits", [2, 3, 4])
     def test_searched_gradients(self, bits: int) -> None:
-        # The branch every 2 bit and mixed ledger row was produced under. Until
-        # it existed the oracle differentiated a searched scheme as an observed
-        # range one, handing alpha the gradient and beta exactly zero, the
-        # opposite of what the MLX core does and of what D-030 records.
+        # The branch every 2 bit and mixed ledger row from row 10 on was
+        # produced under. Until it existed the oracle differentiated a searched
+        # scheme as an observed range one, handing alpha the gradient and beta
+        # exactly zero, the opposite of what the MLX core does and of what D-030
+        # records.
         self._check(
             QuantScheme(bits=bits, group_size=8, scale_init=ScaleInit.SEARCHED),
             seed=400 + bits,
@@ -452,8 +453,8 @@ class TestGradients:
     def test_only_the_dominant_side_receives_coefficient_gradient(self) -> None:
         # A property worth pinning: in symmetric mode the non-dominant
         # coefficient has no influence on the scale, so its gradient is exactly
-        # zero and the optimizer moves it on the sign of nothing. This explains
-        # why one of the two coefficients appears inert.
+        # zero and the optimizer leaves it where it is, since sign(0) == 0. This
+        # explains why one of the two coefficients appears inert.
         scheme = QuantScheme(bits=4, group_size=-1)
         w = np.array([[1.0, -0.4, 0.2, 0.05]])
         params = init_params(w, scheme)

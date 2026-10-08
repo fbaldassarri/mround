@@ -44,10 +44,12 @@ from typing import Any
 __all__ = [
     "ENVIRONMENTS_DIR",
     "LEDGER_PATH",
+    "SCHEMA_VERSION",
     "RunRecord",
     "append_record",
     "capture_environment",
     "capture_packages",
+    "peak_resident_bytes",
     "read_ledger",
     "write_environment_manifest",
 ]
@@ -67,7 +69,16 @@ _CONDA_META_FIELDS = 3
 
 # Bumped when a field changes meaning. New fields may be added without a bump;
 # readers must tolerate absence.
-SCHEMA_VERSION = 1
+#
+# 2, 2026-09-23: ``reference_environment`` and ``memory`` added, and the
+# meaning of ``environment`` stated rather than assumed. Every head to head row
+# before this version carried the scoring machine's inventory under
+# ``environment`` and the reference's only in free text; a reader parsing the
+# published ledger got the wrong release on every reference arm produced by
+# auto-round 0.15.0. Provenance rows appended under this version restate the
+# reference's environment for each earlier head to head row, by row number,
+# because corrections are new lines and never edits.
+SCHEMA_VERSION = 2
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -75,35 +86,104 @@ class RunRecord:
     """One measurement, with everything needed to cite or reproduce it.
 
     Attributes:
-        kind: What was measured: ``rtn`` and ``quantize`` are written by
-            ``examples/tune_model.py`` and ``round_to_nearest_model.py``,
-            ``parity-reference`` by the reference comparison harness, and
+        kind: What was measured: ``quantize`` is written by
+            ``examples/tune_model.py``, ``rtn`` by nothing that runs today
+            (rows 1 and 3 were backfilled from log0017 and log0018, and
+            ``round_to_nearest_model.py`` writes no row),
+            ``parity-reference`` by the reference comparison harness,
             ``generate`` by hand from a terminal paste (three rows, whose
-            evaluation and cost keys are their own). Readers filter on it
-            rather than inferring.
+            evaluation and cost keys are their own), and ``provenance`` for a
+            row that carries no measurement of its own and only restates the
+            reference environment of an earlier head to head row, named in
+            ``source`` as ``row N``, and ``retraction`` for a row that marks
+            an earlier row void, named the same way in ``source``, because the
+            ledger never edits (the first, row 81, retracts row 80, whose two
+            sides were two different models). Readers filter on it rather
+            than inferring: a reader averaging perplexities must skip
+            ``provenance`` and ``retraction`` rows, whose measurement fields
+            are all ``None``, and must drop every row a retraction names.
+            ``zeroshot``, from 2026-09-28, is the task suite scored on the
+            three checkpoints of one head to head row, which its
+            ``evaluation`` names as ``head_to_head_row`` (MEMORY.md D-049); a
+            reader averaging perplexities skips it too, since its perplexity
+            field is ``None`` and its scheme, tuning and calibration repeat
+            the row it cites.
         model: Hugging Face id or path of the model measured.
         scheme: Bits, group size, symmetry, as a plain mapping.
         tuning: The tuning configuration, or ``None`` for round-to-nearest.
         calibration: Corpus identity: source, packing, seed, samples, sequence
-            length, and the content hash where known. The hash is what makes two
-            runs provably comparable.
+            length, and the content hash where known; head to head rows from
+            row 29 and ``zeroshot`` rows carry only ``source`` and ``seed``,
+            their samples and length being under ``tuning``. The hash is what
+            makes two runs provably comparable.
         evaluation: What was scored: ``dataset``, ``tokens`` (the count
-            scored; live parity rows before 2026-09-17 hold the requested
-            count, 65536, where 65504 were scored), ``seq_len``, ``stride``,
-            and, from the same date, ``requested_tokens`` and ``dtype``.
+            scored; rows 10 to 44, quantize and parity alike, hold the
+            requested count, 65536, where 65504 were scored), ``seq_len``,
+            ``stride``, and from row 45 ``requested_tokens`` and ``dtype``.
+            ``generate`` and ``zeroshot`` rows carry keys of their own; a
+            ``zeroshot`` row names ``head_to_head_row``, the suite, the
+            ``lm_eval`` release, the requests and scored tokens per arm, and
+            from row 98 ``mlx_device``.
         perplexity: Measured perplexities by label, such as ``original`` and
-            ``quantized``. The backfilled parity row of 2026-08-13 keys
-            MRound's side ``mround`` where the live rows key it ``quantized``.
+            ``quantized``. Row 9, the backfilled parity row, keys MRound's
+            side ``mround`` where the live rows key it ``quantized``.
         storage: Bits per weight and bytes on disk.
-        cost: Wall-clock seconds by phase, peak memory bytes, and the device.
-        environment: Machine and software versions at measurement time. Its
-            ``packages`` field is the hash of the full pip and conda
-            inventory, stored under :data:`ENVIRONMENTS_DIR`.
+        cost: Wall clock and, on some kinds, throughput or a peak, under keys
+            that vary by kind: ``quantize_seconds`` and ``device`` on ``rtn``
+            rows, plus ``peak_memory_bytes`` on ``quantize`` rows; per side
+            seconds, the hosts and, on mixed rows from row 38,
+            ``mround_scoring_seconds`` on head to head rows, whose peaks are
+            under ``memory`` from schema 2; tokens per second and a peak in GB
+            on ``generate`` rows; ``seconds`` per arm on ``zeroshot`` rows.
+        environment: Machine and software versions where the row was
+            written, which for a head to head row is the scoring machine and
+            not the machine that produced the reference arm. Its ``packages``
+            field is the hash of the full pip and conda inventory, stored
+            under :data:`ENVIRONMENTS_DIR`, absent before row 29. ``None`` on
+            ``provenance`` and ``retraction`` rows: the machine that restated
+            a fact is not part of the fact.
+        reference_environment: For a head to head row, where the reference
+            arm was produced: the same version fields as ``environment`` for
+            that machine, its ``host`` string, ``device``, the device the
+            reference tuned on as it reported it (``cpu``, ``xpu``,
+            ``mps``), and from 2026-09-24 ``precision`` (``float32``, or the
+            autocast dtype it settled on, such as ``bfloat16 autocast``) and
+            ``torch_compile``, and from 2026-10-01 ``algorithm``, the class of
+            the tuning configuration the reference resolved
+            (``SignRoundConfig`` for its default, ``SignRoundV2Config`` with
+            ``enable_alg_ext``; every arm before that date ran the default),
+            and ``block_forward_compile``, which 0.15.0 turns off for its
+            SignRound v2 quantizer while ``torch_compile`` stays on.
+            Read from the sidecar the producing machine
+            wrote beside the checkpoint, so absent fields mean the sidecar did
+            not record them, never that they were guessed; every arm before
+            2026-09-24 ran float32, with ``torch.compile`` off under 0.14.2
+            and on under 0.15.0 (MEMORY.md, 2026-09-23). ``None`` for rows
+            with no reference arm and for head to head rows written under
+            schema 1, whose provenance rows carry it instead.
+        memory: Peak memory, in bytes, where a harness observed it:
+            ``mround_peak_bytes`` (the framework's own peak allocation),
+            ``mround_rss_bytes`` and ``reference_rss_bytes`` (each process's
+            maximum resident set), and ``reference_peak_bytes`` (the device
+            allocator's peak, only where the reference ran on an accelerator).
+            Resident set and allocator peak are different claims and are kept
+            apart. ``None`` where not observed.
+        tasks: Zero-shot results on a ``zeroshot`` row, by arm under the keys
+            ``perplexity`` uses (``original``, ``reference``, ``quantized``),
+            each a mapping from task to its metrics as ``lm_eval`` names them
+            without the filter suffix (``acc``, ``acc_stderr``, ``acc_norm``,
+            ``acc_norm_stderr``, LAMBADA's ``perplexity`` and
+            ``perplexity_stderr``) and ``n``, the documents scored. ``None``
+            on every other row. Added 2026-09-28 without a schema bump, as a
+            new field may be.
         source: Where the numbers came from: ``live`` for a harness writing at
-            measurement time, or a log identifier for backfilled entries.
+            measurement time, a log identifier for backfilled entries,
+            ``terminal-paste-<date>`` for a ``generate`` row, or ``row N`` for
+            a provenance or retraction row.
         notes: Anything the fields cannot say, such as what a correction
             corrects.
-        recorded: UTC timestamp of the append, ISO 8601.
+        recorded: UTC timestamp of the append, ISO 8601, except on rows 1 to 9,
+            backfilled from logs, which carry the date measured at midnight.
         schema: Schema version, for readers.
     """
 
@@ -117,6 +197,9 @@ class RunRecord:
     storage: dict[str, Any] | None = None
     cost: dict[str, Any] | None = None
     environment: dict[str, Any] | None = None
+    reference_environment: dict[str, Any] | None = None
+    memory: dict[str, Any] | None = None
+    tasks: dict[str, Any] | None = None
     source: str = "live"
     notes: str = ""
     recorded: str = ""
@@ -214,10 +297,10 @@ def capture_environment(
 
     Versions are read from installed package metadata rather than imported, so
     this works without loading MLX and returns ``None`` for anything absent
-    rather than failing. The machine string is the hardware identity a paper's
-    hardware table needs; on Apple Silicon ``platform.machine()`` alone says
-    only ``arm64``, so the processor brand is included where the platform
-    exposes it.
+    rather than failing. The machine fields are what ``platform`` reports and
+    no more: on Apple Silicon that is ``arm64`` and a processor of ``arm``,
+    with no chip name, so the hardware a paper's table needs has to be stated
+    beside the ledger rather than read from it.
 
     The handful of named versions stay inline because they are the ones a
     reader wants without opening another file. Everything else is in the
@@ -252,6 +335,24 @@ def capture_environment(
         "auto_round": version_of("auto-round"),
         "packages": write_environment_manifest(directory=directory) if packages else None,
     }
+
+
+def peak_resident_bytes() -> int | None:
+    """This process's maximum resident set size so far, in bytes.
+
+    ``ru_maxrss`` is reported in kilobytes on Linux and in bytes on macOS, a
+    difference that has produced thousandfold errors in published memory
+    tables before; it is normalized here, once. ``None`` where the platform
+    does not expose it, rather than a guess.
+    """
+    try:
+        import resource  # noqa: PLC0415
+    except ImportError:
+        return None
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if peak <= 0:
+        return None
+    return int(peak) if platform.system() == "Darwin" else int(peak) * 1024
 
 
 def append_record(record: RunRecord, path: str | Path = LEDGER_PATH) -> Path:

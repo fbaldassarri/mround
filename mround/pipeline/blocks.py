@@ -40,8 +40,8 @@ masks. `scripts/probe_blocks.py` checks it at both ends of the stack rather than
 between one adjacent pair, since an alternating pattern would agree between
 blocks zero and one about half the time by luck.
 
-Specification: DOCUMENTATION.md section 3. The tuning loop that consumes all of
-this lives in ``runner.py``.
+Specification: DOCUMENTATION.md section 7 and MEMORY.md D-023. The tuning loop
+that consumes all of this lives in ``runner.py``.
 """
 
 from __future__ import annotations
@@ -180,7 +180,7 @@ def _recorder_type() -> type:
         block *before* calling it, and ``mlx-lm``'s Llama loop is one of them::
 
             mask = swa_mask if layer.use_sliding else fa_mask
-            h = layer(h, mask, cache[i])
+            h = layer(h, mask, cache=cache)
 
         An empty stand-in fails on the first line, before it has recorded
         anything. Delegating is also the only version of this that stays generic:
@@ -286,8 +286,8 @@ def discover_blocks(model: nn.Module, *, expected: int | None = None) -> list[Bl
 
     Finds the block stack structurally, by looking for the repeated homogeneous
     sequence that characterizes a transformer, rather than by matching known
-    architecture names. Architectures that need special handling are the
-    exception and are registered explicitly.
+    architecture names. An architecture this cannot handle is refused rather
+    than guessed at; there is no registry of special cases.
 
     Args:
         model: A loaded MLX model.

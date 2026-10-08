@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """What the public entry point does when the caller says nothing.
 
-Every number in `benchmarks/ledger.jsonl` was produced by a harness that passes
-`scale_init="searched"` explicitly. Nothing published was ever produced with the
-value the entry point shipped, and at 2 bits that value was measured at 77,365
-perplexity against the searched grid's 1,361 (MEMORY.md D-030). A default
-nobody who measures anything actually uses is not a default, it is a trap for
-the first person to call the function the documented way.
+Every MRound arm in `benchmarks/ledger.jsonl` from row 10 on was produced with
+`scale_init="searched"` passed explicitly, except rows 52 and 53, two 4 bit
+runs on the observed range. The value the entry point shipped, the observed
+range, otherwise appears only in rows 1 to 9, from before the search existed,
+and at 2 bits it measured 77,365 perplexity (row 4) against the searched grid's
+1,361 (row 10, MEMORY.md D-030). At 2 bits, a default no measurement has used
+since the search existed is not a default, it is a trap for the first person to
+call the function the documented way.
 
 These tests are the rule from D-030 pinned where it is applied, and they run
 without MLX because `mround.api` imports it lazily, which is the point: a

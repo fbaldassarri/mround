@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """What the array framework will tell us about the device it is running on.
 
-One function, in its own module, because two pipeline stages need it and
+Two functions, in their own module. Two pipeline stages need the first and
 neither belongs upstream of the other: the block runner reports its peak into
 the run record, and the sensitivity scorer reports its peak into the progress
-lines that keep a long scoring pass legible.
+lines that keep a long scoring pass legible. The second starts the count over,
+and each public entry point in ``mround.api`` calls it before loading a model.
 
 The peak matters more here than it would elsewhere. Apple Silicon's memory is
 unified, so an MLX allocation that exceeds physical RAM does not fail, it

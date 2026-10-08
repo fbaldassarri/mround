@@ -6,12 +6,12 @@ Mirrors :mod:`mround.reference.optimizer`. The update rule is one line; the rest
 is the schedule, and the schedule is the part that actually constrains the
 method.
 
-Because every step moves a parameter by exactly the current rate and the rate
-decays linearly to zero, total travel is finite and known: about
-``lr * iters / 2``. With the default ``lr = c / iters`` that is ``c / 2``,
-independent of the step count, which is why the learning rate and the iteration
-count are coupled and cannot be tuned separately. DOCUMENTATION.md section 5.4
-and MEMORY.md D-010.
+Because every step moves a parameter with a nonzero gradient by exactly the
+current rate and the rate decays linearly to zero, total travel is finite and
+known: about ``lr * iters / 2``. With the default ``lr = c / iters`` that is
+``c / 2``, independent of the step count, which is why the learning rate and the
+iteration count are coupled and cannot be tuned separately. DOCUMENTATION.md
+section 5.4 and MEMORY.md D-010.
 
 Parameters are transformed functionally rather than mutated, following the MLX
 convention. Writing the optimizer natively is simpler than adapting one built
@@ -76,11 +76,11 @@ def total_excursion(initial_lr: float, total_steps: int) -> float:
 def sign_update(param: mx.array, grad: mx.array, lr: float) -> mx.array:
     """Apply one signed gradient step: ``param - lr * sign(grad)``.
 
-    Every parameter moves by exactly ``lr`` regardless of the gradient's
-    magnitude. Two consequences matter elsewhere: the update is invariant to any
-    positive rescaling of the loss, so loss scaling is a no-op and MRound omits
-    it; and a parameter with exactly zero gradient does not move, since
-    ``sign(0) == 0``.
+    Every parameter with a nonzero gradient moves by exactly ``lr``, regardless
+    of the gradient's magnitude. Two consequences matter elsewhere: the update is
+    invariant to any positive rescaling of the loss, so loss scaling is a no op
+    and MRound omits it; and a parameter with exactly zero gradient does not
+    move, since ``sign(0) == 0``.
     """
     return param - lr * mx.sign(grad)
 
@@ -100,9 +100,11 @@ class SignSGD:
 
         Args:
             learning_rate: A constant rate, or a schedule called with the step.
-            momentum: Exponential moving average factor on the gradient. Zero
-                gives pure signed gradient descent, which is the default and
-                what the published method uses.
+            momentum: Heavy ball factor: the sign is taken of
+                ``momentum * buffer + grad``, as in torch SGD with no dampening,
+                not of a moving average. Zero gives pure signed gradient
+                descent, which is the default and what the published method
+                uses.
         """
         self.learning_rate = learning_rate
         self.momentum = momentum

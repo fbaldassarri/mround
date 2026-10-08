@@ -41,11 +41,12 @@ the MLX reduction is tested against.
 
 **Nothing here is silent.** Scoring prints one line per batch, with elapsed
 time, a projection, and the peak allocation. The reason is log0059: a scoring
-budget thirty two times the default turned a two minute pass into a two hour
-one with no output at all between the model download and the first block, and
-the only honest reading from outside was that the run had hung. A pass this
-long that says nothing is indistinguishable from a broken one, and the peak
-allocation in the same line is what separates working from swapping.
+budget thirty two times the former default turned a 200.7 second pass
+(log0052) into a 1512.0 second one (row 38) with no output at all between the
+model download and the first block, and the only honest reading from outside
+was that the run had hung. A pass this long that says nothing is
+indistinguishable from a broken one, and the peak allocation in the same line
+is what separates working from swapping.
 """
 
 from __future__ import annotations
@@ -108,7 +109,7 @@ class ScoringProgress:
             not report one.
         stage_seconds: Wall clock since this stage started. Under ``widest``
             the perturbation stage precedes the first backward and can
-            dominate the pass (43.6 of 50.6 seconds in ledger row 18), so a
+            dominate the pass (193.9 of 329.7 seconds in log0061), so a
             projection of the backward loop has to start its clock where the
             loop starts, or its first lines read several times too high and
             fall on every line after, which looks like a run speeding up.
@@ -312,7 +313,7 @@ def score_widths(
             procedure: each width gets its own backward on the model quantized
             at that width. It is this function's default so that a bare call
             measures the control; the entry points in :mod:`mround.api` pass
-            ``"widest"``, the measured default (MEMORY.md D-035). ``"widest"``
+            ``"widest"``, the measured default (MEMORY.md D-034). ``"widest"``
             takes one backward per batch at the widest candidate and scores
             every width's perturbation against it,
             targeting the mechanism the first measured allocation exposed
@@ -324,9 +325,10 @@ def score_widths(
         progress: Called with a :class:`ScoringProgress` after the up-front
             perturbations (a stage only ``widest`` has) and after every
             gradient pass. Scoring at the budget
-            the reference recommends for 2-bit schemes is an hours-long phase
-            that produces no other output, so a caller with a console should
-            pass something here.
+            the reference recommends for 2-bit schemes takes minutes, 323 to
+            388 seconds on Qwen2.5-0.5B (rows 39 to 47) and 1512 at the old
+            batch of 8 (row 38), and produces no other output, so a caller
+            with a console should pass something here.
 
     Returns:
         Scores, shapes, skipped layers, and wall clock.

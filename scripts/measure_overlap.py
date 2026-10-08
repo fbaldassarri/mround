@@ -37,9 +37,10 @@ is a maximum over a corpus, and a maximum grows with the number of things it is
 taken over, so a small control makes any reference look damning. Measured:
 against a 304 function library MRound's highest score is 0.741, against the
 reference's 3459 it is 0.962, and against a 35308 function library it is 0.926,
-all at the same floor. The first two differ because of size, not kinship. Pick
-controls that are as big or bigger, and read the reported pool sizes before
-reading anything else.
+all at a floor of 24 tokens, below the calibrated one (at the calibrated floor
+the three are 0.708, 0.749 and 0.723; MEMORY.md, 2026-09-20). The first two
+differ because of size, not kinship. Pick controls that are as big or bigger,
+and read the reported pool sizes before reading anything else.
 
 It never imports the tree it is comparing against. It parses the files, which
 means it needs neither torch nor a GPU and runs anywhere the sources exist.
@@ -76,17 +77,19 @@ __all__ = ["Match", "Unit", "collect", "compare", "main"]
 #
 # Sixty is measured rather than guessed. Sweeping the floor against three trees
 # at once, the highest score MRound reaches anywhere falls from 0.962 at a floor
-# of 24 to 0.880 at 40 and 0.749 at 60, and then stops moving: 80 gives 0.749
+# of 24 to 0.891 at 40 and 0.749 at 60, and then stops moving: 80 gives 0.749
 # again. That plateau is where the metric stops describing how short a function
 # is and starts describing what is in it. MEMORY.md, 2026-09-20.
 MIN_TOKENS = 60
 
-# The default gate. At the calibrated floor nothing in MRound reaches 0.75
-# against any tree, related or not, while an actual transcription scores above
-# 0.95 on a view that cannot see renaming. Sitting the gate at 0.85 leaves a
-# tenth of headroom for ordinary drift in either codebase and still fires long
-# before a copied function could hide. Anything reaching it wants a human
-# reading the pair side by side, not an automatic verdict.
+# The default gate. At the calibrated floor nothing in MRound reaches 0.79
+# against any tree measured, related or not (0.788 against auto-round 0.14.2,
+# 0.749 against 0.15.0 and 0.15.1, 0.732 against 0.16.0), while an actual
+# transcription scores above 0.95 on a view that cannot see renaming. Sitting
+# the gate at 0.85 leaves six hundredths of headroom for ordinary drift in
+# either codebase and still fires long before a copied function could hide.
+# Anything reaching it wants a human reading the pair side by side, not an
+# automatic verdict.
 THRESHOLD = 0.85
 
 # How many of the closest pairs to print. Enough to see the shape of the top of

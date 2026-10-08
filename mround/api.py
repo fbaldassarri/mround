@@ -10,24 +10,28 @@ Typical use::
     from mround import api
 
     result = api.quantize(
-        "mlx-community/Qwen2.5-0.5B",
+        "Qwen/Qwen2.5-0.5B-Instruct",
         bits=4,
         output_dir="./qwen-4bit",
     )
     print(result.summary.total_seconds)
 
-Both entry points are implemented. `quantize_round_to_nearest` applies the same
-scale computation and rounding rule with nothing learned, and exists to be the
-number `quantize` has to beat, measured through the same loader and the same
-export path so that a difference between them is attributable to the learning
-rather than to anything else in the chain.
+Both entry points are implemented. `quantize_round_to_nearest` applies the
+observed range scale computation and the same rounding rule with nothing
+learned, and exists to be the number `quantize` has to beat, measured through
+the same loader and the same export path. At 4 bits and above that is
+`quantize`'s own scale computation, so a difference between them is
+attributable to the learning; below 4 bits `quantize` searches the grid by
+default (D-046) and the difference includes the search.
 
-Mixed precision is `average_bits`: a sensitivity scoring pass per candidate
-width (DOCUMENTATION.md 1.5), an exact allocation under the size budget the
-average implies, and the block loop honoring the per-layer result. The budget
-is defined so that an integer average competes under exactly the ceiling the
-uniform width at that number costs, which is what makes "mixed at 3" against
-"uniform 3" a fair fight. MEMORY.md D-031 and D-033 record the decisions.
+Mixed precision is `average_bits`: a sensitivity scoring pass, by default one
+backward per batch at the widest candidate with every width's perturbation
+scored against it (DOCUMENTATION.md 1.5), an exact allocation under the size
+budget the average implies, and the block loop honoring the per-layer result.
+The budget is defined so that an integer average competes under exactly the
+ceiling the uniform width at that number costs, which is what makes
+"mixed at 3" against "uniform 3" a fair fight. MEMORY.md D-031 and D-033
+record the decisions.
 """
 
 from __future__ import annotations
@@ -70,8 +74,11 @@ class QuantizeResult:
     Attributes:
         output_dir: Where the checkpoint was written.
         summary: Per-block results and run-level measurements.
-        scheme_by_layer: The scheme each layer ended up with, which is not
-            uniform when mixed precision is in play.
+        scheme_by_layer: The scheme each tuned block layer ended up with,
+            which is not uniform when mixed precision is in play. The tensors
+            outside the block loop are not in it; those not left dense take
+            the remainder width recorded under ``mixed``, or ``bits`` on a
+            uniform run.
         config_path: A configuration file capturing every input to this run.
             Re-running from it reproduces the result, which is what makes a
             published number checkable.
@@ -137,7 +144,7 @@ def default_scale_init(narrowest_width: int, symmetry: Symmetry) -> ScaleInit:
     Returns:
         The initialization to use when ``scale_init`` was not given.
     """
-    if symmetry is not Symmetry.SYMMETRIC:
+    if Symmetry(symmetry) is not Symmetry.SYMMETRIC:
         return ScaleInit.OBSERVED_RANGE
     return ScaleInit.SEARCHED if narrowest_width < LOW_BIT_THRESHOLD else ScaleInit.OBSERVED_RANGE
 
@@ -276,6 +283,27 @@ def block_coverage(model: Any, group_size: int, *, expected_blocks: int | None =
     return Coverage(total=total, blocked=tuple(blocked))
 
 
+def _refuse_unrunnable(export_format: str, holdout_batches: int) -> None:
+    """Refuse a request no run can honor, before anything is loaded.
+
+    Raises:
+        UnsupportedSchemeError: If ``export_format`` is not implemented.
+        CalibrationError: If ``holdout_batches`` is negative, which would
+            otherwise surface as a division by zero inside the first block.
+    """
+    from mround.exceptions import CalibrationError, UnsupportedSchemeError  # noqa: PLC0415
+
+    if export_format != "mlx":
+        msg = (
+            f"export_format={export_format!r} is not implemented; only 'mlx' is. "
+            f"See ROADMAP.md Phase 4."
+        )
+        raise UnsupportedSchemeError(msg)
+    if holdout_batches < 0:
+        msg = f"holdout_batches must be zero or more, got {holdout_batches}"
+        raise CalibrationError(msg)
+
+
 def _require_supported_host() -> None:
     """Refuse a host that cannot run MRound, before anything imports MLX.
 
@@ -335,7 +363,8 @@ def quantize(
         symmetry: Signed or unsigned code range.
         average_bits: Target average code bits per weight over the block
             layers, for mixed precision. Setting this engages the planner: a
-            sensitivity scoring pass per candidate width, then an exact
+            sensitivity scoring pass (by default one backward per batch at
+            the widest candidate, see ``sensitivity_gradients``), then an exact
             allocation under the size budget the average implies, defined so
             that an integer average competes under exactly the uniform width's
             ceiling. Must lie within the candidate range. The block layers
@@ -381,11 +410,11 @@ def quantize(
             with this on measures the block algorithm; a run without it
             measures the product.
         scheme: A fully specified scheme, overriding ``bits``, ``group_size``,
-            and ``symmetry``.
+            ``symmetry`` and ``scale_init``.
         tuning: How the learned rounding is optimized. ``None`` uses the
             standard recipe.
-        calibration: Corpus identifier, or ``"auto"`` to select a default
-            appropriate to the model.
+        calibration: Corpus identifier, or ``"auto"`` for the project
+            default, ``pile-10k`` (the reference's), whatever the model.
         export_format: ``"mlx"``. GGUF is planned (ROADMAP.md Phase 4) and
             refused until then.
         quantized_inputs: Tune each block against the activations the already
@@ -402,9 +431,9 @@ def quantize(
             rate its own assigned width implies, and resolve the outlier rule
             from the narrowest width in each block, rather than resolving both
             once from ``bits``. Off by default, which is what every published
-            mixed measurement was produced with; this exists so the two can be
-            compared on one model before either becomes the rule. Ignored
-            without ``average_bits``, since a uniform run has one width.
+            mixed measurement but row 47 was produced with; row 47 is the per
+            layer arm, 0.75 percent worse at seed 42, so off stays the rule.
+            Ignored without ``average_bits``, since a uniform run has one width.
             MEMORY.md D-043.
         scale_init: How each group's scale is initialized. ``OBSERVED_RANGE``
             derives it from the group extremes; ``SEARCHED`` runs the v2 grid
@@ -424,9 +453,10 @@ def quantize(
             ``average_bits``.
         scoring_seq_len: Tokens per scoring sequence, or ``None`` for
             ``SENSITIVITY_SEQ_LEN``. Ignored without ``average_bits``. Both
-            defaults are the budget every published measurement used, not the
-            reference's own 16 by 256, which they were until D-031 measured
-            the difference at 4.70 percent.
+            defaults are the budget of every mixed head to head from ledger
+            row 38 on, not the reference's own 16 by 256, which they were
+            until D-031 measured the difference at 4.70 percent (the August
+            mixed results, rows 15 to 26, and row 32 were scored at it).
         scoring_batch_size: Sequences per scoring batch, or ``None`` to derive
             it from the budget at a fixed token count per batch. Overriding it
             is for reproducing a measurement taken before that derivation
@@ -446,7 +476,8 @@ def quantize(
         PlatformError: If the host is not a supported Apple Silicon Mac.
         SchemeError: If the requested scheme is malformed.
         ArchitectureError: If the model cannot be loaded or walked.
-        CalibrationError: If the corpus cannot be built.
+        CalibrationError: If the corpus cannot be built, or
+            ``holdout_batches`` is negative.
         UnsupportedSchemeError: If ``export_format`` cannot represent the scheme
             faithfully, or if a requested feature is not implemented yet.
     """
@@ -454,7 +485,7 @@ def quantize(
 
     import json  # noqa: PLC0415
 
-    from mround.exceptions import ArchitectureError, UnsupportedSchemeError  # noqa: PLC0415
+    from mround.exceptions import ArchitectureError  # noqa: PLC0415
     from mround.formats.mlx_export import require_mlx_representable  # noqa: PLC0415
     from mround.pipeline.calibration import (  # noqa: PLC0415
         DEFAULT_CORPUS,
@@ -465,12 +496,7 @@ def quantize(
     from mround.pipeline.loader import load_model  # noqa: PLC0415
     from mround.pipeline.runner import QuantizationRunner  # noqa: PLC0415
 
-    if export_format != "mlx":
-        msg = (
-            f"export_format={export_format!r} is not implemented; only 'mlx' is. "
-            f"See ROADMAP.md Phase 4."
-        )
-        raise UnsupportedSchemeError(msg)
+    _refuse_unrunnable(export_format, holdout_batches)
 
     # Every width this run can assign, not just ``bits``: a mixed run reaches
     # widths ``bits`` alone does not name, the candidates and the remainder
@@ -556,11 +582,12 @@ def quantize(
         expected_blocks=bundle.config.get("num_hidden_layers"),
     )
 
-    # Everything outside the block stack: embeddings, the output head, and the
-    # final normalization. Learned rounding has nothing to optimize for a lookup
-    # table, so these take round-to-nearest at the model level, which is what
-    # D-019 is about and what keeps a tied-embedding model from storing its
-    # largest tensor at full precision.
+    # Every linear layer and embedding outside the block stack: the embeddings
+    # and an untied output head (normalization weights are never quantized).
+    # Learned rounding has nothing to optimize for a lookup table, so these
+    # take round-to-nearest at the model level, which is what D-019 is about
+    # and what keeps a tied-embedding model from storing its largest tensor at
+    # full precision.
     skipped: list[tuple[str, str]] = []
     for path, layer, reason in _round_to_nearest_layers(
         bundle, remainder_scheme, skip=set(quantized)
@@ -590,6 +617,9 @@ def quantize(
                 # Recorded because it changes how every block was tuned and
                 # cannot be recovered from the weights (D-043).
                 "per_layer_recipe": per_layer_recipe,
+                # The same holds for the stream every block was tuned against
+                # (Q-001), which an off run changes throughout.
+                "quantized_inputs": quantized_inputs,
                 "tuning": dataclasses.asdict(tuning),
                 "calibration": {
                     "source": calibration_set.source,
@@ -685,15 +715,16 @@ def quantize_round_to_nearest(
 ) -> RoundToNearestResult:
     """Quantize a model without learning anything, and write a checkpoint.
 
-    This is the baseline, not the method. It applies the same scale computation
-    and the same rounding rule as the full pipeline with the learned quantities
-    held at their initial values, which is exactly round-to-nearest. Its purpose
-    is to be the number learned rounding has to beat, measured on the same model
-    with the same export path, so that any later improvement is attributable to
-    the learning rather than to anything else in the chain.
+    This is the baseline, not the method. It applies the observed range scale
+    computation and the same rounding rule as the full pipeline with the
+    learned quantities held at their initial values, which is exactly
+    round-to-nearest. Its purpose is to be the number learned rounding has to
+    beat, measured on the same model with the same export path. At 4 bits and
+    above the full pipeline starts from the same scales, so an improvement is
+    attributable to the learning; below 4 bits it starts from searched scales
+    (D-046) and the gap includes the search.
 
-    It needs no calibration data and no block loop, which is what makes it
-    available now.
+    It needs no calibration data and no block loop.
 
     Args:
         model: Hugging Face repository id or local path.
@@ -779,8 +810,8 @@ def plan_mixed_precision(
     and cannot differ in perplexity. That makes this the cheap half of any
     experiment about scoring: plan at the new budget, compare the assignments
     against a run already on disk, and only pay for the block loop if they
-    moved. On a 0.5B model that is minutes to an hour and a half instead of two
-    and a half hours.
+    moved. On Qwen2.5-0.5B that is the scoring pass alone, 323 to 388 seconds
+    (rows 39 to 47), instead of a run of 3,706 to 4,693 seconds.
 
     Args:
         model: Hugging Face repository id or a local checkpoint directory.
@@ -803,9 +834,11 @@ def plan_mixed_precision(
         scoring_samples: Sequences drawn for scoring, or ``None`` for
             ``SENSITIVITY_SAMPLES``.
         scoring_seq_len: Tokens per scoring sequence, or ``None`` for
-            ``SENSITIVITY_SEQ_LEN``. Both defaults are the budget every
-            published measurement used, not the reference's own, which they
-            were until D-031 measured the difference at 4.70 percent.
+            ``SENSITIVITY_SEQ_LEN``. Both defaults are the budget of every
+            mixed head to head from ledger row 38 on, not the reference's own,
+            which they were until D-031 measured the difference at 4.70
+            percent (the August mixed results, rows 15 to 26, and row 32 were
+            scored at it).
         scoring_batch_size: Sequences per scoring batch, or ``None`` to derive
             it from the budget at a fixed token count per batch.
         seed: Calibration seed.
@@ -817,7 +850,8 @@ def plan_mixed_precision(
     Raises:
         PlatformError: If the host is not a supported Apple Silicon Mac.
         ArchitectureError: If the model cannot be loaded or planned.
-        SchemeError: If the average lies outside the candidate range.
+        SchemeError: If the average lies outside the candidate range, or
+            ``scoring_batch_size`` is below 1.
     """
     _require_supported_host()
 
@@ -981,7 +1015,7 @@ def _plan_mixed(
 
     The procedure is DOCUMENTATION.md 1.5's: by default one causal-LM backward
     per batch at the widest candidate, scoring every width's perturbation
-    against it (D-035; the reference's own-width backward stays available as
+    against it (D-034; the reference's own-width backward stays available as
     the control), the cancellation-free DeltaLoss per layer, and the exact
     allocator under the budget the average implies. The scoring draw comes from
     the same corpus and seed as the main calibration, so the plan's identity is
@@ -994,23 +1028,28 @@ def _plan_mixed(
     measured the difference at 4.70 percent on the same model, seed and
     reference checkpoint (ledger rows 32 and 38). The defaults are therefore
     ``SENSITIVITY_SAMPLES`` and ``SENSITIVITY_SEQ_LEN``, 128 by 1024, which is
-    what every published mixed row from row 38 onwards used. Scoring cost is
-    linear in the product, so the budget is thirty two times the work of the
-    reference's default: with the token constant batch below it is 6 to 10
-    percent of a run rather than the 41 percent the fixed batch cost.
+    what every published mixed row from row 38 onwards used. The gradient
+    passes are linear in the product, thirty two times the tokens of the
+    reference's default, while the scale search and the perturbations are
+    not: with the token constant batch below the pass is 6 to 10 percent of a
+    run rather than the 41 percent the fixed batch cost.
 
     **The batch size follows from the budget rather than standing still.** It
     was a hard coded 8, which at 256 tokens is 2048 tokens per batch and at
     1024 tokens is four times the largest activation in a causal LM backward,
     the logits, on top of the resident model copies D-036 already accounts for.
-    A 0.5B mixed run peaks at 17.14 GB at the default budget; the same run at 8
-    by 1024 stopped making visible progress on a 32 GB machine (log0059).
+    A 0.5B mixed run peaked at 17.14 GB at the former 16 by 256 budget and
+    peaks at 19.28 GB at the current one in batches of 2 (log0061); the same
+    run in batches of 8 by 1024 stopped making visible progress on a 32 GB
+    machine (log0059).
     :func:`~mround.planner.sensitivity.scoring_batch_size` holds the tokens per
-    batch fixed instead, which returns exactly 8 at the default and reproduces
-    every earlier measurement, and which leaves the allocation at any other
-    budget unchanged because the allocator's argmin does not move under a
-    positive scale. Measured afterwards, which settled it: the run that
-    prompted this peaked at 52.08 GB on a 32 GB machine.
+    batch fixed instead, which returns exactly 8 at the former 16 by 256
+    default, so every measurement taken there reproduces, and 2 at the
+    current 128 by 1024. It moves the allocation only slightly, because a
+    finer split scales every score by nearly, not exactly, one factor: 8 of
+    168 layers between batches of 8 and 2 (log0061; rows 38 and 39).
+    Measured afterwards, which settled it: the run that prompted this peaked
+    at 52.08 GB on a 32 GB machine.
 
     ``scoring_batch_size`` overrides that derivation. It exists because a
     measurement was taken at the old fixed 8 before the derivation landed, and
@@ -1028,8 +1067,8 @@ def _plan_mixed(
 
     Raises:
         SchemeError: If there are no candidates, a candidate is unsupported,
-            or the average lies outside the candidate range, which no
-            allocation can reach.
+            the average lies outside the candidate range, which no allocation
+            can reach, or ``scoring_batch_size`` is below 1.
     """
     import math  # noqa: PLC0415
 
@@ -1065,6 +1104,9 @@ def _plan_mixed(
         )
         raise SchemeError(msg)
 
+    if scoring_batch_size is not None and int(scoring_batch_size) < 1:
+        msg = f"scoring_batch_size must be at least 1, or None; got {scoring_batch_size}"
+        raise SchemeError(msg)
     samples = SENSITIVITY_SAMPLES if scoring_samples is None else int(scoring_samples)
     sequence = SENSITIVITY_SEQ_LEN if scoring_seq_len is None else int(scoring_seq_len)
     batch = (

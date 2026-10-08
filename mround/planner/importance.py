@@ -7,9 +7,8 @@ calibration set, so that reconstruction error can be weighted by how much each
 input actually matters. A weight that is always multiplied by near-zero
 activations does not deserve precision.
 
-MLX has no forward-hook mechanism, so this cannot intercept a running model. The
-accumulator is driven explicitly by the block runner instead, which is more code
-and also more legible. See DOCUMENTATION.md section 7.
+MLX has no forward-hook mechanism, so this cannot intercept a running model; a
+caller has to drive it explicitly. See DOCUMENTATION.md section 7.
 
 Specification: DOCUMENTATION.md section 1.5.
 
@@ -60,9 +59,10 @@ class ImportanceAccumulator:
     def normalized(self, name: str) -> mx.array | None:
         """Return a layer's importance scaled to unit mean.
 
-        Normalizing keeps the search objective's magnitude independent of
-        calibration set size, which matters because the scale search compares
-        weighted errors against each other rather than against a threshold.
+        Normalizing keeps the objective's magnitude independent of calibration
+        set size. The scale search does not need it: it compares weighted errors
+        against each other rather than against a threshold, so a positive
+        rescaling leaves its choice unchanged.
         """
         raise NotImplementedError
 

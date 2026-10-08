@@ -9,8 +9,10 @@ learnable quantities downhill with signed gradient descent.
 It operates on a single linear layer rather than a transformer block, which is
 deliberate. A layer is the smallest unit that contains the whole method, it
 needs no model to exercise, and it is exactly the granularity at which parity
-against a reference is meaningful. The block loop in the MLX implementation adds
-orchestration around this; it does not add mathematics.
+against a reference is meaningful. The block loop in the MLX implementation is a
+separate loop over the MLX counterparts of these functions, and it keeps the
+last parameters with a revert to round to nearest rather than the best measured
+ones (DOCUMENTATION.md 5.4, MEMORY.md D-026).
 """
 
 from __future__ import annotations
@@ -73,9 +75,17 @@ class TuningResult:
         return 1.0 - (self.final_loss / self.initial_loss)
 
 
-def round_to_nearest(weight: Array, scheme: QuantScheme) -> Array:
+def round_to_nearest(
+    weight: Array,
+    scheme: QuantScheme,
+    *,
+    eps: float = DEFAULT_EPS_FP32,
+    init_scale: Array | None = None,
+) -> Array:
     """Quantize with no learning, the baseline every result is measured against."""
-    return fake_quantize(weight, init_params(weight, scheme), scheme).qdq
+    return fake_quantize(
+        weight, init_params(weight, scheme), scheme, eps=eps, init_scale=init_scale
+    ).qdq
 
 
 def _layer_loss(

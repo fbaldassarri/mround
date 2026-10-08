@@ -17,8 +17,9 @@ import numpy as np
 import pytest
 
 from mround.reference.quantize import V_BOUND, QuantParams, fake_quantize, project_params
+from mround.reference.scale_search import search_scales
 from mround.reference.tuning import round_to_nearest, tune_layer
-from mround.schemes import QuantScheme, Symmetry, TuningConfig
+from mround.schemes import QuantScheme, ScaleInit, Symmetry, TuningConfig
 
 
 def synthetic_layer(
@@ -128,8 +129,8 @@ class TestConstraints:
     def test_the_loop_projects_after_every_update(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The bound test below reads the best step's parameters, and the best
         # step is usually early enough that a dropped projection would still
-        # pass it (verified by neutralizing project_params: best_step 17, max
-        # |v| 0.085). So pin the mechanism itself: the loop must project once
+        # pass it (verified by neutralizing project_params: best_step 44, max
+        # |v| 0.208). So pin the mechanism itself: the loop must project once
         # after every one of its updates, and every projected parameter set
         # must lie inside the ranges the projection exists to enforce.
         seen: list[float] = []
@@ -213,3 +214,28 @@ class TestValidation:
         assert np.array_equal(weight, weight_before)
         assert np.array_equal(activations, activations_before)
         assert not np.array_equal(result.params.v, np.zeros_like(result.params.v))
+
+
+class TestRoundToNearestTakesWhatTuningTakes:
+    def test_searched_round_to_nearest_is_where_tuning_starts(self) -> None:
+        # A searched scheme has no round to nearest without its searched scale,
+        # so the baseline has to accept one, as the MLX twin always has, or
+        # the initial_loss tuning reports has no baseline to be compared with.
+        weight, activations = synthetic_layer(seed=20)
+        scheme = QuantScheme(bits=2, group_size=32, scale_init=ScaleInit.SEARCHED)
+        init_scale = search_scales(weight, scheme)
+        config = TuningConfig(iters=1, suppress_outliers=False)
+        result = tune_layer(weight, activations, scheme, config, init_scale=init_scale)
+
+        rtn = round_to_nearest(weight, scheme, init_scale=init_scale)
+        residual = activations @ (rtn - weight).T
+        assert result.initial_loss == pytest.approx(float(np.mean(residual**2)), rel=1e-12)
+
+    def test_the_epsilon_reaches_the_quantizer(self) -> None:
+        # Weights of 1e-7 give a 4 bit scale of magnitude 1.25e-8: the default
+        # epsilon of 1e-8 leaves it alone and the weights come back exactly,
+        # while an epsilon of 1e-5 replaces it and every code rounds to zero.
+        weight = np.full((2, 32), 1e-7)
+        scheme = QuantScheme(bits=4, group_size=32)
+        assert np.array_equal(round_to_nearest(weight, scheme), weight)
+        assert np.array_equal(round_to_nearest(weight, scheme, eps=1e-5), np.zeros_like(weight))

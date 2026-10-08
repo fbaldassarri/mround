@@ -51,7 +51,8 @@ __all__ = [
 ]
 
 # What `mx.quantize` accepts. Narrower than MRound's own SUPPORTED_BITS, which
-# also covers 7 for the GGUF path: `mx.quantize` rejects 7 explicitly.
+# includes 7 because the bitstream packing layout handles it (MEMORY.md D-007);
+# `mx.quantize` rejects 7 explicitly, and GGUF has no 7 bit type either.
 MLX_SUPPORTED_BITS: frozenset[int] = frozenset({2, 3, 4, 5, 6, 8})
 
 # Per-channel quantization (group_size -1) has no representation here at all.
@@ -133,9 +134,11 @@ def to_affine(
 
     Both symmetry modes collapse to ``biases = -scales * zero_point``, with the
     zero point being the fixed integer ``2 ** (bits - 1)`` when the scheme is
-    symmetric. Under symmetric schemes that makes the bias exactly the group's
-    dominant extreme, which is a real weight value rather than a synthesized
-    one, and it is what makes both zero and that extreme reconstruct exactly.
+    symmetric. Under symmetric schemes the bias is then the value stored code 0
+    decodes to: the group's dominant extreme while the clipping coefficients are
+    one on the observed range, and that extreme rescaled by a learned
+    coefficient or by the searched scale otherwise. Zero reconstructs exactly
+    either way.
 
     Args:
         scale: Per-group scale, possibly negative under symmetric schemes.
@@ -206,7 +209,15 @@ def _quantization_block(quantized: Mapping[str, QuantizedLayer]) -> dict[str, An
     a real possibility worth checking rather than a theoretical one.
     """
     schemes = [layer.scheme for layer in quantized.values()]
-    default = max(set(schemes), key=schemes.count)
+    # A tie on count goes to the scheme that sorts first by width, group size,
+    # symmetry and scale initialization. Iterating a set of schemes follows
+    # string hashes, which change from one interpreter run to the next, so the
+    # same inputs could write different config files.
+    ordered = sorted(
+        set(schemes),
+        key=lambda s: (s.bits, s.group_size, s.symmetry.value, s.scale_init.value),
+    )
+    default = max(ordered, key=schemes.count)
 
     block: dict[str, Any] = {
         "group_size": default.group_size,

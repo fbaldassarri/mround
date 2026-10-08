@@ -9,8 +9,11 @@ scheme into the nearest GGUF type is not an option this module offers.
 
 The signed-scale case is the first place that rule bites. GGUF block formats
 assume a particular scale convention, and a group whose scale is negative must
-be normalized into it by negating the codes within the group, which is exact,
-rather than by taking an absolute value, which corrupts the weights.
+be mapped into it, not coerced. Negating the codes within the group is not
+exact, because the dominant extreme sits on code ``-2**(bits-1)`` and its
+negation lies outside the code range, and taking an absolute value corrupts the
+weights. Q4_0 and Q5_0 store a signed scale built the same way and need no
+normalization (DOCUMENTATION.md section 6.3).
 
 Status: Phase 4. Not implemented.
 """
@@ -59,8 +62,9 @@ def export_gguf(
 ) -> None:
     """Write a GGUF file that ``llama.cpp`` loads without modification.
 
-    Six same-shaped mapping arguments invite positional transposition, so
-    everything after the destination is keyword-only.
+    Six arguments follow the destination, four of them mappings keyed by
+    layer or tensor name that are easy to transpose, so everything after the
+    destination is keyword only.
 
     Args:
         output_path: Destination file.

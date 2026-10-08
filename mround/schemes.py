@@ -32,14 +32,15 @@ __all__ = [
     "TuningConfig",
 ]
 
-# Bit widths the packing layout and export paths support. 8, 4, and 2 are the
-# focus (MEMORY.md D-007); the rest come along with the cross-word packing
-# layout for widths that do not divide 32 evenly.
+# Bit widths the packing layout supports; the MLX export path takes all of them
+# but 7. 8, 4, and 2 are the focus (MEMORY.md D-007); the rest come along with
+# the cross-word packing layout for widths that do not divide 32 evenly.
 SUPPORTED_BITS: frozenset[int] = frozenset({2, 3, 4, 5, 6, 7, 8})
 
 # Below this width, quantization behaves differently enough to change defaults:
-# the learning rate constant doubles and outlier suppression switches on. Named
-# because it appears in more than one place and the two uses must agree.
+# the learning rate constant doubles, outlier suppression switches on, and
+# api.default_scale_init picks the searched scale on symmetric schemes. Named
+# because it appears in more than one place and the three uses must agree.
 LOW_BIT_THRESHOLD: int = 4
 
 # Scale epsilon, guarding against all-zero groups. DOCUMENTATION.md section 5.2.
@@ -155,8 +156,9 @@ class QuantScheme:
         one code. That asymmetry costs nothing at the group's dominant extreme:
         the signed scale of DOCUMENTATION.md section 5.2.1 (MEMORY.md D-009,
         which closed Q-006) puts that extreme on the code with the larger
-        magnitude, where it reconstructs exactly, and only the opposite
-        extreme of a tied group can clip.
+        magnitude, where it reconstructs exactly. Only the opposite extreme can
+        clip, and it does whenever it lies within half a code of the dominant
+        one, which at 2 bits is common rather than rare.
         """
         if self.symmetry is Symmetry.SYMMETRIC:
             half = 2 ** (self.bits - 1)
@@ -208,8 +210,10 @@ class TuningConfig:
     Defaults are the standard recipe from DOCUMENTATION.md section 5.4. The
     reference's own higher-quality recipe raises ``iters`` to 1000 and
     ``n_samples`` to 512; it is not offered as a preset here because MEMORY.md
-    D-028 measured five times the steps on a fixed corpus as harmful, and no
-    ledger row has yet measured that recipe on this implementation.
+    D-028 measured five times the steps on a fixed corpus as harmful. Ledger
+    row 48 measured that recipe here once, at mixed 2.5 on Qwen2.5-0.5B: 22.3231
+    against the standard recipe's 22.9964 at the same seed (row 39), for 4.26
+    times the wall clock.
 
     Attributes:
         iters: Optimization steps per transformer block.
@@ -270,10 +274,11 @@ class TuningConfig:
         """Learning rate for ``bits``, honoring an explicit override.
 
         The derived rate is ``c / iters`` with ``c = 2.0`` below 4 bits and
-        ``1.0`` at or above. Since every step moves a parameter by exactly the
-        current rate and the rate decays linearly to zero, total excursion is
-        about ``c / 2``, which for 4 bits and above is exactly the half-code
-        bound on the rounding perturbation. DOCUMENTATION.md section 5.4.
+        ``1.0`` at or above. Since every step moves a parameter with a nonzero
+        gradient by exactly the current rate and the rate decays linearly to zero,
+        total excursion is about ``c / 2``, which for 4 bits and above is exactly
+        the half code bound on the rounding perturbation. DOCUMENTATION.md
+        section 5.4.
         """
         if self.lr is not None:
             return self.lr

@@ -197,12 +197,15 @@ class TestOutlierSuppressedLoss:
         pred = np.full((2, 1000), 0.01)
         ref = np.zeros((2, 1000))
         pred[0, :5] = 100.0
+        pred[0, 5:10] = 0.02
 
         loss, grad = outlier_suppressed_loss(pred, ref, fraction=0.005)
-        # All ten excluded elements came from row 0 (five outliers plus five
-        # of its 0.01 residuals, since the fraction is 0.5 percent of 2000),
-        # so row 1 contributes every one of its elements to loss and gradient.
-        assert np.allclose(grad[0, :5], 0.0)
+        # All ten excluded elements come from row 0 (the five outliers and the
+        # five 0.02 residuals, the next largest, since the fraction is 0.5
+        # percent of 2000), so row 1 contributes every one of its elements to
+        # loss and gradient. With every residual but the outliers equal, which
+        # five went with them would be the partition's tie order, not the rule.
+        assert np.allclose(grad[0, :10], 0.0)
         assert np.all(grad[1] != 0.0)
         kept_in_row_0 = 1000 - 10
         expected_loss = (kept_in_row_0 + 1000) * 0.01**2 / pred.size

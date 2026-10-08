@@ -27,9 +27,9 @@ class MRoundError(Exception):
 class PlatformError(MRoundError):
     """The host cannot run this operation.
 
-    Raised when Apple Silicon, a supported macOS version, or a working Metal
-    device is required and absent. MRound targets Apple Silicon only and does
-    not degrade to a portable fallback.
+    Raised when the host is not macOS on Apple Silicon or the interpreter is
+    not a native arm64 build (``pipeline/loader.py``). MRound targets Apple
+    Silicon only and does not degrade to a portable fallback.
     """
 
 

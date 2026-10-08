@@ -76,6 +76,11 @@ licenses govern their own use.
     transformers
   huggingface-hub        Apache License 2.0   Hugging Face, Inc.
   safetensors            Apache License 2.0   Hugging Face, Inc.
+  datasets               Apache License 2.0   Hugging Face, Inc.
+
+  Zero shot evaluation (the `eval` extra, with datasets above, needed by
+  `mround eval --zeroshot`):
+  lm-eval                MIT License          EleutherAI
 
 pyproject.toml is the authoritative dependency set and this list is a summary
 refreshed whenever dependencies change.

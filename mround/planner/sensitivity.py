@@ -31,7 +31,7 @@ receiving whole gradient dictionaries.
 Where the gradients come from is the pipeline's business, specified in
 DOCUMENTATION.md section 1.5: by default one causal-LM backward per batch at
 the widest candidate width, scoring every width's perturbation against it
-(MEMORY.md D-035), with the reference implementation's procedure, one backward
+(MEMORY.md D-034), with the reference implementation's procedure, one backward
 per width on the model round-to-nearest quantized at that width, kept as the
 ``own_width`` control. Scores from different calibration passes are not
 comparable, and nothing here can detect that mistake.
@@ -70,16 +70,18 @@ __all__ = [
 # and needs correspondingly less data. DOCUMENTATION.md section 1.5.
 #
 # These were 16 sequences of 256 tokens, the reference implementation's own
-# defaults, adopted for comparability rather than derived. They are now the
-# budget every measurement in this repository was actually taken at, which is
-# not the same thing and is the reason they changed. Same model, same seed, same
-# reference checkpoint: 24.2539 at 16x256 against 23.1140 at 128x1024, or 4.70
-# percent, and not one of the fifty one ledger rows was produced at the old
-# values. What made the cheap budget defensible was its cost, and D-042's token
-# constant batch removed that: at a fixed batch of 8 the scoring pass was 1512
-# seconds, 41 percent of a run, while every run since has measured it at 323 to
-# 388 seconds on Qwen2.5-0.5B and 119 on SmolLM2, 6 to 10 percent, with the peak
-# unchanged because the batch holds the token count still. MEMORY.md D-031.
+# defaults, adopted for comparability rather than derived; the August mixed
+# rows (ledger rows 15 to 26) and row 32 were scored at them. They changed on a
+# measurement: same model, same seed, same reference checkpoint, 24.2539 at
+# 16x256 (row 32) against 23.1140 at 128x1024 (row 38), 4.70 percent lower, and
+# every mixed head to head since was scored at the new values. What made the
+# cheap budget defensible was its cost, and D-042's token constant batch removed
+# that: at a fixed batch of 8 the scoring pass was 1512 seconds, 29 percent of a
+# run, while every run since has measured it at 323 to 388 seconds on
+# Qwen2.5-0.5B and 112 to 119 on SmolLM2, 6 to 9 percent of a run at the
+# standard recipe and 2 percent at the best one (row 48), with the peak at
+# 19.28 GB against 17.14 GB rather than the 52.08 GB of a batch of 8, because
+# the batch holds the token count still. MEMORY.md D-031.
 SENSITIVITY_SAMPLES: int = 128
 SENSITIVITY_SEQ_LEN: int = 1024
 
@@ -95,9 +97,10 @@ SENSITIVITY_SEQ_LEN: int = 1024
 # activations grow with the sequence, and the dominant activation in a causal
 # LM backward is the logits, batch times tokens times a vocabulary of 151936 on
 # Qwen2.5: four times the sequence at a fixed batch is four times that tensor
-# and everything the backward keeps alongside it. Measured on log0059: the
-# 0.5B mixed run peaked at 17.14 GB at 8 by 256, and the same run at 8 by 1024
-# stopped making visible progress on a 32 GB machine.
+# and everything the backward keeps alongside it. Measured (MEMORY.md D-042):
+# the 0.5B mixed run peaked at 17.14 GB at 8 by 256, and the same run at 8 by
+# 1024 printed nothing for so long it looked stuck (log0059), then completed
+# (log0060, ledger row 38) with its scoring pass at 52.08 GB on a 32 GB machine.
 SENSITIVITY_BATCH_TOKENS: int = 2048
 
 
@@ -109,13 +112,16 @@ def scoring_batch_size(
 ) -> int:
     """Sequences per scoring batch, at a fixed token count per batch.
 
-    Splitting the same sequences into more, smaller batches does not change
-    what the allocator decides. Each batch contributes its own
+    Splitting the same sequences into more, smaller batches changes what the
+    allocator decides only slightly. Each batch contributes its own
     ``sum |gradient * perturbation|`` to a running total, so a finer split
-    raises every layer's score at every width by about the same factor, and the
-    allocator minimizes total predicted loss under a budget, an objective whose
-    argmin is invariant to a positive scale. What does change is the recorded
-    ``predicted_loss``, which is therefore comparable only within one batching.
+    raises every layer's score at every width by nearly, not exactly, one
+    common factor, and the allocator minimizes total predicted loss under a
+    budget, an objective whose argmin is invariant to an exact common scale:
+    between batches of 8 and 2, 8 of 168 layers moved (ledger rows 38 and 39,
+    MEMORY.md "The swap was the cost", 2026-09-12). The recorded
+    ``predicted_loss`` moves with that factor, so it is comparable only within
+    one batching.
 
     Args:
         n_samples: Sequences in the scoring draw.
@@ -146,7 +152,10 @@ def delta_loss(
         quantized_weight: The same weights after quantize-dequantize at the
             candidate width.
         gradient: Loss gradient with respect to the quantize-dequantized
-            weight, from a calibration backward pass.
+            weight, from a calibration backward pass: taken at the widest
+            candidate width under the API's default,
+            ``sensitivity_gradients="widest"``, and at this candidate's own
+            width under ``"own_width"`` (DOCUMENTATION.md section 1.5).
 
     Returns:
         The scalar score. Comparable across layers only when the gradients come
@@ -179,8 +188,9 @@ def storage_bits(
     The same accounting the export path reports (MEMORY.md D-019): packed codes
     plus one scale and one bias per group at the checkpoint's dtype. The
     metadata is half a bit per weight at group size 64 and 16-bit scales, which
-    is not negligible against a 2-bit code, and omitting it would bias the
-    allocator toward small group sizes the budget cannot actually afford.
+    is not negligible against a 2-bit code, and omitting it here while
+    :func:`mixed_budget_bits` counts it would let the allocation overrun the
+    stored size it was given.
 
     Args:
         shape: ``(out_features, in_features)``.

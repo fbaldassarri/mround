@@ -21,15 +21,15 @@ here is a difference of two block outputs with nonlinearities between them, so
 unlike the single-layer loss it cannot be rewritten to avoid the subtraction (see
 MEMORY.md D-014). Storing either side at the model's own width would put a
 rounding error of a few parts in a thousand on one side of a difference whose
-whole magnitude is a few parts in a hundred, which is a noise floor larger than
-the signal being optimized. That choice costs memory and is measured rather than
-assumed.
+whole magnitude is a few parts in a hundred, which is a noise floor of the same
+order as the signal being optimized (MEMORY.md D-026). That choice costs memory
+and is measured rather than assumed.
 
-**Memory discipline is this module's responsibility.** Peak usage is governed by
-the largest single block plus its cached activations rather than by the whole
-model, and that property is why a Mac can quantize models a discrete GPU cannot
-hold. Anything added here that keeps a per-block quantity alive across blocks
-breaks it silently.
+**Memory discipline is this module's responsibility.** Beyond the weights,
+which mlx-lm loads whole and which stay resident, the working set is governed
+by the largest single block plus the cached activations of the two streams,
+not by the depth of the model (DOCUMENTATION.md section 2). Anything added here
+that keeps a per-block quantity alive across blocks breaks that silently.
 
 So is evaluation placement. MLX evaluates lazily, and both failure modes are
 reachable from a loop like this one: reading a scalar loss every step forces a
@@ -51,7 +51,7 @@ from mround.core.losses import outlier_suppressed_loss, reconstruction_loss
 from mround.core.quantizer import fake_quantize, init_params, project_params, quantize_codes
 from mround.core.scale_search import search_scales
 from mround.core.signsgd import LinearDecay, SignSGD
-from mround.exceptions import ArchitectureError
+from mround.exceptions import ArchitectureError, CalibrationError
 from mround.pipeline.blocks import (
     ActivationCache,
     apply_block,
@@ -293,13 +293,13 @@ def block_recipe(
 
     Two readings of DOCUMENTATION.md section 5.4 under a mixed plan, and the
     difference between them is MEMORY.md D-043. ``per_layer`` off is what every
-    published mixed run was produced with: the block loop resolves both the
-    learning rate constant and the outlier rule once from the run's base
-    ``bits``, so a 2 bit layer inside a 4 bit base run is tuned at ``1.0/iters``
-    with no outlier mask, where the uniform 2 bit arm of the same comparison
-    uses ``2.0/iters`` with the mask on. ``per_layer`` on reads the section the
-    way it is written, giving every layer the rate its own assigned width
-    implies.
+    published mixed run but row 47 was produced with: the block loop resolves
+    both the learning rate constant and the outlier rule once from the run's
+    base ``bits``, so a 2 bit layer inside a 4 bit base run is tuned at
+    ``1.0/iters`` with no outlier mask, where the uniform 2 bit arm of the same
+    comparison uses ``2.0/iters`` with the mask on. ``per_layer`` on reads the
+    section the way it is written, giving every layer the rate its own
+    assigned width implies.
 
     The outlier rule cannot be per layer in the same way, because the objective
     is one loss over the whole block rather than one loss per layer. It is
@@ -353,14 +353,23 @@ class QuantizationRunner:
                 reference's behaviour, measures that decision on the data being
                 fit, which cannot detect overfitting. It is off by default
                 because turning it on both changes the method and spends
-                calibration data, and whether that trade pays has not been
-                measured.
+                calibration data, and the ledger's two matched pairs, one
+                seed each, came out worse with it (rows 2 and 8, 22.0975
+                against 22.4762; rows 6 and 7, 344,179 against 479,834).
             per_layer_recipe: Under a mixed plan, resolve the learning rate and
                 the outlier rule from each layer's assigned width rather than
                 once from ``scheme.bits``. Off by default, which is what every
-                published mixed measurement was produced with. See
+                published mixed measurement but row 47 was produced with
+                (row 47 is the per layer arm, 0.75 percent worse). See
                 :func:`block_recipe` and MEMORY.md D-043.
+
+        Raises:
+            CalibrationError: If ``holdout_batches`` is negative, which
+                would otherwise divide by zero inside the first block.
         """
+        if holdout_batches < 0:
+            msg = f"holdout_batches must be zero or more, got {holdout_batches}"
+            raise CalibrationError(msg)
         self.scheme = scheme
         self.tuning = tuning
         self.progress = progress

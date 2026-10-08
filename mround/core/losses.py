@@ -8,12 +8,14 @@ gradient code of their own.
 
 The outlier-suppressed loss has three properties that are counterintuitive and
 that change the gradient. They are implemented deliberately rather than allowed
-to emerge, and each is asserted in the parity tests:
+to emerge, and the first two are checked in tests/unit/test_mlx_parity.py by
+agreement with the reference's value:
 
 - Selection is over the flattened batch, not per row.
 - Excluded elements are zeroed in the numerator, but the denominator stays the
   full element count, so they dilute the mean rather than leaving it.
-- The reduction is always the mean, including under gradient accumulation.
+- The reduction is always the mean. Gradient accumulation is not implemented
+  (``TuningConfig`` refuses any value but 1), so this holds trivially today.
 
 DOCUMENTATION.md sections 1.3 and 5.5.
 """

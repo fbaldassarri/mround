@@ -1,6 +1,6 @@
 # MRound Technical Documentation
 
-**Version: 0.0.1. Last updated: 2026-09-17.**
+**Version: 0.1.0a3. Last updated: 2026-10-08.**
 
 This document specifies what MRound does and how it is built. It is the
 authoritative technical reference; where it disagrees with a comment in the
@@ -53,7 +53,8 @@ For a weight matrix `W` partitioned into groups along the input dimension, with
 
 ```
     s   = f(max(W_g), min(W_g), alpha, beta)      per-group scale
-    q   = clamp( round_ste( W / s + v ), q_min, q_max )
+    q   = clamp( round_ste( W / s + v ), q_min, q_max )        symmetric
+    q   = clamp( round_ste( W / s + v ) + z, q_min, q_max )    asymmetric
     W'  = s * q                                   symmetric
     W'  = s * (q - z)                             asymmetric
 ```
@@ -78,10 +79,14 @@ everywhere and nothing can be learned.
 `clamp` needs its own specification for the same reason, and it is easy to miss.
 The value reaching the clamp has already been rounded, so it is an integer, and a
 code landing exactly on `q_min` or `q_max` is therefore the ordinary case rather
-than a coincidence: 43 percent of weights at 2 bits, 7 percent at 4 bits, none at
-8. **The boundary counts as inside.** A code exactly on `q_min` or `q_max`
-receives gradient; only a code the clamp actually moved does not. See section 5.7
-for why, and MEMORY.md D-013 for the failure that made the point.
+than a coincidence: at the untouched start of the observed range initialization
+the dominant extreme of every symmetric group sits exactly on `q_min` (section
+5.2.1), and in the symmetric arm of the parity suite's gradient test (group size
+8, perturbed coefficients) 43 percent of codes sat on a boundary at 2 bits, 7
+percent at 4 and none at 8 (asymmetric: 45, 17 and none). **The boundary counts
+as inside.** A code exactly on `q_min` or `q_max` receives gradient; only a code
+the clamp actually moved does not. See section 5.7 for why, and MEMORY.md D-013
+for the failure that made the point.
 
 ### 1.3 The objective
 
@@ -109,10 +114,12 @@ The optimizer uses only the sign of the gradient:
     p  <-  p - lr * sign( dL/dp )
 ```
 
-Every parameter moves by exactly the learning rate at every step, in the
-direction the gradient indicates. The learning rate decays linearly to zero over
-the step budget, which makes the trajectory a coarse-to-fine search: large
-strides early, progressively finer adjustments later, terminating at zero.
+Every parameter with a nonzero gradient moves by exactly the learning rate at
+every step, in the direction the gradient indicates; one whose gradient is
+exactly zero, as `alpha` always is under the searched initialization, stays
+where it is. The learning rate decays linearly to zero over the step budget,
+which makes the trajectory a coarse-to-fine search: large strides early,
+progressively finer adjustments later, terminating at zero.
 
 This suits the problem. The loss surface over rounding perturbations is
 pathological, full of flat regions where the rounding does not change and cliffs
@@ -187,23 +194,26 @@ The reference procedure remains available as the ``own_width`` control, where
 the gradient is evaluated at each width's own quantized operating point. In
 either mode the loss is the mean shifted
 causal cross-entropy, labels being the inputs themselves, on a small
-calibration draw whose defaults are 128 sequences of 1024 tokens, the budget
-every published mixed measurement used (D-031 amended; the reference's own 16
-by 256 was the default until that budget measured 4.70 percent better on the
-same model and seed); `quantize` and `plan_mixed_precision` take the draw as
-`scoring_samples` and `scoring_seq_len`, and the reference now warns that its
-own former default is too small once a 2 bit option is on the menu, so the
-published mixed 2.5 head to heads were scored at 128 by 1024 on both sides.
+calibration draw whose defaults are 128 sequences of 1024 tokens, the budget of
+every mixed head to head from ledger row 38 on (D-031 amended; the reference's
+own 16 by 256 was the default until that budget measured 4.70 percent better on
+the same model and seed, and the August mixed results among rows 15 to 26 and
+row 32 were scored at it); `quantize` and `plan_mixed_precision` take the draw
+as `scoring_samples` and `scoring_seq_len`, and the reference now warns that its
+own default is too small once a 2 bit option is on the menu, so the mixed 2.5
+head to heads from row 40 on were scored at 128 by 1024 on both sides.
 The draw is fed to the backward in batches holding a constant 2048 tokens
 (`SENSITIVITY_BATCH_TOKENS`: 8 sequences at 256 tokens, 2 at 1024, 1 at 2048,
 never more than the draw), which is what keeps scoring memory flat as the
 sequence grows; the batch can be overridden with `scoring_batch_size` to
 reproduce a run measured at another batching. Scores sum over batches, so a
-`predicted_loss` is comparable only between runs batched the same way, while
-the allocation itself is invariant to any positive rescaling of the scores
-(MEMORY.md D-042). The layers scored are exactly the layers the block loop tunes;
-embeddings and everything outside the blocks are excluded from scoring. For
-weight-only schemes the activation term the reference conditionally adds is
+`predicted_loss` is comparable only between runs batched the same way, and the
+allocation moves only slightly between batchings: 8 of 168 layers between
+batches of 8 and 2 (ledger rows 38 and 39; MEMORY.md, 2026-09-12), because
+splitting the draw changes each layer's score by nearly, not exactly, one
+common factor (D-042). The layers scored are exactly the layers the block loop
+tunes; embeddings and everything outside the blocks are excluded from scoring.
+For weight-only schemes the activation term the reference conditionally adds is
 identically absent, so the score is the weight term alone. Scores are raw sums
 with no normalization: both the score and the storage cost scale with layer
 size, so the allocator's implicit loss-per-bit trade stays dimensionally
@@ -240,11 +250,14 @@ discipline within a block more important, not less.
 
 **The memory ceiling is high, and this is the project's central opportunity.** A
 128 GB Mac has more memory available to a quantization run than most single
-discrete GPUs. Because quantization is block-wise, peak usage is governed by the
-largest block plus cached activations rather than by the whole model. The
-combination means a Mac can plausibly quantize models that require multi-GPU
-setups elsewhere. This claim is the project's headline and it will be established
-by measurement in Phase 5, not asserted.
+discrete GPUs. Because quantization is block-wise, the working set beyond the
+weights is governed by the largest block plus cached activations. MRound as
+built still loads the whole model eagerly through mlx-lm, and a mixed precision
+run's scoring pass holds a float32 copy of the block weights per candidate width
+plus one (MEMORY.md D-036), so today the whole model must fit; whether a Mac can
+quantize models that require multi-GPU setups elsewhere is the project's
+headline claim, and it will be established by measurement in Phase 5, not
+asserted.
 
 **Compute is different in character.** The GPU is well suited to the elementwise
 and reduction work that dominates the tuning loop. The scale search in
@@ -310,13 +323,16 @@ kernel that accelerates packing would live in `kernels/` and be called from
 
 `mround/reference/` deliberately duplicates the mathematics of `core/` in
 NumPy. That duplication is the point rather than an oversight: it gives the MLX
-implementation a local oracle that shares no code with it, so a disagreement
-between the two is evidence about the port rather than about a shared bug. It
-also runs on any machine, which is what keeps the numerical core testable in
-continuous integration without Apple hardware. It must never import MLX, and a
-test enforces that. When the two implementations disagree, the reference is
-presumed right until shown otherwise, because it is the one with exhaustive
-tests and finite-difference-verified gradients.
+implementation a local oracle that shares no code with it beyond `schemes.py`,
+which gives both their code ranges, coefficient bounds, learning rate rule and
+outlier switch, and the scale search's candidate grid, `SearchGrid`, which
+`core/scale_search.py` imports from the reference. Outside those, a
+disagreement between the two is evidence about the port rather than about a
+shared bug. It also runs on any machine, which is what keeps the numerical core
+testable in continuous integration without Apple hardware. It must never import
+MLX, and a test enforces that. When the two implementations disagree, the
+reference is presumed right until shown otherwise, because it is the one with
+exhaustive tests and finite-difference-verified gradients.
 
 **The optimizer layer knows nothing about transformers.** It quantizes a weight
 matrix given inputs and target outputs. This makes it unit-testable on synthetic
@@ -356,8 +372,8 @@ mround/
 ├── pipeline/
 │   ├── loader.py          model loading, architecture detection
 │   ├── blocks.py          block discovery, activation capture
-│   ├── calibration.py     dataset handling, batching, masking
-│   ├── scoring.py         whole-model DeltaLoss backward per candidate width
+│   ├── calibration.py     dataset handling, batching
+│   ├── scoring.py         whole-model DeltaLoss, backward at the widest width
 │   ├── device.py          peak memory as the array framework reports it
 │   └── runner.py          orchestration, memory discipline
 ├── formats/
@@ -366,7 +382,7 @@ mround/
 │   ├── gguf_export.py     GGUF for llama.cpp
 │   └── coreml_export.py   Phase 7, research
 ├── kernels/
-│   └── metal/             custom kernels, each with its justifying profile
+│   └── metal/             none yet; each must carry its justifying profile
 ├── eval/
 │   ├── perplexity.py
 │   ├── zeroshot.py
@@ -379,9 +395,9 @@ mround/
 
 tests/
 ├── unit/                  no model required, synthetic data
-├── parity/                against the dumped reference corpus
-├── integration/           end-to-end on small models
-└── fixtures/              the parity corpus and calibration sets
+├── parity/                planned: README only (section 8)
+├── integration/           planned: empty
+└── fixtures/              README only
 
 scripts/
 └── check_module_layout.py verifies this diagram against the tree
@@ -394,11 +410,12 @@ the planner and the formats layer both use it without either taking on the
 other's dependencies. A layer-specific home for it would create an import cycle
 the moment two layers needed it, which is immediately.
 
-The diagram above is checked, not trusted. `scripts/check_module_layout.py`
-parses it and compares it against the tree in both directions: a documented
-module that does not exist is a broken promise, and an undocumented module is a
-layer someone added without saying so. It runs in continuous integration and as
-a pre-commit hook.
+The package subtree of the diagram above is checked, not trusted (the `tests/`
+and `scripts/` trees are not). `scripts/check_module_layout.py` parses it and
+compares it against the tree in both directions: a documented module that does
+not exist is a broken promise, and an undocumented module is a layer someone
+added without saying so. It runs in continuous integration and as a pre-commit
+hook.
 
 ---
 
@@ -458,6 +475,11 @@ Forcing zero into the range matters for groups whose weights are all one sign.
 Without it the asymmetric zero point falls outside the code range and no format
 that stores an integer zero point can represent the group.
 
+Every rounding that forms a code, `round_ste` and the zero point included,
+rounds half to even, the rule of the reference's `torch.round`;
+`core/quantizer.py` builds it from `floor` so that it does not depend on the
+array framework's own rounding.
+
 **Symmetric.** The scale carries the sign *opposite* to the larger-magnitude
 extreme. That inversion is not a quirk; it is the mechanism that makes the
 asymmetric code range work, and section 5.2.1 explains why.
@@ -506,14 +528,18 @@ Verified numerically at 2, 4, and 8 bits:
 | negative side dominates | positive | reconstructs exactly | no |
 | exact magnitude tie | negative | positive side exact | the negative side clips by one code |
 
-Only an exact magnitude tie causes a clip, and only on the non-dominant side.
-For real weight distributions that is a measure-zero case.
+The opposite extreme is another matter: it clips by one code whenever it lies
+within half a code of the dominant one, of which the exact tie in the table is
+only the limiting case, and at low widths that is common: with unit
+coefficients about 70 percent of Gaussian groups of 64 clip a code at 2 bits,
+about 19 percent at 4 bits and about 1 percent at 8.
 
 The naive alternative, an unsigned `s = max(|W|) / 2^(b-1)`, clips the dominant
-extreme by one code: a 0.8 percent magnitude shortfall at 8 bits, 12.5 percent at
-4 bits, and 50 percent at 2 bits. The other naive alternative,
-`s = max(|W|) / (2^(b-1) - 1)`, clips nothing but leaves one code permanently
-unused and lowers resolution for every weight in the group.
+extreme by one code in every group where it is positive, about half of them: a
+0.8 percent magnitude shortfall at 8 bits, 12.5 percent at 4 bits, and 50
+percent at 2 bits. The other naive alternative, `s = max(|W|) / (2^(b-1) - 1)`,
+clips nothing but leaves one code permanently unused and lowers resolution for
+every weight in the group.
 
 The signed construction is strictly better than both, which is why MRound adopts
 it. Two consequences follow and both must be honored downstream:
@@ -559,11 +585,11 @@ multiplier on that result rather than on the observed range:
 `alpha` is unused in this form (it is carried, projected, and receives a
 gradient of exactly zero; MEMORY.md D-030 and a unit test pin its inertness),
 and `beta` is centered on 1.0 meaning "accept the search result" rather than
-"no clipping". This mirrors the reference, whose searched branch reads its
-upper coefficient and ignores the lower one. This is why the permitted range
-differs between the two parameterizations in section 5.3, and it is the reason
-the v2 range must extend above 1.0: otherwise the optimizer could only ever
-shrink the searched scale, never grow it.
+"no clipping". This mirrors the reference, whose searched branch reads one
+coefficient (its `max_scale`, here named `beta`) and ignores the other. This is
+why the permitted range differs between the two parameterizations in section
+5.3, and it is the reason the v2 range must extend above 1.0: otherwise the
+optimizer could only ever shrink the searched scale, never grow it.
 
 ### 5.3 Parameter ranges
 
@@ -579,7 +605,9 @@ enforces these bounds.
 The lower bound of `0.1` on the clipping coefficients is a guard, not a tuning
 choice: at exactly zero the group range collapses, the scale falls to `eps`, and
 every weight in the group saturates to a single code. A strictly positive floor
-makes that state unreachable.
+makes that state unreachable. It is MRound's own: the reference's observed range
+path bounds both coefficients at `[0.0, 1.0]` (`auto_round/wrapper.py`,
+`minmax_scale_bound`).
 
 The v2 range differs because the coefficients mean something different there.
 With searched initialization active `beta` multiplies the *searched* scale
@@ -603,11 +631,11 @@ parameter can travel is independent of how many steps are taken:
                           c = 2.0  for b < 4
 ```
 
-Since every step moves a parameter by exactly `lr` and the rate decays linearly
-to zero, the total possible excursion is about `c/2`. For `b >= 4` that is 0.5,
-exactly the width of `v`'s permitted range in one direction, which is the
-property that makes this scaling the right one. Low bit widths get the larger
-constant because they need to explore more of that range.
+Since every step moves a parameter with a nonzero gradient by exactly `lr` and
+the rate decays linearly to zero, the total possible excursion is about `c/2`.
+For `b >= 4` that is 0.5, exactly the width of `v`'s permitted range in one
+direction, which is the property that makes this scaling the right one. Low bit
+widths get the larger constant because they need to explore more of that range.
 
 Decay is linear from `lr` to exactly zero over the budget, stepped once per
 iteration. The clipping coefficients share `v`'s learning rate; the reference
@@ -616,19 +644,26 @@ carries the field but refuses any value other than `None`, because no tuning
 loop consumes it yet, and the same holds for `gradient_accumulate_steps`
 other than 1.
 
-**Which parameters a layer keeps.** The loop measures the loss with the
-current parameters, records them if that measurement is the lowest so far, and
-only then applies the update. The parameters a layer keeps are therefore the
-ones behind the lowest measurement, `best_step` counts the updates that
-produced them, and the parameters left by the final update are never measured
-and can never be kept. Step zero measures the untouched parameters, so
-`initial_loss` is `losses[0]` and needs no forward of its own. This is the
-reference implementation's semantics (its block loop evaluates, records the
-best, then steps, and its `init_loss` is the loss at iteration zero), adopted
-rather than "improved": scoring the final update would make MRound keep
-parameters the reference never considers, for no gain the method describes.
-The reference also offers a switch to keep the last step's parameters
-regardless; MRound does not expose one. MEMORY.md D-048.
+**Which parameters a layer keeps.** The single layer loop, `tune_layer` in both
+implementations, measures the loss with the current parameters, records them if
+that measurement is the lowest so far, and only then applies the update. The
+parameters a layer keeps are therefore the ones behind the lowest measurement,
+`best_step` counts the updates that produced them, and the parameters left by
+the final update are never measured and can never be kept. Step zero measures
+the untouched parameters, so `initial_loss` is `losses[0]` and needs no forward
+of its own. This is the reference implementation's semantics (its block loop
+evaluates, records the best, then steps, and its `init_loss` is the loss at
+iteration zero), adopted rather than "improved": scoring the final update would
+make MRound keep parameters the reference never considers, for no gain the
+method describes. The reference also offers a switch to keep the last step's
+parameters regardless; `tune_layer` does not expose one. MEMORY.md D-048. The
+block loop that `api.quantize` runs does not select a step: it keeps the
+parameters left by the final update, measures the block loss before and after
+tuning (on the tuning batches, or on the held out ones when `holdout_batches`
+is set), and reverts a block whose loss did not fall to its starting
+parameters, which round to nearest at its initial scale. In effect that is the
+reference's switch for keeping the last step's parameters, always on, plus a
+revert: a recorded divergence (MEMORY.md D-026).
 
 Two divergences from the reference in this rule are deliberate and recorded.
 The reference applies `c = 2.0` only when `iters >= 1000` as well as
@@ -637,15 +672,17 @@ standard 200 iterations a 2 bit run here starts at `lr = 0.01` where the
 reference starts at `0.005` (MEMORY.md D-010 and the audit entry of
 2026-09-17). And in a mixed precision run the block loop resolves `b` from the
 run's base `bits`, once per block, rather than per layer from the width the
-planner assigned; every published mixed run was produced that way and the
-choice is recorded as D-043 rather than changed under them.
+planner assigned; every published mixed run but row 47 was produced that way,
+and D-043 keeps it by measurement: the per layer reading, available as
+`per_layer_recipe=True`, scored 0.75 percent worse at seed 42 (row 47).
 
 Default step budget: 200 iterations per block, batch size 8, sequence length
-2048, 128 calibration samples; group size 64 everywhere, in every measured
-run and in `QuantScheme`, `quantize`, `quantize_round_to_nearest`,
-`plan_mixed_precision` and the command line, a default settled on generality
-rather than quality (MEMORY.md, 2026-09-20: every dimension divisible by 128 is
-divisible by 64 and the converse fails, so 128 leaves most of SmolLM2 dense).
+2048, 128 calibration samples; group size 64 by default, in `QuantScheme`,
+`quantize`, `quantize_round_to_nearest`, `plan_mixed_precision` and the command
+line, and in every measured run except the group size 128 arms (ledger rows 53,
+96 and 104), a default settled on generality rather than quality (MEMORY.md,
+2026-09-20: every dimension divisible by 128 is divisible by 64 and the converse
+fails, so 128 leaves most of SmolLM2 dense).
 The reference's own higher-quality recipe, 1000 iterations over 512 samples,
 has been measured on both sides at mixed 2.5 on Qwen2.5-0.5B (ledger row 48):
 MRound 22.3231 against the reference's 25.8199, a margin that narrows from
@@ -672,7 +709,8 @@ be honored exactly because each choice changes the gradient:
 - Excluded elements are zeroed in the numerator; the denominator remains the
   full element count. Excluded elements therefore dilute the mean rather than
   being removed from it.
-- The reduction is always the mean, including under gradient accumulation.
+- The reduction is always the mean. Gradient accumulation is not implemented
+  (`TuningConfig` refuses any value but 1), so this holds trivially today.
 
 The third point is counterintuitive and easy to get wrong in either direction.
 It is specified here so the implementation is a decision rather than an accident.
@@ -714,11 +752,12 @@ does block is absorbed by the forward clamp and costs one wasted step, which is
 recoverable; a frozen parameter is not.
 
 The practical stake is larger than it sounds, because the clamp's input is an
-integer and the boundary is therefore hit constantly rather than rarely: at 2
-bits, the convention decides whether 43 percent of the rounding perturbations
-learn anything at all. Implementations must supply it explicitly. Frameworks
-disagree, and inheriting whichever one a framework happens to implement is how
-this becomes a silent divergence. MEMORY.md D-013 records the run where it was.
+integer and the boundary is therefore hit constantly rather than rarely: in the
+symmetric arm of the parity suite's gradient test at 2 bits, the convention
+decided whether 43 percent of the rounding perturbations learn anything at all.
+Implementations must supply it explicitly. Frameworks disagree, and inheriting
+whichever one a framework happens to implement is how this becomes a silent
+divergence. MEMORY.md D-013 records the run where it was.
 
 ### 5.8 Never form a small residual by subtracting two large products
 
@@ -832,8 +871,9 @@ the two agree everywhere except on exact ties, which have measure zero on
 float32 weights. Second, a negative `i` widens the effective range, so the
 largest elements land beyond the clamp: it clips the tail and buys resolution
 for the bulk. A positive `i` narrows it, so the largest element lands inside
-the code range and the outer codes go unused: coarser everywhere, never
-clipped. The module docstring once described this backwards and was corrected
+the code range and the outer codes go unused: coarser everywhere; the anchor is
+never clipped, though an opposite extreme within half a code of `nmax` still
+can be. The module docstring once described this backwards and was corrected
 in the audit of 2026-09-23.
 
 ---
@@ -893,8 +933,10 @@ the group's larger-magnitude extreme (section 5.2.1), so exported scales are sig
 corresponding biases flip sign with them. The affine reconstruction is correct
 either way, since nothing in `scales * q_u + biases` assumes positivity. Any
 consuming format that requires non-negative scales must be handled explicitly by
-its exporter, either by negating the codes within the group or by refusing the
-group; silently taking an absolute value would corrupt the weights.
+its exporter, by storing the scale's sign in the format's own convention where
+it has one or by refusing the group; negating the codes is not exact, because
+the dominant extreme sits on `-2^(b-1)` and its negation lies outside the code
+range, and silently taking an absolute value would corrupt the weights.
 
 Per-layer bit widths and group sizes are recorded in the checkpoint
 configuration so that mixed-precision models load correctly.
@@ -912,8 +954,11 @@ what was requested is worse than one that refuses.
 
 The signed-scale case from section 6.2 is the first place this rule bites: GGUF's
 block formats assume a particular scale convention, and a group whose scale is
-negative must be normalized into it, not coerced. Normalization by negating the
-codes within the group is exact and is the preferred handling.
+negative must be mapped into it, not coerced. Negating the codes within the
+group is not exact: the dominant extreme sits on code `-2^(b-1)` (section 5.2.1)
+and its negation lies outside the code range. Q4_0 and Q5_0 store a signed scale
+built the same way (`d = max / -8` and `max / -16`) and need no normalization;
+any other type needs a decision before its exporter is written.
 
 ---
 
@@ -929,8 +974,9 @@ result is needed. Two failure modes follow. Reading a scalar every iteration, as
 a naive loss log would, forces a synchronous evaluation each step and can
 dominate runtime. Never evaluating lets the graph grow without bound and
 exhausts memory. Resolution: evaluation boundaries are explicit design decisions,
-placed once per optimization step at a defined point, with loss values
-accumulated on device and read only periodically.
+placed once per optimization step at a defined point: one synchronization per
+step covering the loss and the new parameters, and nothing read between
+synchronizations.
 
 **Immutable arrays.** There is no in-place mutation. Any pattern that modifies a
 parameter during the forward pass, such as clamping it mid-computation, has no
@@ -945,9 +991,10 @@ written.
 
 **No forward hooks.** MLX has no mechanism to attach a callback to a module's
 forward pass. Importance matrix accumulation and activation capture therefore
-require explicit instrumentation. Resolution: the block runner runs the model to
-a boundary explicitly rather than relying on interception. This is more code but
-it is also more legible.
+require explicit instrumentation. Resolution: the runner substitutes stand in
+modules instead of attaching hooks: a recorder that raises at the block boundary
+(MEMORY.md D-023) and the tunable wrapper's collection mode (D-030). This is more
+code but it is also more legible.
 
 **No ambient gradient mode.** There is no global flag to disable gradient
 tracking. Gradients are produced by a function transformation, so code either is
@@ -987,7 +1034,7 @@ cases constructed so that greedy allocation is provably wrong. The NumPy
 reference's gradients are checked against finite differences of the
 straight-through surrogate on every branch, the searched one included, and the
 MLX core against the reference function for function (`tests/unit/`, about
-850 tests).
+1,090 tests where MLX is installed and about 870 without it).
 
 **Parity tests.** *(Planned.)* Against a dumped reference corpus, at the
 granularity of a single layer, with byte-identical inputs: scales, integer
@@ -1005,13 +1052,24 @@ in continuous integration. `tests/integration/` is empty; the end to end path
 is exercised by `examples/tune_model.py` and the parity harness on Apple
 hardware.
 
-**Quality benchmarks.** Perplexity and, once `eval/zeroshot.py` exists,
-zero-shot task accuracy on real models. Too slow for continuous integration;
-run by hand on Apple hardware and on the Linux reference machine, and every
-run that produces a quotable number appends one line to
-`benchmarks/ledger.jsonl` the day it is produced (MEMORY.md D-029), citing a
-hashed environment manifest (D-038). The ledger does not yet record the
-commit that produced a line; adding it is an open item.
+**Quality benchmarks.** Perplexity and zero-shot task accuracy
+(`eval/zeroshot.py`, MEMORY.md D-049) on real models. Too slow for continuous
+integration; scored by hand on Apple hardware, with reference arms produced
+there or on the Linux reference machine, and every run that produces a
+quotable number appends one line to `benchmarks/ledger.jsonl` the day it is
+produced (MEMORY.md D-029), citing a hashed environment manifest (D-038).
+Since schema 2 (2026-09-23) a row's `environment` is stated to be the machine
+that wrote the row, which for a head to head row is the scoring machine, and
+the machine that produced the reference arm has its own `reference_environment`
+block: its manifest hash, reference release, torch build, interpreter, system,
+host string, the device the reference reported tuning on and, from 2026-09-24,
+the precision it settled on and whether it compiled. A `memory` block carries
+peak figures where a harness observed them, resident set and allocator peak
+kept apart because they are different claims. The head to head rows written
+under schema 1 are restated, one `provenance` row each (rows 55 to 79, `source`
+naming the row), because a correction is a new line and never an edit. The
+ledger does not yet record the commit that produced a line; adding it is an
+open item.
 
 ### 8.1 The perplexity evaluator
 
@@ -1022,13 +1080,16 @@ is scored in windows of `seq_len` tokens (2048 by default) with a stride equal
 to the window unless a shorter one is asked for, so windows do not overlap by
 default; the first token of each window has no predecessor inside its window
 and is not scored, which is why a request for 65536 tokens scores
-`32 x 2047 = 65504` targets. Under an overlapping stride only the first
-`stride` tokens of each window after the first are scored, so no target is
-counted twice. The result is `exp` of the mean negative log likelihood over
-the scored targets, and the ledger's `evaluation.tokens` is that scored count.
-The parity harness scores every checkpoint at float32 weights; the example
-harness scores each checkpoint at its own dtype, and since 2026-09-17 both
-record the dtype beside the count.
+`32 x 2047 = 65504` targets. Under an overlapping stride each window after the
+first scores only the targets no earlier window scored, which are its last
+`stride` (fewer in the final window), so no target is counted twice. The result
+is `exp` of the mean negative log likelihood over the scored targets. From
+ledger row 45 on, `evaluation.tokens` is that scored count and
+`requested_tokens` the count asked for; rows 10 to 44 hold the requested 65536
+in `tokens` where 65504 were scored, and rows 1 to 9, written from logs, hold
+the scored 65504. The parity harness scores every checkpoint at float32
+weights; the example harness and `mround eval` score each checkpoint at its own
+dtype, and from row 45 the harnesses record the dtype beside the count.
 
 ---
 
@@ -1083,8 +1144,8 @@ produce the activations against which reconstruction error is measured.
 
 **Group size.** The number of consecutive weights sharing one scale. Smaller
 groups give better quality and more metadata overhead. 128 is the common
-default in the literature and `QuantScheme`'s; every measured MRound run uses
-64 (section 5.4).
+default in the literature and the reference's; MRound's default is 64 (section
+5.4), and only ledger rows 53, 96 and 104 were measured at 128.
 
 **Importance matrix.** Accumulated sums of squared activations per input
 channel, used to weight reconstruction error by how much each input actually
@@ -1098,7 +1159,8 @@ and whose backward pass passes gradients through unchanged, making the
 non-differentiable differentiable enough to optimize.
 
 **Signed gradient descent.** An update rule using only the sign of the gradient,
-so every parameter moves by exactly the learning rate each step.
+so every parameter with a nonzero gradient moves by exactly the learning rate
+each step.
 
 **Weight-only quantization.** Compressing weights while leaving activations in
 floating point. Simpler and more robust than also quantizing activations, and

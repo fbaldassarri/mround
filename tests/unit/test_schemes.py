@@ -123,16 +123,18 @@ class TestGroupsPerRow:
 
 
 class TestWithBits:
-    def test_only_the_bit_width_changes(self) -> None:
-        # Mixed-precision search varies the width and nothing else. The
-        # non-default fields here must form a VALID scheme: searched demands
-        # symmetric, so asymmetric exercises the symmetry field on its own
-        # elsewhere and this test uses the searched-symmetric pair.
-        base = QuantScheme(
-            bits=4,
-            group_size=64,
-            scale_init=ScaleInit.SEARCHED,
-        )
+    @pytest.mark.parametrize(
+        "base",
+        [
+            QuantScheme(bits=4, group_size=32, scale_init=ScaleInit.SEARCHED),
+            QuantScheme(bits=4, group_size=128, symmetry=Symmetry.ASYMMETRIC),
+        ],
+    )
+    def test_only_the_bit_width_changes(self, base: QuantScheme) -> None:
+        # Mixed precision search varies the width and nothing else. Every
+        # other field is away from its default in one of these two schemes,
+        # or a copy rebuilt from the defaults would pass; there are two
+        # because searched demands symmetric.
         derived = base.with_bits(2)
         assert derived.bits == 2
         assert derived.group_size == base.group_size

@@ -33,8 +33,10 @@ repos:
     rev: v2.3.0
     hooks:
       - id: mypy
-        files: ^(mround|tests|scripts|examples|ubuntu-24\.04)/
-        additional_dependencies: [pytest]
+        files: ^(mround|tests|scripts|examples)/
+        # numpy as in CI: the reference layer, the planner and the tests need
+        # its types, or strict mode fails them with errors CI does not see.
+        additional_dependencies: [pytest, "numpy==2.4.6"]
 
   - repo: local
     hooks:

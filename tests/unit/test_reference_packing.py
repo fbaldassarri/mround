@@ -118,9 +118,17 @@ class TestLayout:
     def test_stream_elements_straddle_word_boundaries(self, bits: int) -> None:
         # The property that distinguishes this layout: at least one element in
         # every 32 must cross a word boundary, otherwise the layout would be the
-        # simple one.
+        # simple one. Each of them is packed and read back from the stream, since
+        # the positions tested above straddle nothing at 3, 5 and 7 bits.
         straddlers = [i for i in range(32) if (i * bits) // 32 != ((i + 1) * bits - 1) // 32]
         assert straddlers, f"{bits} bits should produce straddling elements"
+        for element in straddlers:
+            codes = np.zeros((1, 32), dtype=np.int64)
+            codes[0, element] = 2**bits - 1
+            stream = 0
+            for word_index, word in enumerate(pack_codes(codes, bits)[0]):
+                stream |= int(word) << (32 * word_index)
+            assert stream == (2**bits - 1) << (element * bits), f"element {element} misplaced"
 
 
 class TestValidation:
@@ -226,10 +234,11 @@ class TestMLXLayoutCompatibility:
 
     def test_seven_bits_packs_here_but_has_no_mlx_representation(self) -> None:
         # 7 is supported by this layout and rejected by mx.quantize. The
-        # asymmetry is deliberate: packing serves GGUF as well, and the export
-        # layer is where the narrower constraint belongs. Pinned so that a
-        # future widening of one is a decision rather than a surprise.
+        # asymmetry is deliberate: 7 comes with the cross word layout (MEMORY.md
+        # D-007), and the export layer is where the narrower constraint belongs.
+        # Pinned so that a future widening of one is a decision rather than a
+        # surprise; MLX's side is pinned against MLX itself in
+        # test_mlx_formats.py.
         assert 7 in SUPPORTED_BITS
-        assert 7 not in self.MLX_BITS
         codes = np.random.default_rng(7).integers(0, 128, size=(4, 64), dtype=np.uint32)
         assert np.array_equal(unpack_codes(pack_codes(codes, 7), 64, 7), codes)

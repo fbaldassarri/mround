@@ -6,9 +6,11 @@ Tests are organized by what they need, not by what they cover:
 
 - ``unit`` needs nothing. Synthetic data, no model, no MLX where avoidable.
   These run everywhere, including on machines that are not Macs.
-- ``parity`` needs the dumped reference corpus in ``tests/fixtures``. Skipped
-  when it is absent, since generating it requires the reference stack.
-- ``integration`` needs MLX and a real model. Slow.
+- ``parity`` will need the dumped reference corpus in ``tests/fixtures``, and
+  skips when it is absent, since generating it requires the reference stack.
+  Neither the corpus generator nor a parity test exists yet
+  (``tests/parity/README.md``).
+- ``integration`` will need MLX and a real model, and is empty today.
 
 Anything mathematical belongs in ``unit`` with a hand-computed expectation. A
 test that loads a real model to verify arithmetic is in the wrong place.
@@ -31,7 +33,8 @@ def _mlx_available() -> bool:
     Deliberately a probe rather than a platform check: what matters is whether
     the tests can run, not what the machine claims to be. ``find_spec`` raises
     rather than returning ``None`` when the parent package is absent, which is
-    exactly the case on every machine that is not a Mac.
+    the case on any machine without MLX installed, a Mac or not: MLX's Linux CPU
+    wheel imports and runs the whole suite.
     """
     try:
         return importlib.util.find_spec("mlx.core") is not None

@@ -83,9 +83,9 @@ if [ -n "$MISSING" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# MLX is deliberately not a default in environment.yml, so that the file also
-# works on a machine used only for the framework-free reference layer. Install
-# it here when it is absent.
+# MLX is a runtime dependency in pyproject.toml, so an environment built from
+# environment.yml already has it, while a package installed with --no-deps
+# does not. Install it here when it is absent.
 # ---------------------------------------------------------------------------
 if ! python -c "import mlx.core" >/dev/null 2>&1; then
   section "Installing MLX"

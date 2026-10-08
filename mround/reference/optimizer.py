@@ -6,12 +6,13 @@ Implements DOCUMENTATION.md sections 1.4 and 5.4. The whole method is one line
 of arithmetic; everything else in this module is the schedule and the bookkeeping
 that makes the schedule reproducible.
 
-The schedule matters more than it looks. Because every step moves a parameter by
-exactly the current rate and the rate decays linearly to zero, the total distance
-a parameter can travel is finite and known: about ``lr * iters / 2``. With the
-default ``lr = c / iters`` that is ``c / 2``, independent of the step count. The
-learning rate and the iteration count are therefore coupled, and tuning one
-without the other changes how far rounding decisions can move.
+The schedule matters more than it looks. Because every step moves a parameter
+with a nonzero gradient by exactly the current rate and the rate decays linearly
+to zero, the total distance a parameter can travel is finite and known: about
+``lr * iters / 2``. With the default ``lr = c / iters`` that is ``c / 2``,
+independent of the step count. The learning rate and the iteration count are
+therefore coupled, and tuning one without the other changes how far rounding
+decisions can move.
 """
 
 from __future__ import annotations
@@ -71,9 +72,9 @@ def total_excursion(initial_lr: float, total_steps: int) -> float:
 def sign_update(param: Array, grad: Array, lr: float) -> Array:
     """Apply one signed gradient step.
 
-    The entire method: ``param - lr * sign(grad)``. Every parameter moves by
-    exactly ``lr``, in the direction the gradient indicates, regardless of the
-    gradient's magnitude.
+    The entire method: ``param - lr * sign(grad)``. Every parameter with a
+    nonzero gradient moves by exactly ``lr``, in the direction the gradient
+    indicates, regardless of the gradient's magnitude.
 
     Two consequences follow and both are load-bearing elsewhere. The update is
     invariant to any positive rescaling of the loss, so loss scaling is a no-op
@@ -105,9 +106,11 @@ class SignSGD:
 
         Args:
             learning_rate: A constant rate, or a schedule called with the step.
-            momentum: Exponential moving average factor on the gradient. Zero
-                gives pure signed gradient descent, which is the default and
-                what the published method uses.
+            momentum: Heavy ball factor: the sign is taken of
+                ``momentum * buffer + grad``, as in torch SGD with no dampening,
+                not of a moving average. Zero gives pure signed gradient
+                descent, which is the default and what the published method
+                uses.
         """
         self.learning_rate = learning_rate
         self.momentum = momentum

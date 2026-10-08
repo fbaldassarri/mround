@@ -19,7 +19,10 @@ MEMORY.md D-017 for what was verified against MLX's source and what was not.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -27,9 +30,6 @@ import pytest
 from mround.exceptions import ExportError, UnsupportedSchemeError
 from mround.reference import packing as ref_packing
 from mround.schemes import SUPPORTED_BITS, QuantScheme, Symmetry
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 pytestmark = pytest.mark.needs_mlx
 
@@ -258,6 +258,14 @@ class TestExport:
                 config={},
             )
 
+    def test_mlx_itself_still_rejects_seven_bits(self) -> None:
+        # The MLX half of the pin in test_reference_packing.py: a release that
+        # accepts 7 bits makes MLX_SUPPORTED_BITS and the refusal above stale,
+        # and this is where that surfaces.
+        assert 7 not in mlx_export.MLX_SUPPORTED_BITS
+        with pytest.raises(ValueError, match="bits"):
+            mx.quantize(mx.zeros((8, 64)), group_size=32, bits=7)
+
     def test_per_channel_is_refused(self, tmp_path: Path) -> None:
         with pytest.raises(UnsupportedSchemeError, match="per-channel"):
             mlx_export.export_mlx(
@@ -355,3 +363,52 @@ class TestExport:
         )
         unpacked = mlx_packing.unpack_codes(words, 256, bits)
         assert np.array_equal(np.array(unpacked), np.array(codes).astype(np.uint32))
+
+
+# Two layers at 2 bits and two at 4: a tie on the count that picks the default.
+_TIED_BLOCK = """
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+
+import mlx.core as mx
+
+from mround.formats.mlx_export import QuantizedLayer, _quantization_block
+from mround.schemes import QuantScheme
+
+
+def layer(bits):
+    scheme = QuantScheme(bits=bits, group_size=64)
+    return QuantizedLayer(mx.zeros((1, 1, 64)), mx.ones((1, 1, 1)), None, scheme)
+
+
+quantized = {"m.q": layer(2), "m.k": layer(2), "m.v": layer(4), "m.o": layer(4)}
+print(json.dumps(_quantization_block(quantized), sort_keys=True))
+"""
+
+
+class TestTiedDefault:
+    def test_a_tie_writes_the_same_configuration_in_every_process(self) -> None:
+        # The default scheme was the first maximum of a set of schemes, and a
+        # set iterates in the order of string hashes, which Python randomizes
+        # per process: the same layers wrote 2 bits as the default under some
+        # seeds and 4 bits under others. The loaded model was the same, the
+        # configuration file was not. One process cannot show it, since its
+        # seed is fixed at startup, so this runs fresh ones.
+        root = str(Path(__file__).resolve().parents[2])
+        outputs = set()
+        for seed in range(10):
+            result = subprocess.run(
+                [sys.executable, "-c", _TIED_BLOCK, root],
+                capture_output=True,
+                text=True,
+                check=True,
+                env=dict(os.environ, PYTHONHASHSEED=str(seed)),
+            )
+            outputs.add(result.stdout)
+        assert len(outputs) == 1, outputs
+        block = json.loads(outputs.pop())
+        assert block["bits"] == 2, "a tie goes to the narrower width"
+        assert block["m.v"] == {"group_size": 64, "bits": 4, "mode": "affine"}
+        assert "m.q" not in block

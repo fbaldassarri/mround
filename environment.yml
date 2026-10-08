@@ -16,7 +16,7 @@
 # installing the project into it:
 #
 #   conda create -n <name> python=3.11 && conda activate <name>
-#   pip install -e '.[dev]'
+#   pip install -e '.[dev,models,eval]'
 #
 # Creating an environment with `conda create` alone is the one trap: it never
 # runs the pip section below, so numpy, pytest, and the package itself are all
@@ -56,15 +56,15 @@ dependencies:
   - pip
 
   - pip:
-      # The project itself, editable, with the development tools.
-      - -e .[dev]
+      # The project itself, editable, with the development tools, the model
+      # stack (`models`: mlx-lm, transformers, safetensors, huggingface-hub,
+      # datasets) that loads and quantizes a real checkpoint, and `eval`
+      # (lm-eval) for the zero-shot suite. MLX itself is a runtime dependency
+      # in pyproject.toml, so it arrives with the package on every platform
+      # that has a wheel (macOS arm64 and Linux x86_64 both do).
+      - -e .[dev,models,eval]
 
-      # MLX and mlx-lm arrive through the project's own dependencies and the
-      # `models` extra above: mlx is a runtime dependency in pyproject.toml, so
-      # `-e .[dev]` installs it on every platform that has a wheel (macOS arm64
-      # and Linux x86_64 both do). Nothing here needs uncommenting.
-
-      # Uncomment to generate the reference parity corpus. This pulls in
+      # Uncomment to run the reference implementation here. This pulls in
       # PyTorch and Intel AutoRound, which are development-time tools only and
       # must never become runtime dependencies of the quantizer.
       # - -e .[parity]

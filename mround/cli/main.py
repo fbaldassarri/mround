@@ -5,7 +5,8 @@
 Four subcommands, all implemented. ``version`` and ``doctor`` answer the
 question a console script has to answer before anything else, whether this
 machine can run the thing at all. ``quantize`` and ``eval`` are thin over
-:mod:`mround.api` and :mod:`mround.eval.perplexity`: argument translation,
+:mod:`mround.api`, :mod:`mround.eval.perplexity` and
+:mod:`mround.eval.zeroshot`: argument translation,
 progress that is already printed by the layer underneath, and errors turned
 into a message and an exit status rather than a traceback.
 
@@ -30,7 +31,7 @@ from mround.exceptions import PlatformError
 __all__ = ["build_parser", "main"]
 
 # Column width for the human readable report. Wide enough for the longest label
-# below, which is "peak memory", with room for one more.
+# below, which is "reference layer" at 15 characters, with three to spare.
 _LABEL = 18
 
 
@@ -139,7 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     quantize.add_argument(
         "--calibration",
         default="auto",
-        help="Calibration corpus identifier (default: auto).",
+        help="Calibration corpus identifier (default: auto, which is pile-10k).",
     )
     quantize.add_argument("--seed", type=int, default=None, help="Calibration seed.")
     quantize.add_argument(
@@ -162,7 +163,25 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument(
         "--zeroshot",
         action="store_true",
-        help="Run the zero-shot task suite. Not implemented; see ROADMAP.md.",
+        help=(
+            "Run the zero-shot task suite: the reference implementation's own default "
+            "tasks less wikitext, through lm_eval's task definitions. Needs the eval "
+            "extra (pip install -e '.[eval]')."
+        ),
+    )
+    evaluate.add_argument(
+        "--tasks",
+        default=None,
+        help="Comma separated lm_eval task names for --zeroshot (default: the suite).",
+    )
+    evaluate.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Score only the first N documents of each task, for a quick check. The "
+            "default scores the full sets, which a published number requires."
+        ),
     )
     evaluate.add_argument(
         "--dataset",
@@ -226,12 +245,10 @@ def _doctor_report() -> dict[str, Any]:
     # The verdict comes from the function the loader itself calls, not from a
     # copy of its rule here, so the two cannot drift apart. Its message already
     # explains the Rosetta case, which is the one that bites.
-    try:
-        from mround.pipeline.loader import require_apple_silicon  # noqa: PLC0415
+    from mround.pipeline.loader import require_apple_silicon  # noqa: PLC0415
 
+    try:
         require_apple_silicon()
-    except ImportError:
-        platform_ok = record("apple silicon", False, "not checked, because mlx is missing")
     except PlatformError as exc:
         platform_ok = record("apple silicon", False, str(exc))
     else:
@@ -368,8 +385,8 @@ def _tuning(args: argparse.Namespace) -> Any:
     """Build the tuning recipe, leaving anything unset at the library default.
 
     Unset rather than restated: the defaults live in ``TuningConfig`` and are
-    the standard recipe every published number used, so a flag nobody passed
-    must not quietly become a second opinion about what the recipe is.
+    the standard recipe of every head to head row but row 48, so a flag nobody
+    passed must not quietly become a second opinion about what the recipe is.
     """
     from mround.schemes import TuningConfig  # noqa: PLC0415
 
@@ -486,15 +503,23 @@ def _evaluate(args: argparse.Namespace) -> int:
     """
     from mround.exceptions import MRoundError  # noqa: PLC0415
 
-    if args.zeroshot:
-        print(
-            "mround: the zero-shot suite is not implemented. See ROADMAP.md. "
-            "Perplexity is available now with --perplexity.",
-            file=sys.stderr,
-        )
+    if args.limit is not None and args.limit < 1:
+        print(f"mround: --limit must be at least 1; got {args.limit}", file=sys.stderr)
         return 1
+    tasks = None if args.tasks is None else [t.strip() for t in args.tasks.split(",") if t.strip()]
+    if tasks is not None and not tasks:
+        print("mround: --tasks names no task", file=sys.stderr)
+        return 1
+    # Perplexity is the default when nothing else is asked for, and runs
+    # beside the task suite when both are.
+    perplexity = args.perplexity or not args.zeroshot
 
     from mround.eval.perplexity import evaluate_perplexity  # noqa: PLC0415
+    from mround.eval.zeroshot import (  # noqa: PLC0415
+        DEFAULT_TASKS,
+        context_window,
+        evaluate_zeroshot,
+    )
     from mround.pipeline.loader import load_model  # noqa: PLC0415
 
     try:
@@ -502,17 +527,27 @@ def _evaluate(args: argparse.Namespace) -> int:
         # point here, while the loader refuses one by default so that nothing
         # quantizes a quantized model by accident.
         bundle = load_model(args.model, allow_quantized=True)
-        measured = evaluate_perplexity(
-            bundle.model,
-            bundle.tokenizer,
-            dataset=args.dataset,
-            max_tokens=args.max_tokens,
-        )
+        if perplexity:
+            measured = evaluate_perplexity(
+                bundle.model,
+                bundle.tokenizer,
+                dataset=args.dataset,
+                max_tokens=args.max_tokens,
+            )
+            print(f"  {measured.describe()}", flush=True)
+        if args.zeroshot:
+            summary, _ = evaluate_zeroshot(
+                bundle.model,
+                bundle.tokenizer,
+                tasks=DEFAULT_TASKS if tasks is None else tasks,
+                limit=args.limit,
+                max_length=context_window(bundle.config),
+            )
+            for line in summary.describe().splitlines():
+                print(f"  {line}")
     except MRoundError as exc:
         print(f"mround: {exc}", file=sys.stderr)
         return 1
-
-    print(f"  {measured.describe()}")
     return 0
 
 

@@ -127,9 +127,10 @@ def allocate_bits(
             quantization are expressed.
         budget_bits: Maximum total storage.
         max_states: Keep at most this many frontier states after each layer,
-            retaining those with the lowest predicted loss. **This makes the
-            result approximate**, because a state that looks poor now can lead
-            to the best final answer once cheaper layers follow it. ``None``,
+            taken at evenly spaced ranks of the sorted costs, so the cheapest
+            state always survives and, from two states up, the lowest loss one
+            too. **This makes the result approximate**, because a state it
+            drops can still lead to the best final answer. ``None``,
             the default, keeps the search exact. Set it only when the exact
             search is measurably too slow, and record that the result is no
             longer optimal.
@@ -215,7 +216,7 @@ def _prune(
 def _thin(
     frontier: dict[int, tuple[float, tuple[int, ...]]], max_states: int
 ) -> dict[int, tuple[float, tuple[int, ...]]]:
-    """Subsample the frontier uniformly along the cost axis.
+    """Subsample the frontier at evenly spaced ranks of its sorted costs.
 
     Keeping simply the lowest-loss states would be the obvious thing and it is
     wrong: after Pareto pruning the lowest-loss states are also the most
@@ -224,10 +225,10 @@ def _thin(
     instance that has plenty. That is not a hypothetical; it is what the first
     version of this function did.
 
-    Sampling evenly across the cost axis keeps both ends. The cheapest state
-    always survives, which preserves feasibility whenever the instance is
-    feasible at all, and the best-loss state always survives, which preserves
-    quality when budget is not the binding constraint.
+    Sampling at evenly spaced ranks keeps both ends. The cheapest state always
+    survives, which preserves feasibility whenever the instance is feasible at
+    all, and with two or more states kept the lowest loss state survives too,
+    which preserves quality when budget is not the binding constraint.
     """
     if len(frontier) <= max_states:
         return frontier

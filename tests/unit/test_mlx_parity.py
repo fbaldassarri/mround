@@ -3,12 +3,13 @@
 """The MLX implementation against the NumPy reference.
 
 This is the test that makes the port trustworthy. Both implementations are ours,
-they share no code, and one of them has exhaustive tests and
+they share no code but the scale search's candidate grid (``SearchGrid``, which
+``core/scale_search.py`` imports), and one of them has exhaustive tests and
 finite-difference-verified gradients. So a disagreement here is a porting defect
 in the MLX side, not an open question about which is right. See MEMORY.md D-011.
 
-Every test skips when MLX is unavailable, so a Linux machine still runs a green
-suite. The whole file is the reason MRound built the reference first.
+Every test skips when MLX is unavailable, so a machine without it still runs a
+green suite. The whole file is the reason MRound built the reference first.
 
 **Tolerances.** MLX computes in float32 by default and the reference in float64,
 so exact agreement is not expected on anything involving accumulation. Integer
@@ -17,11 +18,13 @@ close enough to a rounding boundary that float32 and float64 land on opposite
 sides, which the tests measure as a fraction rather than forbidding outright.
 
 Two of these tolerances are not float32 tolerances and are labeled where they
-appear. ``INITIAL_LOSS_TOL`` holds a real, measured, unexplained divergence
-(MEMORY.md Q-007); calling it precision would have been the comfortable answer
-and it is false. The gradient tests, by contrast, are tight, because the clamp
-boundary convention that used to make them fail is now specified on both sides
-rather than inherited from whichever framework got there first (D-013).
+appear. ``INITIAL_LOSS_TOL`` holds a real, measured divergence, the matrix
+product's 8.5e-4 relative error, which the squared residual raises to 1.42e-3
+(MEMORY.md D-014, which closed Q-007); calling it a float32 tolerance would
+have been the comfortable answer and it is false. The gradient tests, by
+contrast, are tight, because the clamp boundary convention that used to make
+them fail is now specified on both sides rather than inherited from whichever
+framework got there first (D-013).
 """
 
 from __future__ import annotations
@@ -57,15 +60,15 @@ FLOAT32_TOL = 2e-5
 # The round-to-nearest layer loss. This is NOT a float32 tolerance, and calling
 # it one would be wrong. It is inherited from a measured property of the hardware:
 # mx.matmul returns 8.5e-4 relative error on float32 operands, and the loss
-# squares the residual, so it carries about twice that. See MEMORY.md D-014.
+# squares the residual, so it carries up to twice that. See MEMORY.md D-014.
 #
 # Measured on Apple Silicon after D-014: 1.42e-3, 1.43e-3, 1.41e-3, 1.43e-3 at 2,
-# 3, 4, and 8 bits. Twice the matmul error, as predicted, and flat across bit
-# widths, which is the property D-014 was after: the error now scales with the
-# residual rather than with the whole layer output. 3e-3 is that number with room
-# for a different machine or MLX build, and it still fails on any real regression,
-# since a single differing code out of a thousand moves this loss by one to four
-# percent.
+# 3, 4, and 8 bits. About 1.7 times the matmul error, inside the doubling the
+# square allows, and flat across bit widths, which is the property D-014 was
+# after: the error now scales with the residual rather than with the whole layer
+# output. 3e-3 is that number with room for a different machine or MLX build, and
+# it still fails on any real regression, since a single differing code out of a
+# thousand moves this loss by one to four percent.
 #
 # Tighten it only against a measurement. check_mlx.sh prints the achieved figure
 # every run for exactly that purpose.
@@ -229,6 +232,20 @@ class TestReconstruction:
             f"{differing:.3%} of codes differ at {bits} bits, which is too many "
             "to explain as float32 boundary effects"
         )
+
+    @pytest.mark.parametrize("bits", [2, 4, 8])
+    @pytest.mark.parametrize("symmetry", list(Symmetry))
+    def test_dequantize_matches_the_reference(self, bits: int, symmetry: Symmetry) -> None:
+        # The codes and scales back to weights, through a width that does not
+        # divide into groups, so the padding is undone on the way out too.
+        weight, _ = synthetic(seed=1000 + bits, out_features=8, in_features=80)
+        scheme = QuantScheme(bits=bits, group_size=32, symmetry=symmetry)
+        expected = ref_quant.fake_quantize(weight, ref_quant.init_params(weight, scheme), scheme)
+        codes, scale, zero_point = mlx_quant.quantize_codes(
+            to_mx(weight), mlx_quant.init_params(to_mx(weight), scheme), scheme
+        )
+        got = np.array(mlx_quant.dequantize(codes, scale, zero_point, weight.shape, scheme))
+        assert relative_error(got, expected.qdq) < FLOAT32_TOL
 
     @pytest.mark.parametrize("bits", [2, 4])
     def test_dominant_extreme_still_reconstructs_exactly(self, bits: int) -> None:
@@ -434,6 +451,27 @@ class TestOptimizer:
         schedule = mlx_sgd.LinearDecay(0.005, 200)
         assert schedule(200) == 0.0
 
+    def test_momentum_matches_the_reference(self) -> None:
+        # No caller sets momentum today, so nothing else would notice the two
+        # heavy ball updates drifting apart. Six steps on random gradients, the
+        # last two a twentieth the size, so that in those the accumulated
+        # buffer and not the gradient sets the sign of nearly every update; 64
+        # elements are enough for a moving average or a dampened buffer to
+        # flip at least one sign.
+        from mround.reference.optimizer import LinearDecay as RefDecay  # noqa: PLC0415
+        from mround.reference.optimizer import SignSGD as RefSignSGD  # noqa: PLC0415
+
+        gen = np.random.default_rng(13)
+        theirs = RefSignSGD(RefDecay(0.1, 10), momentum=0.9)
+        ours = mlx_sgd.SignSGD(mlx_sgd.LinearDecay(0.1, 10), momentum=0.9)
+        ref_params = {"v": np.zeros(64)}
+        mlx_params = {"v": mx.zeros(64)}
+        for step in range(6):
+            grad = gen.normal(size=64) * (1.0 if step < 4 else 0.05)
+            ref_params = theirs.apply(ref_params, {"v": grad})
+            mlx_params = ours.apply(mlx_params, {"v": to_mx(grad)})
+        assert relative_error(np.array(mlx_params["v"]), ref_params["v"]) < FLOAT32_TOL
+
 
 class TestLosses:
     def test_reconstruction_loss_matches(self) -> None:
@@ -456,6 +494,19 @@ class TestLosses:
         pred[0, 0] = 1e6
         got = float(mlx_losses.outlier_suppressed_loss(to_mx(pred), mx.zeros((1, 2000))))
         assert got == pytest.approx(0.0, abs=1e-6)
+
+    def test_the_denominator_is_the_full_element_count(self) -> None:
+        # The agreement test above tells an n - k denominator apart by 0.1001
+        # percent against its 0.1 percent tolerance, so the rule is pinned
+        # here directly, as the reference's own tests pin it.
+        gen = np.random.default_rng(2)
+        pred = gen.normal(size=(10, 100))
+        n = pred.size
+        k = max(1, int(n * 0.001))
+        loss = mlx_losses.outlier_suppressed_loss(to_mx(pred), mx.zeros((10, 100)), fraction=0.001)
+        kept = np.sort(np.abs(pred).reshape(-1))[: n - k]
+        assert float(loss) == pytest.approx(float(np.sum(kept**2) / n), rel=1e-5)
+        assert float(loss) != pytest.approx(float(np.sum(kept**2) / (n - k)), rel=1e-5)
 
 
 class TestTuning:
@@ -486,12 +537,12 @@ class TestTuning:
 
     @pytest.mark.parametrize("bits", [2, 4])
     def test_the_reconstruction_behind_that_loss_is_identical(self, bits: int) -> None:
-        # This guards the diagnosis of Q-007, not the loss. The loose tolerance
-        # above is defensible only while the reconstruction feeding it is exact;
-        # if the gap ever turns out to be a differing code, this test fails first
-        # and names the real cause, because one code step is four orders of
-        # magnitude larger than FLOAT32_TOL. Same seeds as the test above,
-        # deliberately.
+        # This guards D-014's diagnosis of Q-007, not the loss. The loose
+        # tolerance above is defensible only while the reconstruction feeding
+        # it is exact; if the gap ever turns out to be a differing code, this
+        # test fails first and names the real cause, because one code step is
+        # four orders of magnitude larger than FLOAT32_TOL. Same seeds as the
+        # test above, deliberately.
         weight, _ = synthetic(seed=500 + bits)
         scheme = QuantScheme(bits=bits, group_size=32)
 
@@ -501,7 +552,7 @@ class TestTuning:
         )
         assert np.array_equal(np.array(codes), expected.codes), (
             "codes differ, so the initial-loss gap is a quantizer defect rather "
-            "than the open question Q-007 records"
+            "than the matrix product error D-014 measured"
         )
 
     @pytest.mark.parametrize("bits", [2, 4])
@@ -575,8 +626,10 @@ class TestScaleSearchParity:
         from mround.core import scale_search as mlx_search  # noqa: PLC0415
         from mround.reference import scale_search as ref_search  # noqa: PLC0415
 
+        # 512 groups, so the fraction below permits ten differing choices and
+        # the quality check after it can run; at 32 groups it permitted none.
         rng = np.random.default_rng(bits)
-        weight = rng.normal(size=(16, 64)).astype(np.float32)
+        weight = rng.normal(size=(64, 256)).astype(np.float32)
         scheme = QuantScheme(bits=bits, group_size=32)
 
         ours = np.array(mlx_search.search_scales(mx.array(weight), scheme))
@@ -604,8 +657,8 @@ class TestScaleSearchParity:
         from mround.reference import scale_search as ref_search  # noqa: PLC0415
 
         rng = np.random.default_rng(42)
-        weight = rng.normal(size=(8, 32)).astype(np.float32)
-        importance = rng.uniform(0.1, 10.0, size=32)
+        weight = rng.normal(size=(32, 64)).astype(np.float32)
+        importance = rng.uniform(0.1, 10.0, size=64)
         scheme = QuantScheme(bits=3, group_size=16)
 
         ours = np.array(
@@ -713,10 +766,10 @@ class TestSearchedBranchParity:
         np.testing.assert_allclose(theirs.alpha, 0.0, atol=0.0)
 
     def test_tuning_on_the_searched_grid_matches_the_reference_loop(self) -> None:
-        # The recipe every 2 bit and mixed ledger row was produced under, run
-        # through both loops from the same searched scale. Until the reference
-        # loop accepted init_scale this comparison did not exist for the
-        # branch that produced the project's headline numbers.
+        # The recipe every 2 bit and mixed ledger row from row 10 on was
+        # produced under, run through both loops from the same searched scale.
+        # Until the reference loop accepted init_scale this comparison did not
+        # exist for the branch that produced the project's headline numbers.
         from mround.reference import scale_search as ref_search  # noqa: PLC0415
 
         rng = np.random.default_rng(21)
@@ -740,8 +793,9 @@ class TestSearchedBranchParity:
         # That is not a divergence in the searched branch: identical code and
         # identical dtype on CPU land on the reference, so what the Mac adds is
         # the matmul kernel D-014 measured at 8.5e-4, and this loss squares the
-        # residual and carries about twice it. 1.32e-3 sits in the band this
-        # constant was measured over (1.41e-3 to 1.43e-3 at 2, 3, 4 and 8 bits).
+        # residual and carries about twice it. 1.32e-3 is that floor on another
+        # layer, a little under the 1.41e-3 to 1.43e-3 this constant was
+        # measured at (2, 3, 4 and 8 bits) and well inside its 3e-3.
         # The lesson is the one CLAUDE.md states: a suite green on CPU and red
         # on Metal is a finding, and here the finding was in the test.
         assert ours.initial_loss == pytest.approx(theirs.initial_loss, rel=INITIAL_LOSS_TOL)

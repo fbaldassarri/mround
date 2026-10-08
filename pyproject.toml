@@ -46,8 +46,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Model loading and checkpoint IO. Required by `mround/pipeline/` and the export
-# paths once those exist; not needed to run the quantization mathematics.
+# Model loading and checkpoint IO. Required by `mround/pipeline/`, which loads
+# real checkpoints; not needed to run the quantization mathematics.
 models = [
     "mlx-lm>=0.31",
     "safetensors>=0.4.3",
@@ -59,11 +59,16 @@ models = [
     # because the perplexity harness reads its corpora the same way.
     "datasets>=2.20",
 ]
-# Generating the parity corpus requires the reference implementation's stack.
+# The reference implementation's stack, which the head to head comparisons and
+# the overlap check run against; the layer level parity corpus it was first
+# declared for is not built (tests/parity/README.md).
 # This is a development-time extra and must never become a runtime dependency.
 # See MEMORY.md D-002.
 parity = ["torch>=2.4", "auto-round>=0.14"]
-eval = ["datasets>=2.20", "lm-eval>=0.4.3"]
+# lm-eval at the release the zero-shot evaluator was checked against: it
+# subclasses that release's TemplateLM, whose pairing of context and
+# continuation is part of what the numbers mean (MEMORY.md D-049).
+eval = ["datasets>=2.20", "lm-eval>=0.4.12"]
 dev = [
     "pytest>=8.2",
     "pytest-cov>=5.0",

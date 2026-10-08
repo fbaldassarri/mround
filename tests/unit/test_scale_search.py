@@ -61,16 +61,19 @@ class TestGrid:
     ) -> None:
         # The table in analysis 04 section 5.2, verified there numerically
         # against the reference source. The 2-bit row is the hard-coded finer
-        # window; every other width is 200 candidates regardless of ratio.
+        # window; every other width is 200 candidates at the default ratio.
         got_step, got_half = SearchGrid().steps(bits)
         assert got_step == pytest.approx(step, abs=1e-12)
         assert got_half == half_count
 
-    def test_ratio_moves_the_span_never_the_count(self) -> None:
+    def test_ratio_moves_the_span_and_truncation_the_count(self) -> None:
+        # nmax * ratio / step truncates to 99 at some ratios, 0.9 among them,
+        # as the reference's own expression does.
         wide = SearchGrid(ratio=1.0).steps(4)
         default = SearchGrid().steps(4)
         assert wide[1] == default[1] == 100
         assert wide[0] > default[0]
+        assert SearchGrid(ratio=0.9).steps(4)[1] == 99
 
 
 class TestAgainstBruteForce:

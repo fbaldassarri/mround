@@ -193,11 +193,12 @@ class TestPackage:
         # A stub that raises NotImplementedError when called is fine. A stub
         # that cannot even be imported means the skeleton is broken.
         #
-        # One exception is legitimate: `mround.core` is the MLX layer and imports
-        # MLX at module level, which is correct, so on a machine without MLX
-        # those modules cannot import. That specific failure is tolerated and
-        # every other one is not, which keeps the check meaningful here while
-        # remaining complete on Apple Silicon.
+        # One exception is legitimate: `mround.core`, the MLX exporter and packer
+        # in `mround.formats`, and the device, runner and scoring modules of
+        # `mround.pipeline` import MLX at module level, which is correct, so on a
+        # machine without MLX those modules cannot import. That specific failure
+        # is tolerated and every other one is not, which keeps the check
+        # meaningful here while remaining complete on Apple Silicon.
         broken: list[str] = []
         for name in _module_names():
             try:
@@ -402,10 +403,10 @@ class TestEnvironment:
     def test_mlx_is_installed_where_it_is_the_gate(self) -> None:
         # On Apple Silicon a missing MLX must fail, not skip. Every MLX gated
         # test collapses to a skip when the framework is absent, so without
-        # this check a Mac with a broken environment reports a green suite of
-        # about two hundred skips, which is the one outcome the gate exists to
-        # rule out. Linux without MLX is the framework-free path and is not
-        # gated here.
+        # this check a Mac with a broken environment reports a green suite about
+        # two hundred tests short, each MLX file counted as a single skip, which
+        # is the one outcome the gate exists to rule out. Linux without MLX is
+        # the framework-free path and is not gated here.
         assert importlib.util.find_spec("mlx.core") is not None, (
             "MLX is not importable on this Mac: the MLX suite has silently "
             "become skips. Install it with pip install -e '.[dev]'."
@@ -482,17 +483,25 @@ class TestCLI:
         assert main(argv) == 1
         assert capsys.readouterr().err.startswith("mround: ")
 
-    def test_the_zero_shot_suite_says_it_is_not_here_yet(
+    def test_the_zero_shot_suite_reports_rather_than_traceback(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        # The one thing `eval` advertises and cannot do. It names what it
-        # cannot do, where the plan is, and what it can do instead, rather
-        # than failing somewhere inside a stub.
-        assert main(["eval", "a-checkpoint", "--zeroshot"]) == 1
-        message = capsys.readouterr().err
-        assert "zero-shot" in message
-        assert "ROADMAP.md" in message
-        assert "--perplexity" in message
+        # Until 2026-09-28 this checked that `--zeroshot` said it was not
+        # implemented. It is now (MEMORY.md D-049), and what matters is what
+        # matters for the other subcommands: a missing model, a platform that
+        # cannot run MLX or a missing evaluation stack arrives as a message
+        # and an exit status, not a traceback.
+        assert main(["eval", "definitely-not-a-model", "--zeroshot"]) == 1
+        assert capsys.readouterr().err.startswith("mround: ")
+
+    @pytest.mark.parametrize(
+        ("extra", "complaint"), [(["--limit", "0"], "--limit"), (["--tasks", " , "], "--tasks")]
+    )
+    def test_the_zero_shot_options_are_checked_before_anything_loads(
+        self, extra: list[str], complaint: str, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert main(["eval", "definitely-not-a-model", "--zeroshot", *extra]) == 1
+        assert complaint in capsys.readouterr().err
 
     def test_version_subcommand_matches_the_flag(self, capsys: pytest.CaptureFixture[str]) -> None:
         # `mround --version` worked while `mround version` raised, which is a
