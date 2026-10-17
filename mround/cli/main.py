@@ -23,10 +23,13 @@ import argparse
 import json
 import os
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mround import __version__
 from mround.exceptions import PlatformError
+
+if TYPE_CHECKING:
+    from mround.schemes import Symmetry
 
 __all__ = ["build_parser", "main"]
 
@@ -65,7 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     quantize = sub.add_parser("quantize", help="Quantize a model.")
     quantize.add_argument("model", help="Hugging Face repository id or local path.")
-    quantize.add_argument("-o", "--output-dir", required=True, help="Where to write.")
+    quantize.add_argument(
+        "-o",
+        "--output-dir",
+        default=None,
+        help="Where to write. Required unless --dry-run.",
+    )
     quantize.add_argument(
         "-b",
         "--bits",
@@ -138,6 +146,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Calibration sequences per step (default: 8).",
     )
     quantize.add_argument(
+        "--micro-batches",
+        type=int,
+        default=None,
+        help=(
+            "Run each step's batch in this many pieces, summing their gradients: "
+            "the step's activation memory falls by about this factor and the "
+            "step is still the whole batch's, but the run is slower and its "
+            "checkpoint is another draw, so use it only where a step does not "
+            "fit (default: 1)."
+        ),
+    )
+    quantize.add_argument(
         "--calibration",
         default="auto",
         help="Calibration corpus identifier (default: auto, which is pile-10k).",
@@ -150,6 +170,33 @@ def build_parser() -> argparse.ArgumentParser:
             "Proceed even when the group size can only reach a small part of the "
             "model. Without this, a run that would leave most layers at full "
             "precision is refused before it starts rather than after an hour."
+        ),
+    )
+    quantize.add_argument(
+        "--memory-budget",
+        type=float,
+        default=None,
+        metavar="GB",
+        help=(
+            "Memory the run may be predicted to reach, in GB of 10^9 bytes, the unit "
+            "run records print (default: 85 percent of this Mac's memory). The peak "
+            "is predicted from the model's configuration before anything is loaded, "
+            "and a run predicted past the budget is refused with the --micro-batches "
+            "that would fit."
+        ),
+    )
+    quantize.add_argument(
+        "--skip-memory-check",
+        action="store_true",
+        help="Predict and record the peak, but run even when it is past the budget.",
+    )
+    quantize.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Predict the run's peak memory against the budget and stop, reading the "
+            "model's configuration and nothing else. Exits 0 when it fits, 1 when "
+            "the run would be refused."
         ),
     )
 
@@ -256,14 +303,25 @@ def _doctor_report() -> dict[str, Any]:
             "apple silicon", True, f"{environment.get('system')} on {environment.get('machine')}"
         )
 
-    device: dict[str, Any] = {"default": None, "peak_memory_reported": False}
+    device: dict[str, Any] = {
+        "default": None,
+        "peak_memory_reported": False,
+        "memory_bytes": None,
+        "memory_budget_bytes": None,
+    }
     try:
         import mlx.core as mx  # noqa: PLC0415
 
-        from mround.pipeline.device import peak_memory, reset_peak_memory  # noqa: PLC0415
+        from mround.pipeline.device import (  # noqa: PLC0415
+            device_memory,
+            peak_memory,
+            reset_peak_memory,
+        )
     except ImportError as exc:
         mlx_ok = record("mlx", False, f"not importable: {exc}")
     else:
+        from mround.planner.memory import default_budget  # noqa: PLC0415
+
         device["default"] = str(mx.default_device())
         # A megabyte, allocated and evaluated, so that the peak is something
         # this build has actually been asked to report rather than a zero that
@@ -271,6 +329,11 @@ def _doctor_report() -> dict[str, Any]:
         reset_peak_memory()
         mx.eval(mx.zeros((512, 512), dtype=mx.float32))
         device["peak_memory_reported"] = peak_memory() > 0
+        # What the check before a run holds a prediction to, so that the
+        # budget a refusal names can be read here before any run is tried.
+        memory = device_memory()
+        device["memory_bytes"] = memory or None
+        device["memory_budget_bytes"] = default_budget(memory)
         mlx_ok = record("mlx", True, f"{packages['mlx']}, default device {device['default']}")
 
     # Checked by metadata rather than by importing it: mlx-lm pulls in
@@ -337,6 +400,13 @@ def _render_doctor(report: dict[str, Any]) -> str:
     lines.append("")
     row("default device", report["device"]["default"])
     row("peak memory", "reported" if report["device"]["peak_memory_reported"] else "not reported")
+    memory = report["device"].get("memory_bytes")
+    budget = report["device"].get("memory_budget_bytes")
+    row("device memory", f"{memory / 1e9:.2f} GB" if memory else "not reported")
+    row(
+        "memory budget",
+        f"{budget / 1e9:.2f} GB, what a run may be predicted to reach" if budget else "none",
+    )
 
     lines.extend(["", "  checks"])
     for check in report["checks"]:
@@ -396,6 +466,7 @@ def _tuning(args: argparse.Namespace) -> Any:
         n_samples=standard.n_samples if args.samples is None else args.samples,
         seq_len=standard.seq_len if args.seq_len is None else args.seq_len,
         batch_size=standard.batch_size if args.batch_size is None else args.batch_size,
+        micro_batches=standard.micro_batches if args.micro_batches is None else args.micro_batches,
     )
 
 
@@ -437,15 +508,19 @@ def _describe_request(args: argparse.Namespace, candidates: tuple[int, ...]) -> 
     samples = standard.n_samples if args.samples is None else args.samples
     sequence = standard.seq_len if args.seq_len is None else args.seq_len
     batch = standard.batch_size if args.batch_size is None else args.batch_size
+    pieces = standard.micro_batches if args.micro_batches is None else args.micro_batches
+    split = f", each run in {pieces} pieces" if pieces > 1 else ""
     group = "per channel" if args.group_size == -1 else f"group size {args.group_size}"
     lines = [
         "",
         f"  {'model':<{_LABEL}}{args.model}",
         f"  {'scheme':<{_LABEL}}{width}, {group}, {symmetry.value}, scale {scale}",
         f"  {'calibration':<{_LABEL}}{args.calibration}, {samples} sequences of "
-        f"{sequence} tokens, batches of {batch}",
+        f"{sequence} tokens, batches of {batch}{split}",
         f"  {'tuning':<{_LABEL}}{steps} steps per block",
-        f"  {'writing to':<{_LABEL}}{args.output_dir}",
+        f"  {'writing to':<{_LABEL}}{args.output_dir}"
+        if args.output_dir is not None
+        else f"  {'writing to':<{_LABEL}}nothing, a dry run",
         "",
     ]
     return "\n".join(lines)
@@ -463,15 +538,25 @@ def _quantize(args: argparse.Namespace) -> int:
     from mround.exceptions import MRoundError  # noqa: PLC0415
     from mround.schemes import Symmetry  # noqa: PLC0415
 
+    if args.memory_budget is not None and not args.memory_budget > 0:
+        print(
+            f"mround: --memory-budget is a positive number of GB, not {args.memory_budget}",
+            file=sys.stderr,
+        )
+        return 1
+    budget = None if args.memory_budget is None else round(args.memory_budget * 1e9)
+    symmetry = Symmetry.ASYMMETRIC if args.asym else Symmetry.SYMMETRIC
     try:
         candidates = _widths(args.options)
         print(_describe_request(args, candidates), flush=True)
+        if args.dry_run:
+            return _dry_run(args, candidates, symmetry, budget)
         result = api.quantize(
             args.model,
             output_dir=args.output_dir,
             bits=args.bits,
             group_size=args.group_size,
-            symmetry=Symmetry.ASYMMETRIC if args.asym else Symmetry.SYMMETRIC,
+            symmetry=symmetry,
             average_bits=args.average_bits,
             candidate_bits=candidates,
             remainder_bits=args.remainder_bits,
@@ -480,6 +565,8 @@ def _quantize(args: argparse.Namespace) -> int:
             export_format=args.format,
             min_block_coverage=0.0 if args.allow_dense else api.MIN_BLOCK_COVERAGE,
             seed=args.seed,
+            memory_budget=budget,
+            memory_check=not args.skip_memory_check,
         )
     except (MRoundError, ValueError) as exc:
         print(f"mround: {exc}", file=sys.stderr)
@@ -493,6 +580,41 @@ def _quantize(args: argparse.Namespace) -> int:
     print(f"  wrote {result.output_dir}")
     print(f"  settings in {result.config_path.name}, which reproduces this run")
     return 0
+
+
+def _dry_run(
+    args: argparse.Namespace,
+    candidates: tuple[int, ...],
+    symmetry: Symmetry,
+    budget: int | None,
+) -> int:
+    """Predict the run's peak memory against the budget, and stop.
+
+    Returns:
+        Zero when the run fits the budget, one when it would be refused, so
+        that a script can ask before it commits a machine for hours.
+    """
+    from mround import api  # noqa: PLC0415
+
+    check = api.predict_memory(
+        args.model,
+        bits=args.bits,
+        group_size=args.group_size,
+        symmetry=symmetry,
+        average_bits=args.average_bits,
+        candidate_bits=candidates,
+        remainder_bits=args.remainder_bits,
+        tuning=_tuning(args),
+        memory_budget=budget,
+    )
+    print(f"  {check.describe()}")
+    stages = check.prediction.stages
+    for stage, reached in sorted(stages.items(), key=lambda item: -item[1]):
+        print(f"    {stage:<{_LABEL - 2}}{reached / 1e9:.2f} GB")
+    if check.fits:
+        return 0
+    print(f"mround: {check.explain()}", file=sys.stderr)
+    return 1
 
 
 def _evaluate(args: argparse.Namespace) -> int:
@@ -575,6 +697,8 @@ def main(argv: list[str] | None = None) -> int:
         return _doctor(args.json)
 
     if args.command == "quantize":
+        if args.output_dir is None and not args.dry_run:
+            parser.error("quantize needs -o/--output-dir, unless it is a --dry-run")
         return _quantize(args)
 
     return _evaluate(args)

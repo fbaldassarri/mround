@@ -21,23 +21,26 @@ AutoRound is the reference implementation of the method MRound implements. It
 is a serious piece of work by the people who published the method, and beating
 it is the only comparison that means anything.
 
-One setting is matched in two tables only, and it is the reference's own
+One setting is matched in three tables only, and it is the reference's own
 algorithm. AutoRound keeps its implementation of SignRound v2's tuning, a
 searched initial scale and, below 4 bits, the outlier suppressed loss, behind an
 option, `enable_alg_ext`, that is off by default, and its documentation says to
-turn it on to reproduce the SignRound v2 results. Two
-Qwen2.5-0.5B-Instruct tables have been run both ways. At 2 bits, rows 105 to
-107 with the option on beside rows 88, 33 and 89 with it off: MRound is 9.25
-percent ahead with it on and 30.63 with it off (Uniform 2 bits, below, with
-what that pair leaves open). At mixed 2.5, rows 108 to 110 beside rows 43, 45
-and 46: 12.88 percent ahead with it on and 20.68 with it off (Mixed precision,
-below). Every other reference arm in this document ran with it off. The mixed
-precision arms use the reference's own allocator for that method, AutoScheme,
-with the option and without it. So outside those two tables every comparison
-below sets MRound against the reference's default tuning, how far the option
-would move the reference there has not been measured yet, and no table, those
-two included, sets MRound against the configuration the reference's
-documentation recommends at 2 bits (What these numbers do not show).
+turn it on to reproduce the SignRound v2 results. Three tables have been run
+both ways. At 2 bits on Qwen2.5-0.5B-Instruct, rows 105 to 107 with the option
+on beside rows 88, 33 and 89 with it off: MRound is 9.25 percent ahead with it
+on and 30.63 with it off (Uniform 2 bits, below, with what that pair leaves
+open). At 2 bits on Qwen2.5-3B-Instruct, rows 127 to 129 beside rows 124 to
+126: 1.25 percent ahead with it on, behind on one seed of three, so the two are
+level, and 13.51 with it off (Uniform 2 bits, below). At mixed 2.5 on
+Qwen2.5-0.5B-Instruct, rows 108 to 110 beside rows 43, 45 and 46: 12.88 percent
+ahead with it on and 20.68 with it off (Mixed precision, below). Every other
+reference arm in this document ran with it off. The mixed precision arms use
+the reference's own allocator for that method, AutoScheme, with the option and
+without it. So outside those three tables every comparison below sets MRound
+against the reference's default tuning, how far the option would move the
+reference there has not been measured yet, and no table, those three included,
+sets MRound against the configuration the reference's documentation recommends
+at 2 bits (What these numbers do not show).
 
 ## What is measured, and how
 
@@ -94,11 +97,16 @@ Mac's CPU, the 4 bit comparison this document quoted until 2026-09-28). A
 comparison that does not say which it did is not a comparison.
 
 **Size is reported with quality, always.** A quantizer can buy perplexity with
-bytes. MRound's checkpoints run 2.4 to 4.9 percent larger than the reference's
+bytes. MRound's checkpoints run 2.4 to 6.2 percent larger than the reference's
 at the same nominal width and group size 64, and 1.2 percent larger at group
 size 128, because the format it writes stores a bias beside every group's
 scale, and that difference is stated in every table
-below rather than left out. Where the two are compared at the same bytes
+below rather than left out. The bias costs a fixed share of the weights a
+side quantizes and nothing of the tensors both keep dense, so the difference
+grows with the share of the model its block stack holds: at 2 bits it is 3.02
+percent on Qwen2.5-0.5B-Instruct and 6.19 on Qwen2.5-3B-Instruct, and in both
+the tensors MRound stores exceed the reference's packed bytes by exactly the
+biases. Where the two are compared at the same bytes
 instead, it says so.
 
 **Cost is the weakest number here and is not reported as a ratio.** MRound
@@ -106,8 +114,9 @@ runs on the Apple GPU through MLX; the reference defaults to the CPU on Apple
 Silicon (its device manager redirects there and offers `--device_map=mps` as an
 override), so every reference arm in the tables below ran on a CPU, on the
 Linux machine for every row but row 35, which ran on the Mac's own CPU,
-except the Qwen2.5-1.5B-Instruct table (rows 92 to 94), whose reference arms
-ran on the Linux machine's integrated GPU, as described below. Every row
+except the Qwen2.5-1.5B-Instruct and Qwen2.5-3B-Instruct tables (rows 92 to
+94 and 124 to 129), whose reference arms ran on the Linux machine's integrated
+GPU, as described below. Every row
 records which under `cost.reference_host`, and rows 55 to 79 restate each
 reference arm's machine, release, torch build and device in a
 `reference_environment` block, one provenance row per head to head row. A
@@ -176,10 +185,22 @@ took 4.1 times as long (rows 31 and 36, under 0.14.2), so the lead that
 widens with the model is the Arc graphics' over its own CPU, not MRound's
 over the reference. At that size MRound's allocator peaked at 27.27 GB, four
 fifths of the Mac's 32 GiB, and the reference's pool on the Arc graphics at
-12.05 GB with 10.87 GB resident; the reference moves one block at a time to
+12.05 GB with 10.87 GB resident (MRound's current tree writes the same
+checkpoint to the byte at a peak of 19.34 GB, row 121, having stopped holding
+the whole model, a third activation stream and its codes in float32, and at
+8.26 GB with every tuning step in eight pieces, row 122, which is another
+draw rather than the same checkpoint: 21.1863 against 20.8947, the two
+checkpoints 0.33 apart, as two seeds of the reference are); the
+reference moves one block at a time to
 its device and keeps the rest on the host, so those two are not one quantity
-either. Those pairs put each
-implementation on its own machine's integrated GPU, which removes the CPU
+either. At Qwen2.5-3B-Instruct, 2 bits, three seeds (rows 124 to 126), the Arc
+arm took 21,758.6 to 21,770.9 s against MRound's 16,497.2 to 16,561.5 s, and
+MRound's block loop was 1.31 to 1.32 times faster on every seed; on seed 44
+the Arc arm took 1.98 times as long as at 1.5 billion and MRound, on a later
+tree, 1.91 times, for twice the parameters. There MRound's allocator peaked at
+20.07 GB on every seed, three fifths of the Mac's 32 GiB, and the reference's
+pool on the Arc graphics at 15.90 GB with 20.18 GB resident. Those pairs put
+each implementation on its own machine's integrated GPU, which removes the CPU
 against GPU category difference and not the device difference, so they are
 reported with both machines named and not as a ratio.
 Before these rows the only same machine pair was 4 bit Qwen2.5-0.5B-Instruct
@@ -205,7 +226,15 @@ of 2 percent away in 94 percent of groups, and that is exactly what a change
 of release (66 percent, at the same seed) or of calibration seed (65 percent)
 also does, and what a change of tuning precision on one device does (0.095 at
 4 bits), while the same seed produced twice on one device and release
-reproduces all 357,826,560 weights. MRound does the same: one configuration
+reproduces all 357,826,560 weights, under either of the reference's tunings,
+and still does after the Linux machine's operating system was upgraded to a new
+release and then reinstalled, its software environment rebuilt (rows 117 and
+118 against rows 88 and 105, below). The reference on the integrated GPU
+repeats itself too: seed 44's 2 bit arm, produced again there after the
+reinstall, on another release of the GPU's compute runtime and in its
+environment rebuilt, is row 91's checkpoint to the bit, with row 91's
+perplexity and the same device memory to the byte (row 123). MRound does the
+same: one configuration
 produced twice on the Apple GPU, three days apart and on two labelled trees
 (rows 86 and 95), wrote the same checkpoint file to the byte. The block losses
 the reference prints do not see the device change: the accelerator arms' losses
@@ -213,11 +242,12 @@ agree with the CPU arms' to a fifth of a percent on average, to six decimals
 where the release prints six, with the same best step on nearly every block.
 Two consequences for reading this document. The weight level disagreement
 between MRound and the reference (the mean relative root mean square
-difference over layers, relative to MRound's own weights: 0.47 to 0.48 at 2
+difference over layers, relative to MRound's own weights: 0.46 to 0.48 at 2
 bits against the reference's default checkpoints, which at 0.5 billion is 0.45
 relative to theirs, and 0.37 against its SignRound v2 checkpoints on either
-denominator; 0.33 at mixed 2.5, and 0.27 to 0.28 there against its SignRound
-v2 checkpoints on either denominator; 0.10 to 0.12 at 4 bits) has a floor: the
+denominator at 0.5 billion and 0.35 at 3 billion; 0.33 at mixed 2.5, and 0.27
+to 0.28 there against its SignRound v2 checkpoints on either denominator; 0.10
+to 0.12 at 4 bits) has a floor: the
 reference disagrees with itself by 0.30 to 0.34 at 2
 bits (across a change of release or of seed), 0.22 to 0.24 at mixed 2.5
 (device, release or seed) and 0.095 at 4 bits (device or precision),
@@ -239,7 +269,10 @@ At 0.5 billion MRound is 1.32 to 1.45 times as far from the reference's default
 arms as two of those arms are from each other, both taken relative to a
 default arm (0.45 against 0.31 to 0.34). At 1.5 billion the figures as
 printed, MRound's relative to its own weights, give about 1.6 times (0.47
-against 0.30), and the two have not been put on one denominator there. The
+against 0.30), and the two have not been put on one denominator there. At 3
+billion MRound's checkpoints sit 0.46 to 0.47 from the reference's default arms
+and 0.35 from its arms with the option on, on MRound's denominator, and no two
+of the reference's arms there have been compared. The
 reference's own
 SignRound v2 tuning is a change of another kind (the reference checkpoints
 behind rows 105 to 107 beside those behind rows 88, 33 and 89, compared with
@@ -250,10 +283,10 @@ two draws
 share 1.6 to 5 percent (4 to 5 between two default arms, 1.6 to 1.7 between two
 arms with the option on), and differ in their scales by a median of 14 to 15
 percent of the default checkpoint's scale (17 of the other's) where two draws
-differ by 3 to 4. Those two checkpoints were also
-produced under different operating system releases of one machine, which
-should at most make one of them another draw, and this is not what a draw
-looks like.
+differ by 3 to 4. Those two checkpoints were also produced under different
+operating system releases of one machine, and that changed nothing: produced
+again on one system, each is the same checkpoint to the bit (rows 117 and 118),
+so the two differ in the option alone.
 Measured from the checkpoint with the option on and relative to it, MRound's
 checkpoint sits 0.37 away and the reference's own default checkpoint 0.43,
 MRound the nearer in 164 or 165 of the 168 layers, with scales a median of 5.4
@@ -290,9 +323,10 @@ Qwen2.5-0.5B-Instruct, 1.17 percent across four such arms at one seed
 (15.0777 to 15.2537 over rows 30, 85, 95 and 83); at 2 bits, 24 percent
 between seeds on one setup (rows 88, 33 and 89) and 25 percent for one change
 of release at one seed (rows 37 and 89) on Qwen2.5-0.5B-Instruct, and 10
-percent between seeds on Qwen2.5-1.5B-Instruct (rows 92 to 94), which is why
-the tables below give three seeds on one named setup where the claim depends
-on it.
+percent between seeds on Qwen2.5-1.5B-Instruct (rows 92 to 94) and 2 percent
+on Qwen2.5-3B-Instruct under either tuning (rows 124 to 129), which is why the
+tables below give
+three seeds on one named setup where the claim depends on it.
 
 ## Uniform 4 bits
 
@@ -419,9 +453,10 @@ must not be pooled.
 **Against the reference's own SignRound v2 tuning.** The same three seeds
 again with the reference's `enable_alg_ext` turned on and no other setting
 changed (auto-round 0.15.0, the same recipe, the same machine's CPU in float32;
-that machine's operating system release did change in between, as said
-below), each arm scored against the MRound checkpoint the table above scored
-its default arm against, so MRound's column is the same three checkpoints:
+that machine's operating system release did change in between, which moved
+neither tuning's checkpoint, as said below), each arm scored against the MRound
+checkpoint the table above scored its default arm against, so MRound's column
+is the same three checkpoints:
 
 | seed | reference | MRound | MRound against it | the reference's default arm | ledger |
 |---|---|---|---|---|---|
@@ -433,8 +468,9 @@ its default arm against, so MRound's column is the same three checkpoints:
 MRound is ahead on every seed, and by much less. With the option on the
 reference scores 16.30, 18.53 and 34.06 percent below its default arm of the
 same seed, 23.56 percent on the mean, which closes 77 percent of the gap in
-mean perplexity. Each of those is one draw against another, across a change of
-operating system release as well (below), and at this width a default arm has
+mean perplexity. Each of those is one draw against another (the change of
+system between them moved neither arm at seed 42, below), and at this width a
+default arm has
 moved by 25 percent under a change of release alone (rows 37 and 89), so each
 depends on the default draw it is taken against: against the default arms of
 the same seeds under 0.14.2 (rows 31, 34 and 37) the same three arms are
@@ -455,19 +491,31 @@ percent of their mean, against 24.35 for the default arms under this release
 and 16.84 for the default arms of the same seeds under 0.14.2, so three draws
 do not show the option steadying it.
 
-Two things this table does not settle. The reference's documentation
-recommends the option together with its stronger recipe at 2 bits, and no arm
-on either side has run that recipe at this width. And the Linux machine's
-operating system changed release between the two sets of reference arms (rows
-105 to 107 record Ubuntu 26.04.1, rows 88, 33 and 89 Ubuntu 24.04, the package
-inventory being the same one), so what separates the two reference columns is
-the option and the system together until both tunings have been run again on
-one system. The head to head in each row
-does not depend on that. The reference's times are stated for the record and
-not as the price of the option, for that reason and one more: 20,102 to 20,440
-s with the option on against 17,334 to 17,750 s without, on that machine's
-CPU, and under auto-round 0.15.0 the option's tuning runs its block forward
-uncompiled where the default tuning compiles it.
+One thing this table does not settle. The reference's documentation recommends
+the option together with its stronger recipe at 2 bits, and no arm on either
+side has run that recipe at this width. A second, listed here until 2026-10-09,
+is settled. The Linux machine's operating system changed release between the
+two sets of reference arms (rows 105 to 107 record Ubuntu 26.04.1, rows 88, 33
+and 89 Ubuntu 24.04, the package inventory being the same one), and the machine
+was then reinstalled and its environment rebuilt. On the reinstalled system
+both of seed 42's arms were produced again (rows 117 and 118), and each is the
+checkpoint of row 88 or of row 105 to the bit, with the same perplexity: the
+change of system moved neither tuning, so the two reference columns differ in
+the option alone, measured at seed 42 and taken at seeds 43 and 44 on the
+strength of it. The head to head in each row never depended on that. The same
+two arms give the option's price at one seed on one system: the block loop took
+20,012 s with the option on against 17,678 s without, 13.2 percent longer, with
+9.3 percent more resident memory, and the same pair produced again under
+auto-round 0.16.0, which wrote the same two checkpoints (rows 119 and 120),
+took 19,840 s against 17,359 s, 14.3 percent longer, with 9.6 percent more.
+Read across the change of system the three
+seeds had shown 15 to 17 percent, 16.9 at seed 42 (totals of 20,102 to 20,440 s
+with the option on against 17,334 to 17,750 s without), and the reinstalled
+system timed the default arm 1.8 percent slower than row 88's and the arm with
+the option 1.4 percent faster than row 105's, so a time read across two systems
+carries a couple of percent either way. Part of that price is the release's and
+not the method's: under auto-round 0.15.0 and 0.16.0 alike the option's tuning
+runs its block forward uncompiled where the default tuning compiles it.
 
 **Zero shot tasks** on the three pairs of checkpoints of the first table, the
 reference at its default tuning (rows 98 to 100, scored on the Apple GPU as
@@ -573,6 +621,62 @@ an older tree. The reference moved 1.10 percent between the two seed 42 arms
 and MRound 2.71 percent between its two trees; row 36 stays in the ledger as
 the comparison and is not pooled with this table.
 
+**Qwen2.5-3B-Instruct**, original 8.5719, three seeds, the reference as in the
+table above (auto-round 0.15.0 on the integrated GPU, bfloat16 under
+autocast, uncompiled), MRound on one tree:
+
+| seed | reference | MRound | MRound against it | ledger |
+|---|---|---|---|---|
+| 42 | 20.1332 | 17.9583 | -10.80 percent | row 124 |
+| 43 | 19.8525 | 16.8479 | -15.13 percent | row 125 |
+| 44 | 19.6877 | 16.8030 | -14.65 percent | row 126 |
+| **mean** | **19.8912** | **17.2031** | **-13.51 percent** | |
+
+MRound's worst draw beats the reference's best by 8.78 percent. Size is +6.19
+percent. The mean of the per seed ratios is 13.53 percent; a 95 percent
+Student interval on the three runs from 7.6 to 19.4 percent ahead, where the
+same interval on the 1.5 billion table runs from 6.0 to 18.4. The reference's
+three draws span 2.24 percent of their mean, against 9.92 at 1.5 billion and
+24.35 at 0.5 billion, and MRound's 6.72, so this is the first table here in
+which the reference's draws sit closer together than MRound's. The runs' own
+logs, which are not ledger rows, show both sides finding the same thing at the
+model's second block: rounded to the nearest code it starts three to four
+orders of magnitude above the blocks beside it, on each side's own loss, and
+tuning brings it down to their level, so 2 bit round-to-nearest fails there
+for the model and not for one implementation.
+
+**Against the reference's own SignRound v2 tuning, at 3 billion.** The same
+three seeds with the reference's `enable_alg_ext` turned on and no other
+setting changed, each pair of arms produced on one system in one environment,
+and each arm scored against the MRound checkpoint its default twin was scored
+against, so MRound's column is the same three checkpoints:
+
+| seed | reference | MRound | MRound against it | the reference's default arm | ledger |
+|---|---|---|---|---|---|
+| 42 | 17.4454 | 17.9583 | +2.94 percent | 20.1332 | row 127 |
+| 43 | 17.6121 | 16.8479 | -4.34 percent | 19.8525 | row 128 |
+| 44 | 17.2059 | 16.8030 | -2.34 percent | 19.6877 | row 129 |
+| **mean** | **17.4211** | **17.2031** | **-1.25 percent** | 19.8912 | |
+
+Here the two implementations are level. MRound is ahead on two seeds and behind
+on the third, 1.25 percent ahead on the mean (the mean of the per seed ratios
+is the same), and the two ranges overlap almost entirely: MRound's worst draw
+is 4.37 percent behind the reference's best and its best 4.59 percent ahead of
+the reference's worst, and a 95 percent Student interval on the three runs from
+10.6 percent ahead to 8.1 behind. This row is a tie, read as the 4 bit
+Qwen2.5-0.5B-Instruct row is. With the option on the reference scores 13.35,
+11.29 and 12.61 percent below its default arm of the same seed, 12.42 on the
+mean, which closes 92 percent of the gap in mean perplexity, where on
+Qwen2.5-0.5B-Instruct at 2 bits it closed 77: at this size nearly all of the
+default table's margin sat between the reference's two tunings. The seed on
+which MRound is behind is its own worst draw, 6.7 percent above its other two,
+which agree to 0.27 percent, while the reference's three arms with the option
+on span 2.33 percent of their mean. Size is +6.19 percent. Both tunings ran
+uncompiled on that device, so the pair gives the option's cost without a
+compiler's share in it: the block loop took 22,936 to 22,945 s with the option
+on against 21,754 to 21,767 s without, 5.4 to 5.5 percent longer, and the
+device pool peaked at 14.08 GB against 15.90.
+
 One more model at the same scheme, one seed:
 
 | model | original | reference | MRound | MRound against it | size | ledger |
@@ -582,17 +686,23 @@ One more model at the same scheme, one seed:
 Note the absolute numbers. At 2 bits both implementations produce models far
 worse than the original, and the interesting claim is the gap between them, not
 that either result is good. Against the reference's default tuning the margin
-also narrows as the model grows, 32.79 percent at 135 million parameters, 30.63
-at 0.5 billion and 12.25 at 1.5 billion, the last two on three seeds each, and
+narrowed as the model grew to 1.5 billion parameters, 32.79 percent at 135
+million, 30.63 at 0.5 billion and 12.25 at 1.5 billion, and then stopped
+narrowing: it is 13.51 percent at 3 billion, inside the range of the 1.5
+billion table's per seed margins, the last three sizes on three seeds each.
 MRound's penalty over the original is 51 to 65 percent of the reference's at
-0.5 billion and 77 to 84 percent at 1.5 billion. Against the reference's own
-SignRound v2 tuning the 0.5 billion figure is 9.25 percent, already below the
-1.5 billion figure against the default, and MRound's penalty there is 81 to 92
-percent of the reference's. So neither the narrowing nor the larger lead where
-2 bits hurts more can be read as a property of the two implementations until
-the other two sizes have such arms. The caveat on every number in this
-document stands either way: they come from models under two billion
-parameters.
+0.5 billion, 77 to 84 percent at 1.5 billion and 73 to 81 percent at 3 billion.
+Against the reference's own SignRound v2 tuning, the method MRound implements,
+the margin is 9.25 percent at 0.5 billion and 1.25 at 3 billion, where the two
+are level, and MRound's penalty is 81 to 92 percent of the reference's at the
+smaller size and 92 to 106 at the larger: against that tuning the lead shrinks
+as the model grows, to nothing at 3 billion, on the two sizes measured, 1.5
+billion having no such arms. Most of each margin against the default tuning is
+the difference between the reference's two tunings, 77 percent of
+the gap in mean perplexity at 0.5 billion and 92 at 3 billion, and the curve
+against the default says little about the two implementations. The caveat on
+every number in this document stands either way: they come from models of
+three billion parameters or fewer.
 
 ## Mixed precision at an average of 2.5 bits
 
@@ -625,7 +735,8 @@ percent on Qwen and 39.16 on SmolLM2. Size is +2.85 and +3.64 percent.
 Qwen2.5-0.5B-Instruct seeds again with the reference's `enable_alg_ext` turned
 on and no other setting changed (auto-round 0.15.0, the same recipe and
 scoring budget, the same machine's CPU in float32; that machine's operating
-system release did change in between, as at 2 bits), each arm scored against
+system release did change in between, as at 2 bits, where that moved neither
+tuning's checkpoint), each arm scored against
 the MRound checkpoint the table above scored its default arm against, so
 MRound's column is the same three checkpoints:
 
@@ -647,8 +758,8 @@ the reference scores 7.42, 11.23 and 8.20 percent below its default arm of the
 same seed, 8.95 percent on the mean, which closes 43 percent of the gap in
 mean perplexity (38.6 to 47.3 percent seed by seed) where at 2 bits it closed
 77: at this scheme less than half of the margin sat between the reference's
-two tunings. Each of those is one draw against another, across a change of
-operating system release as well (below), and at this scheme a default arm
+two tunings. Each of those is one draw against another, and at this scheme a
+default arm
 has moved by 2.8 to 3.6 percent under a change of device or of release alone
 (rows 84 and 87 against 45, rows 45 and 46 against 41 and 42); the three arms
 with the option on, 25.19 to 26.36, sit a point below every default arm the
@@ -662,16 +773,20 @@ three draws do not show the option steadying it.
 What this table does not settle is what the 2 bit one does not. The option
 together with the reference's stronger recipe has not been run on either side:
 at seed 42 the recipe alone took the reference to 25.8199 (The reference at its
-stronger recipe, below) and the option alone to 26.3575. And these arms were
+stronger recipe, below) and the option alone to 26.3575. These arms too were
 produced after the Linux machine's operating system changed release (rows 108
 to 110 record Ubuntu 26.04.1, rows 43, 45 and 46 Ubuntu 24.04, the package
-inventory being the same one), so what separates the two reference columns is
-the option and the system together until both tunings have been run again on
-one system; the head to head in each row does not depend on that. The
-reference's times are stated for the record, as at 2 bits, and not as the price
-of the option: 20,123 to 20,125 s with it on against 17,417 to 22,004 s
+inventory being the same one). The 2 bit control, both tunings of one seed
+produced again on one system and each the same checkpoint to the bit, is taken
+to hold here as well, the block loop being the same code and the allocation the
+same in all six exports, so the two reference columns are read as differing in
+the option alone, which no mixed arm produced twice has shown; the head to head
+in each row does not depend on it. The reference's times are stated for the
+record: 20,123 to 20,125 s with the option on against 17,417 to 22,004 s
 without, the longest of those holding a 70 minute scheme search that the others
-read from cache. SmolLM2-135M-Instruct's table has no such arms.
+read from cache, and block loops 13.0 to 15.6 percent longer with the option
+on, read across the change of system, where at 2 bits that reading gave 15 to
+17 percent and one system 13.2. SmolLM2-135M-Instruct's table has no such arms.
 
 **Zero shot tasks** on the first Qwen2.5-0.5B-Instruct table's three pairs of
 checkpoints, the reference at its default tuning (rows 101 to 103, scored on
@@ -795,19 +910,35 @@ before reading any of the above.
 Every three seed table here faces auto-round 0.15.0, one release throughout:
 the two mixed 2.5 tables since they were produced, the 2 bit table since
 2026-09-26, when its seed 42 and seed 44 arms were reproduced under 0.15.0
-(rows 88 and 89; seed 43 had been, row 33), and the two tables against the
-reference's own SignRound v2 tuning since they were produced (rows 105 to 107
-and 108 to 110).
+(rows 88 and 89; seed 43 had been, row 33), and the two Qwen2.5-0.5B-Instruct
+tables against the reference's own SignRound v2 tuning since they were produced
+(rows 105 to 107 and 108 to 110).
 The 4 bit SmolLM2 comparison was
 rerun on 0.15.0 on the Linux machine's CPU, and the reference moved 0.12
 percent from its August result under 0.14.2 on the Mac's CPU (rows 9 and 54,
 both arms scored from the reference's dequantized export). The
 Qwen2.5-1.5B-Instruct table faces 0.15.0 since 2026-09-27 (rows 92 to 94,
-replacing row 36), and the 4 bit Qwen2.5-0.5B row since 2026-09-28 (row 95,
+replacing row 36), the two Qwen2.5-3B-Instruct tables, one under each of the
+reference's tunings, since they were produced (rows 124 to 129), and the 4 bit
+Qwen2.5-0.5B row since 2026-09-28 (row 95,
 replacing row 30), where the change of release and machine together moved the
 reference by 0.94 percent. The single seed rows that still face 0.14.2 are the
 2 bit SmolLM2 row (35) and the Apple GPU arms (82, 83, 85 and 86), 0.14.2
 being the release installed on the Mac.
+
+**A later release, auto-round 0.16.0, writes the same checkpoints.** It was
+published while the tables above were being completed. Seed 42's two 2 bit
+reference arms, one under each of the reference's tunings, were produced again
+under 0.16.0 on the machine and system of the controls of rows 117 and 118, in
+an environment that differs from theirs in the release and in the version of
+setuptools, and both came out the 0.15.0 checkpoints to the bit, all
+357,826,560 weights, with the perplexities of rows 88 and 105 (rows 119 and
+120, 2026-10-09). Read side by side, the two releases differ on the path these
+comparisons take in nothing that computes a number at these settings: the scale
+and rounding code, the optimizer and the calibration path are the same files.
+So the tables here are tables of 0.16.0 as well at the point measured, and are
+expected to be at the others, where no 0.16.0 arm has been run. auto-round
+0.16.1, published since, has not been run at all.
 
 **How much the release is worth depends on the width, and at 2 bits it is not
 small.** At mixed 2.5 the release has been measured as worth about three
@@ -820,38 +951,49 @@ reading that fits all of it is the one the checkpoint comparisons give above:
 a change of release, like a change of seed or of device, produces a different
 reference checkpoint, and at 2 bits the perplexity of a different checkpoint
 can sit a quarter away. At its default tuning the reference's own three seeds
-under one release span 24.35 percent of their mean at 2 bits, against 2.5
+under one release span 24.35 percent of their mean at 2 bits on
+Qwen2.5-0.5B-Instruct (9.92 at 1.5 billion and 2.24 at 3 billion), against 2.5
 percent at mixed 2.5, which is why this document quotes the per seed ratios and
 their range beside the ratio of the means at 2 bits.
 
 ## What these numbers do not show
 
-They are three models, all under two billion parameters, on one evaluation
+They are four models, of three billion parameters at most, on one evaluation
 corpus, scored by perplexity, and five tables of them by a zero shot task
 suite as well (the 4 bit one, and the 2 bit and mixed 2.5 ones against each of
 the reference's two tunings, all on Qwen2.5-0.5B-Instruct); the other tables
 have not been through the suite yet, and on the five that have, the suite
 confirms the perplexity lead clearly only at 2 bits against the reference's
 default tuning: against its own SignRound v2 tuning MRound is 0.49 points
-ahead there and 0.10 at mixed 2.5. Outside two
+ahead there and 0.10 at mixed 2.5. Outside three
 tables every reference arm ran AutoRound's default tuning, without the option
-that turns on its own SignRound v2 tuning (The bar). On the two
-Qwen2.5-0.5B-Instruct tables measured both ways the margin with that option on
-is 9.25 percent at 2 bits, MRound ahead on each of three seeds whose ranges
-overlap, where it is 30.63 with it off, and 12.88 percent at mixed 2.5, the
-ranges still apart, where it is 20.68; in both, the reference arms with the
-option on were produced under a different operating system release from
-their default twins. The other margins
-have not been measured against it. No arm has paired the option with the
+that turns on its own SignRound v2 tuning (The bar). On the three tables
+measured both ways the margin with that option on is 9.25 percent at 2 bits on
+Qwen2.5-0.5B-Instruct, MRound ahead on each of three seeds whose ranges
+overlap, where it is 30.63 with it off; 12.88 percent at mixed 2.5 on the same
+model, the ranges still apart, where it is 20.68; and 1.25 percent at 2 bits on
+Qwen2.5-3B-Instruct, MRound behind on one seed of three and the two level,
+where it is 13.51. In the two Qwen2.5-0.5B-Instruct tables the reference arms
+with the option on were produced under a different operating system release
+from their default twins, and producing both tunings of one seed again on one
+system showed that this moved neither checkpoint; the Qwen2.5-3B-Instruct pairs
+were produced on one system. The other margins have not been measured against
+it. No arm has paired the option with the
 reference's stronger recipe,
 which its documentation recommends at 2 bits, so no margin here says how MRound
 compares with the reference's best configuration at low widths. The largest
-model measured is Qwen2.5-1.5B and it shows the smallest of the 2 bit margins
-against the reference's default tuning, 12.25 percent over three seeds, so
-nothing here should be read as a claim about what happens at seven billion. At
-1.5 billion MRound's block loop already uses four fifths of the Mac it runs on
-at the standard recipe, so a larger model on that machine needs the memory
-ceiling raised first.
+model measured is Qwen2.5-3B, at 13.51 percent over three seeds against the
+reference's default tuning, where Qwen2.5-1.5B shows 12.25, and at 1.25 against
+its own SignRound v2 tuning, where Qwen2.5-0.5B shows 9.25: against the method
+MRound implements the lead shrinks as the model grows on the two sizes
+measured, to a tie at 3 billion, and nothing here should be read as a claim
+about what happens at seven billion. At 1.5 billion MRound's block loop used
+four fifths of the Mac it ran on at the standard recipe; the current tree
+writes the same checkpoint in 19.34 GB (row 121) and the 3B table's in 20.07 GB
+(rows 124 to 126), and in two step memory probes, which are not ledger rows, a
+7B's block loop peaked at 26.28 GB with every step in eight pieces and a 3B
+mixed 2.5 run at 23.95 GB in its scoring pass, so a 7B fits that machine in
+pieces; none has been compared yet.
 
 Cost is not reported as a ratio in any table, as above: every comparison in
 the tables crosses a device or a machine, and the pairs that share one GPU are

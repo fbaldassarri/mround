@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     import mlx.core as mx
     from mlx import nn
 
-__all__ = ["ModelBundle", "load_model", "model_dtype", "require_apple_silicon"]
+__all__ = ["ModelBundle", "load_model", "model_dtype", "read_config", "require_apple_silicon"]
 
 _INSTALL_HINT = (
     "Model loading needs the optional model stack. Install it with:\n    pip install -e '.[models]'"
@@ -119,8 +119,66 @@ def model_dtype(model: nn.Module) -> mx.Dtype:
     raise ArchitectureError(msg)
 
 
+def read_config(source: str | Path) -> dict[str, Any]:
+    """A model's configuration, read without loading its weights or fetching them.
+
+    The memory check before a run needs the model's shape before anything is
+    loaded (``mround/planner/memory.py``), and for a Hub model before its
+    weights are downloaded, which for a 7B is 15 GB. A local path is read
+    where it is, as :func:`load_model` would; a repository id fetches
+    ``config.json`` alone, into the same cache ``mlx-lm`` downloads the rest
+    into, so the load that follows finds it there and the file is read once.
+    Neither imports MLX.
+
+    Args:
+        source: Hub repository id or local path, as :func:`load_model` takes.
+
+    Returns:
+        The configuration as plain data.
+
+    Raises:
+        ArchitectureError: If there is no configuration to read: a local
+            directory without one, a repository the Hub does not have, or no
+            network and nothing cached.
+    """
+    import json  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    local = Path(source).expanduser()
+    if local.exists():
+        file = local / "config.json" if local.is_dir() else local
+    else:
+        try:
+            from huggingface_hub import hf_hub_download  # noqa: PLC0415
+        except ImportError as exc:
+            raise ArchitectureError(_INSTALL_HINT) from exc
+        try:
+            file = Path(hf_hub_download(str(source), "config.json"))
+        except Exception as exc:
+            # The Hub raises a family of its own errors, an OSError when there
+            # is no network and nothing cached, and a validation error for a
+            # name that cannot be a repository; the first line says which.
+            text = str(exc).strip()
+            first_line = text.splitlines()[0] if text else type(exc).__name__
+            msg = f"could not read the configuration of {source!r}: {first_line}"
+            raise ArchitectureError(msg) from exc
+    try:
+        config = json.loads(file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        msg = f"could not read a model configuration from {file}: {exc}"
+        raise ArchitectureError(msg) from exc
+    if not isinstance(config, dict):
+        msg = f"{file} is not a model configuration: it holds {type(config).__name__}"
+        raise ArchitectureError(msg)
+    return config
+
+
 def load_model(
-    source: str | Path, *, dtype: str | None = None, allow_quantized: bool = False
+    source: str | Path,
+    *,
+    dtype: str | None = None,
+    allow_quantized: bool = False,
+    lazy: bool = False,
 ) -> ModelBundle:
     """Load a model from the Hugging Face Hub or a local directory.
 
@@ -134,6 +192,12 @@ def load_model(
             codes as weights and produce nonsense without erroring. Evaluation
             needs it on, since scoring a quantized model is the entire point of
             having made one.
+        lazy: Leave the weights on disk until something reads them, which is
+            ``mlx-lm``'s own ``lazy`` and reads the same bytes. The block loop
+            asks for it: it reads one block at a time and releases each when it
+            is done (``mround/pipeline/runner.py``), so a model larger than the
+            Mac's free memory need never be resident at once. Off by default,
+            since anything that runs the whole model reads every weight anyway.
 
     Returns:
         The loaded model and its metadata.
@@ -153,7 +217,7 @@ def load_model(
         raise ArchitectureError(_INSTALL_HINT) from exc
 
     try:
-        model, tokenizer, config = load(str(source), return_config=True)
+        model, tokenizer, config = load(str(source), return_config=True, lazy=lazy)
     except Exception as exc:
         # mlx-lm raises a mixture of ValueError, KeyError, and its own types
         # depending on whether the repository is missing, the architecture is

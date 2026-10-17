@@ -46,6 +46,7 @@ __all__ = [
     "MLX_SUPPORTED_BITS",
     "QuantizedLayer",
     "export_mlx",
+    "narrow_codes",
     "require_mlx_representable",
     "to_affine",
 ]
@@ -90,6 +91,25 @@ class QuantizedLayer:
     scale: mx.array
     zero_point: mx.array | None
     scheme: QuantScheme
+
+
+def narrow_codes(codes: mx.array, scheme: QuantScheme) -> mx.array:
+    """The codes in one byte each: ``int8`` when signed, ``uint8`` when not.
+
+    :func:`~mround.core.quantizer.quantize_codes` returns them in the weight's
+    float32, which is exact and four times the room integers up to eight bits
+    need. A run keeps every layer's codes until the export, so the narrow form
+    is what the pipeline holds; the export reads either.
+
+    Raises:
+        UnsupportedSchemeError: If the scheme's code range does not fit a byte.
+    """
+    lo, hi = scheme.code_range
+    target = mx.int8 if lo < 0 else mx.uint8
+    if (lo < 0 and (lo < -(2**7) or hi > 2**7 - 1)) or (lo >= 0 and hi > 2**8 - 1):
+        msg = f"codes in [{lo}, {hi}] do not fit one byte"
+        raise UnsupportedSchemeError(msg)
+    return codes.astype(target)
 
 
 def _require_mlx_representable(path: str, scheme: QuantScheme) -> None:
@@ -180,8 +200,10 @@ def _tensors_for_layer(path: str, layer: QuantizedLayer, dtype: mx.Dtype) -> dic
         raise ExportError(msg)
 
     # Symmetric codes are signed and storage is unsigned, so the fixed offset
-    # goes on here rather than being left to the caller to remember.
-    flat = layer.codes.reshape(out_features, n_groups * group_size)
+    # goes on here rather than being left to the caller to remember. Widened
+    # first: the codes may arrive as float32 or as one byte each (see
+    # narrow_codes), and a signed byte plus the offset overflows at 8 bits.
+    flat = layer.codes.reshape(out_features, n_groups * group_size).astype(mx.int32)
     if scheme.symmetry is Symmetry.SYMMETRIC:
         flat = flat + 2 ** (scheme.bits - 1)
 

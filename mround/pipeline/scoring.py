@@ -60,12 +60,12 @@ from mlx import nn
 
 from mround.core.quantizer import fake_quantize
 from mround.core.scale_search import search_scales
-from mround.pipeline.blocks import discover_blocks, iter_quantizable_linears
+from mround.pipeline.blocks import checkpointed_blocks, discover_blocks, iter_quantizable_linears
 from mround.pipeline.device import peak_memory
 from mround.schemes import DEFAULT_EPS_FP32, QuantScheme, ScaleInit
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
 __all__ = ["ScoringProgress", "SensitivityScores", "score_widths"]
 
@@ -164,114 +164,176 @@ def _causal_loss(model: nn.Module, batch: mx.array) -> mx.array:
     return mx.mean(nn.losses.cross_entropy(logits, batch[:, 1:], reduction="none"))
 
 
-def _quantized_weights(
-    weights: dict[str, mx.array],
+def _grids(originals: Mapping[str, mx.array], scheme: QuantScheme) -> dict[str, mx.array | None]:
+    """Each layer's searched grid at one width, or ``None`` where it does not search.
+
+    Searched once per width and kept, a few numbers per group, so that the
+    width's quantize-dequantize can be rebuilt from the original weight
+    whenever it is needed rather than held (MEMORY.md D-036's next lever,
+    taken as M1c). Unweighted, since no activation statistics exist yet.
+    """
+    if scheme.scale_init is not ScaleInit.SEARCHED:
+        return dict.fromkeys(originals)
+    grids: dict[str, mx.array | None] = {}
+    for path, weight in originals.items():
+        grid = search_scales(weight.astype(mx.float32), scheme)
+        mx.eval(grid)
+        grids[path] = grid
+    return grids
+
+
+def _quantized(
+    weight32: mx.array, scheme: QuantScheme, eps: float, grid: mx.array | None
+) -> mx.array:
+    """Round-to-nearest quantize-dequantize of one weight, nothing learned.
+
+    ``params=None`` is the quantizer's round-to-nearest path, with scalar unit
+    coefficients; under a searched scheme ``grid`` is the initial scale.
+    """
+    return fake_quantize(weight32, None, scheme, eps=eps, init_scale=grid)
+
+
+def _anchor(
+    originals: Mapping[str, mx.array],
     scheme: QuantScheme,
     eps: float,
+    grids: Mapping[str, mx.array | None],
 ) -> dict[str, mx.array]:
-    """Round-to-nearest quantize-dequantize of every eligible weight.
+    """The weights the backward runs at, built and evaluated one layer at a time."""
+    anchor: dict[str, mx.array] = {}
+    for path, weight in originals.items():
+        anchor[path] = _quantized(weight.astype(mx.float32), scheme, eps, grids[path])
+        mx.eval(anchor[path])
+    return anchor
 
-    ``params=None`` is the quantizer's round-to-nearest path: nothing learned,
-    scalar unit coefficients. Under a searched scheme the grid is searched
-    first, unweighted, and handed in as the initial scale.
+
+def _accumulate(
+    gradients: dict[str, mx.array],
+    by_block: Sequence[Sequence[str]],
+    originals: Mapping[str, mx.array],
+    perturbations: Mapping[int, Callable[[str, mx.array], mx.array]],
+    accumulated: dict[int, dict[str, mx.array]],
+) -> None:
+    """Add one batch's ``sum |g * perturbation|`` to every layer's score at every width.
+
+    Taken from the last block to the first, the order the backward produces
+    the gradients in, and evaluated one layer and one width at a time, with
+    each gradient dropped from ``gradients`` once its terms exist. A block's
+    gradients come out of its backward together, so they live until the
+    block's last layer is scored, and a layer's perturbations are rebuilt from
+    its original weight and dropped with their terms; neither is ever held for
+    the whole model. The terms and their accumulation are the same operations
+    on the same values as when every gradient and perturbation was held, so
+    the scores are the same.
     """
-    qdq: dict[str, mx.array] = {}
-    for path, weight in weights.items():
-        init_scale = None
-        if scheme.scale_init is ScaleInit.SEARCHED:
-            init_scale = search_scales(weight, scheme)
-        qdq[path] = fake_quantize(weight, None, scheme, eps=eps, init_scale=init_scale)
-    return qdq
+    for paths in reversed(by_block):
+        for path in paths:
+            gradient = gradients.pop(path)
+            weight32 = originals[path].astype(mx.float32)
+            for width, perturbation in perturbations.items():
+                term = mx.sum(mx.abs(gradient * perturbation(path, weight32)))
+                accumulated[width][path] = accumulated[width][path] + term
+                # One width at a time, so that one rebuilt quantize-dequantize
+                # and its temporaries are alive at once rather than all of them.
+                mx.eval(accumulated[width][path])
 
 
 def _scores_from_own_width(
     grad_fn: Any,
     batches: Sequence[mx.array],
-    weights32: dict[str, mx.array],
+    originals: Mapping[str, mx.array],
     *,
     schemes: dict[int, QuantScheme],
     eps: float,
-    paths: list[str],
+    by_block: Sequence[Sequence[str]],
     report: Callable[[str, int, int], None],
+    restore: Callable[[], None],
 ) -> dict[str, dict[int, float]]:
     """The reference's procedure: each width's backward at its own model.
 
-    One width is resident at a time, so this holds three model-sized float32
-    copies (the originals, one quantize-dequantize, one perturbation) however
-    many candidates there are. See MEMORY.md D-036.
+    One width's quantized copy is resident at a time, the weights the backward
+    runs at; its perturbation is that copy less the original, formed per layer
+    as its gradient arrives. ``restore`` puts the original weights back in the
+    model between widths, since the model's layers hold the last copy they
+    were given and the next width's must not be built beside it. See
+    MEMORY.md D-036 and M1c.
     """
+    paths = [path for block in by_block for path in block]
     scores: dict[str, dict[int, float]] = {path: {} for path in paths}
     passes = len(batches) * len(schemes)
     done = 0
     for width in sorted(schemes):
-        qdq = _quantized_weights(weights32, schemes[width], eps)
-        diff = {path: qdq[path] - weights32[path] for path in paths}
-        mx.eval(list(qdq.values()), list(diff.values()))
+        anchor = _anchor(originals, schemes[width], eps, _grids(originals, schemes[width]))
 
-        accumulated = {path: mx.zeros((), dtype=mx.float32) for path in paths}
+        def own(path: str, weight32: mx.array, anchor: dict[str, mx.array] = anchor) -> mx.array:
+            return anchor[path] - weight32
+
+        accumulated = {width: {path: mx.zeros((), dtype=mx.float32) for path in paths}}
         for batch in batches:
-            gradients = grad_fn(qdq, batch)
-            for path in paths:
-                term = mx.sum(mx.abs(gradients[path] * diff[path]))
-                accumulated[path] = accumulated[path] + term
-            # One synchronization per batch bounds the graph; there are few
-            # batches and each holds a whole-model backward.
-            mx.eval(list(accumulated.values()))
+            _accumulate(grad_fn(anchor, batch), by_block, originals, {width: own}, accumulated)
             done += 1
             report("backward", done, passes)
         for path in paths:
-            scores[path][width] = float(accumulated[path])
+            scores[path][width] = float(accumulated[width][path])
+        # The model's layers and the closure hold this width's copy too, and
+        # the next width must not find it resident when it builds its own.
+        restore()
+        del anchor, own
     return scores
 
 
 def _scores_from_widest(
     grad_fn: Any,
     batches: Sequence[mx.array],
-    weights32: dict[str, mx.array],
+    originals: Mapping[str, mx.array],
     *,
     schemes: dict[int, QuantScheme],
     eps: float,
-    paths: list[str],
+    by_block: Sequence[Sequence[str]],
     report: Callable[[str, int, int], None],
+    restore: Callable[[], None],
 ) -> dict[str, dict[int, float]]:
     """One backward per batch at the widest candidate, every width scored on it.
 
-    The gradient needs only the widest width's quantize-dequantize; every
-    other width contributes nothing but its perturbation, so each narrower
-    quantized copy is released as soon as its difference exists. ``weights32``
-    is consumed rather than borrowed: it is cleared once the last perturbation
-    is formed, because holding the float32 originals through the batch loop
-    costs a whole model copy for nothing. The batch loop therefore holds one
-    quantized copy plus one perturbation per candidate, which is the floor for
-    this schedule: the gradient is nonlinear in the perturbation, so the
-    perturbations cannot be folded together and a width dropped now would cost
-    a second backward later. See MEMORY.md D-036.
+    The gradient needs the widest width's quantize-dequantize, which stays
+    resident: it is the model the backward runs through. Every width
+    contributes its perturbation, and since 2026-10-11 (M1c) none of them is
+    held: each width keeps its searched grid, a few numbers per group, and a
+    layer's perturbation is rebuilt from its original weight when that layer's
+    gradient arrives, then dropped. Before, every width's perturbation was
+    resident through the batch loop, one model sized float32 copy per
+    candidate, which is what kept a mixed run above 1.5B parameters off a 32
+    GB machine. The rebuilt perturbation is the same arithmetic on the same
+    values, so the scores are the same; what it costs is the elementwise work
+    of one quantize-dequantize per narrower width per batch. See MEMORY.md
+    D-036.
     """
     widest = max(schemes)
-    anchor = _quantized_weights(weights32, schemes[widest], eps)
-    mx.eval(list(anchor.values()))
-
-    diffs: dict[int, dict[str, mx.array]] = {}
-    for width in sorted(schemes):
-        qdq = anchor if width == widest else _quantized_weights(weights32, schemes[width], eps)
-        diffs[width] = {path: qdq[path] - weights32[path] for path in paths}
-        mx.eval(list(diffs[width].values()))
-        del qdq
-    weights32.clear()
+    grids = {width: _grids(originals, schemes[width]) for width in sorted(schemes)}
+    anchor = _anchor(originals, schemes[widest], eps, grids[widest])
     report("perturbations", len(schemes), len(schemes))
 
+    def perturbation_at(width: int) -> Callable[[str, mx.array], mx.array]:
+        def perturbation(path: str, weight32: mx.array) -> mx.array:
+            if width == widest:
+                return anchor[path] - weight32
+            return _quantized(weight32, schemes[width], eps, grids[width][path]) - weight32
+
+        return perturbation
+
+    perturbations = {width: perturbation_at(width) for width in sorted(schemes)}
+    paths = [path for block in by_block for path in block]
     accumulated = {
-        width: {path: mx.zeros((), dtype=mx.float32) for path in paths} for width in diffs
+        width: {path: mx.zeros((), dtype=mx.float32) for path in paths} for width in schemes
     }
     for index, batch in enumerate(batches, start=1):
-        gradients = grad_fn(anchor, batch)
-        for width in diffs:
-            for path in paths:
-                term = mx.sum(mx.abs(gradients[path] * diffs[width][path]))
-                accumulated[width][path] = accumulated[width][path] + term
-        mx.eval([value for per in accumulated.values() for value in per.values()])
+        _accumulate(grad_fn(anchor, batch), by_block, originals, perturbations, accumulated)
         report("backward", index, len(batches))
-    return {path: {width: float(accumulated[width][path]) for width in diffs} for path in paths}
+    restore()
+    return {
+        path: {width: float(accumulated[width][path]) for width in sorted(schemes)}
+        for path in paths
+    }
 
 
 def score_widths(
@@ -349,7 +411,9 @@ def score_widths(
     blocks = discover_blocks(model, expected=expected_blocks)
     eligible: dict[str, nn.Module] = {}
     skipped: list[tuple[str, str]] = []
+    by_block: list[list[str]] = []
     for block in blocks:
+        by_block.append([])
         for name, linear in iter_quantizable_linears(block.module):
             path = f"{block.name}.{name}"
             if linear.weight.shape[-1] % base_scheme.group_size:
@@ -362,14 +426,14 @@ def score_widths(
                 )
                 continue
             eligible[path] = linear
+            by_block[-1].append(path)
     if not eligible:
         msg = "no layer in any block can be quantized at this group size"
         raise ValueError(msg)
 
     originals = {path: layer.weight for path, layer in eligible.items()}
-    weights32 = {path: weight.astype(mx.float32) for path, weight in originals.items()}
     shapes = {
-        path: (int(weight.shape[0]), int(weight.shape[1])) for path, weight in weights32.items()
+        path: (int(weight.shape[0]), int(weight.shape[1])) for path, weight in originals.items()
     }
 
     def loss_from(qdq: dict[str, mx.array], batch: mx.array) -> mx.array:
@@ -385,8 +449,11 @@ def score_widths(
     # Materializing every width's quantize-dequantize and every width's
     # perturbation up front costs twice the candidate count in model-sized
     # float32 copies, which made scoring, not tuning, the peak of a mixed run
-    # on a 0.5B model. The schedules below build what they need and release
-    # the rest. See MEMORY.md D-036.
+    # on a 0.5B model. The schedules below hold one quantized copy, the one
+    # the backward runs through, rebuild each perturbation when its gradient
+    # arrives, and run every block under gradient checkpointing, so that the
+    # backward holds one block's activations rather than the model's. See
+    # MEMORY.md D-036 and M1c.
     schemes = {int(width): dataclasses.replace(base_scheme, bits=int(width)) for width in widths}
 
     current_stage = ""
@@ -417,30 +484,25 @@ def score_widths(
             )
         )
 
-    try:
-        if gradient_source == "widest":
-            scores = _scores_from_widest(
-                grad_fn,
-                batches,
-                weights32,
-                schemes=schemes,
-                eps=eps,
-                paths=list(eligible),
-                report=report,
-            )
-        else:
-            scores = _scores_from_own_width(
-                grad_fn,
-                batches,
-                weights32,
-                schemes=schemes,
-                eps=eps,
-                paths=list(eligible),
-                report=report,
-            )
-    finally:
+    def restore() -> None:
         for path, layer in eligible.items():
             layer.weight = originals[path]
+
+    schedule = _scores_from_widest if gradient_source == "widest" else _scores_from_own_width
+    try:
+        with checkpointed_blocks(model, blocks):
+            scores = schedule(
+                grad_fn,
+                batches,
+                originals,
+                schemes=schemes,
+                eps=eps,
+                by_block=by_block,
+                report=report,
+                restore=restore,
+            )
+    finally:
+        restore()
 
     return SensitivityScores(
         scores=scores,

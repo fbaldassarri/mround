@@ -227,8 +227,26 @@ class TuningConfig:
             reference accepts one; no tuning loop here consumes it yet, so
             any value other than ``None`` is refused rather than silently
             ignored. The coefficients share ``lr``.
-        gradient_accumulate_steps: Micro-batches accumulated before a step.
-            Only ``1`` is implemented; anything else is refused.
+        gradient_accumulate_steps: The reference's knob of that name, which
+            makes a step's batch larger by accumulating the gradients of that
+            many batches. Only ``1`` is implemented; anything else is refused.
+        micro_batches: Pieces each step's batch is run in, forward and
+            backward, with their gradients summed, so that a step holds the
+            activations of one piece rather than of the whole batch. The step
+            is still the whole batch's: each piece's loss is divided by the
+            whole batch's element count, and the outlier rule's threshold is
+            taken over the whole batch from one forward pass without gradient
+            before the pieces run, which costs that pass. The losses measured
+            before and after tuning are computed in the same pieces. ``1``,
+            the default, runs every batch whole, which is what every published
+            measurement before 2026-10-11 did. A larger value changes the
+            order of the additions and nothing else, and that is not nothing:
+            a sign step reads the sign of every gradient, and on Metal at 2
+            bits eight pieces moved Qwen2.5-1.5B's checkpoint as far as a
+            change of seed does and took 1.9 times as long a block (ledger row
+            122, MEMORY.md 2026-10-12). Use it where a step does not fit
+            whole. Not the reference's gradient accumulation, which changes
+            the batch.
         suppress_outliers: Exclude the largest errors from the loss. ``None``
             enables it only below 4 bits, which is the condition under which it
             was introduced.
@@ -242,6 +260,7 @@ class TuningConfig:
     minmax_lr: float | None = None
     gradient_accumulate_steps: int = 1
     suppress_outliers: bool | None = None
+    micro_batches: int = 1
 
     def __post_init__(self) -> None:
         """Reject configurations that cannot produce a valid run."""
@@ -266,7 +285,14 @@ class TuningConfig:
         if self.gradient_accumulate_steps != 1:
             msg = (
                 "gradient_accumulate_steps other than 1 is not implemented, got "
-                f"{self.gradient_accumulate_steps}"
+                f"{self.gradient_accumulate_steps}; micro_batches splits a step's "
+                "batch without changing it"
+            )
+            raise SchemeError(msg)
+        if not 1 <= self.micro_batches <= self.batch_size:
+            msg = (
+                f"micro_batches must be between 1 and batch_size={self.batch_size}, "
+                f"got {self.micro_batches}"
             )
             raise SchemeError(msg)
 

@@ -6,6 +6,263 @@ Notable changes to MRound, newest first. The format follows
 caveat that public interfaces may change between pre-release versions without a
 major bump. Each version is dated by its release tag.
 
+## 0.1.0a4
+
+The release that makes memory something a run predicts rather than discovers. A
+uniform run no longer holds the whole model, a tuning step can run its batch in
+pieces, and every run predicts its peak memory from the model's configuration
+before it loads anything, refusing a run that would not fit and naming the
+number of pieces that would: four for Qwen2.5-7B-Instruct on a 32 GB Mac, by
+that prediction, though no 7 billion parameter model has been quantized end to
+end yet. The ledger grows from 116 rows to 129, appended and never edited: the
+2 bit table on Qwen2.5-3B-Instruct under each of the reference's two tunings,
+the fourth model and the first above two billion parameters; controls showing
+that the reference repeats its checkpoints to the bit across a reinstalled
+system, another release of a GPU's compute runtime and a later release of its
+own, auto-round 0.16.0; and two rows showing that the memory work moved no
+checkpoint, and what running a step in pieces does move.
+
+### Changed
+
+`mround_run.json` measures the two stages after the block loop, `remainder`,
+the tensors outside the blocks rounded to nearest, and `export`, and the run's
+peak is the whole run's, the export included, where it was the block loop's.
+
+The block loop holds less memory and computes the same numbers. A quantization
+run loads the model lazily and reads each block's weights when it reaches the
+block, releasing the block's quantized layers once the quantized stream has
+passed through them, so a uniform run no longer holds the whole model. The
+reconstruction targets are written over the reference inputs they are computed
+from and the quantized stream advances in place, so two activation streams are
+resident while a block is tuned rather than three. The codes wait for the
+export at one byte each rather than in float32, in the block loop and on the
+round-to-nearest path alike, and the export widens them before adding the
+storage offset. On a three block model on MLX's CPU backend every exported
+tensor is the same to the bit as before, in four runs: 2 bit searched with and
+without quantized inputs, 4 bit with a holdout, and 8 bit asymmetric. On Metal,
+row 92's configuration, Qwen2.5-1.5B-Instruct at 2 bits, wrote the same
+`model.safetensors` to the byte and peaked at 19.34 GB where it had peaked at
+27.27 (row 121). Each
+block's progress line now gives its peak and the stage that reached it, and
+`mround_run.json` records the peak of every stage of every block under
+`result.memory`; the losses measured at both ends of a block's tuning are now
+a stage of their own, `score`, apart from the steps, `tune`.
+
+The mixed precision scoring pass holds less memory and computes the same
+scores. It held the quantized copy of the block weights the backward runs
+through, one float32 perturbation per candidate width and every gradient at
+once, and every block's activations through the backward. It now keeps each
+width's searched grid rather than its perturbation, rebuilds a layer's
+perturbations when the layer's gradient arrives, reduces and drops the
+gradients a block at a time from the last block, and runs every block under
+gradient checkpointing, so the backward holds one block's activations. On
+MLX's CPU backend the scores are the same to the bit, under both gradient
+sources. The cost is one more pass through the quantizer per narrower width
+per layer per batch, and one more forward through each block in the backward.
+
+The losses measured before and after a block's tuning are taken one batch at a
+time rather than as one lazy sum over the batches, which held many batches'
+forward passes at once and was the largest stage of a 3B run, 25.42 GB against
+the steps' 20.07. The same 3B run now peaks at 20.07 GB, the measurement at
+12.43, and writes the same checkpoint to the byte. A mixed precision run loads
+the model lazily again once it has scored it, since the scoring pass reads
+every weight and the scored model kept them resident through the block loop,
+5.4 GB more at a 3B model's first block. With both changes a 3B mixed 2.5 run
+peaks at its scoring pass's 23.95 GB, where its block loop had reached 30.11
+GB; its block loop holds what a uniform run's does, and it writes the same
+checkpoint to the byte.
+
+The scale search takes a layer a slice of rows at a time, each slice's
+intermediates near 256 MB, where it held about 270 bytes per weight of the
+layer at once: 6 GB for a 3B model's widest layer and 18 GB for a 7B's. Every
+group's search is its own, so every scale is the same to the bit.
+
+### Added
+
+A memory check before every run. `api.quantize` and `api.plan_mixed_precision`
+predict a run's peak memory from the model's configuration before anything is
+loaded, and for a Hub model before its weights are downloaded, and refuse a run
+predicted past `memory_budget`, 85 percent of the Mac's memory unless given,
+with the stage that sets the peak and the fewest `TuningConfig.micro_batches`
+that would fit; `memory_check=False` predicts, records and runs anyway.
+`api.predict_memory` makes the prediction alone, on any machine. `mround
+quantize` takes `--memory-budget` in GB, `--skip-memory-check` and `--dry-run`,
+which prints the prediction stage by stage without loading the model and exits
+1 when the run would be refused, so `-o` is required only without it; `mround
+doctor` shows the device's memory and the budget. The prediction
+(`mround/planner/memory.py`) is a fit to the stage peaks of the five runs on
+the current tree, Qwen2.5-1.5B-Instruct and Qwen2.5-7B-Instruct at 2 bits in
+eight pieces and Qwen2.5-3B-Instruct at 2 bits and at mixed 2.5, and of eleven
+configurations that `scripts/probe_memory.py` measured on Metal, two synthetic
+blocks at a model's shape with nothing downloaded: a 7B whole and in two, four
+and eight pieces, SmolLM2-135M, Qwen2.5-0.5B and Llama 3 8B, and four sequence
+lengths at a fixed number of tokens. Its entrance is accounting, exact to eight
+bytes on every run recorded; a step's peak is the larger of its MLP's tensors
+and its attention's, not their sum, which the sequence lengths showed; and the
+step was fitted to err toward refusing, so every peak is predicted between 1.0
+percent short and 8.2 percent over, and the five runs' within 1.1 percent. On a
+32 GB Mac it refuses Qwen2.5-7B-Instruct at the standard recipe whole,
+predicted at 39.5 GB, and names four pieces, predicted at 28.7. Each run
+records its prediction in `mround_run.json` under `memory_check`, beside what
+it measured.
+
+`TuningConfig.micro_batches`, and `--micro-batches` on `mround quantize`, run
+each tuning step's batch in that many pieces, forward and backward, with the
+pieces' gradients summed, so a step holds one piece's activations: for a model
+whose step does not fit whole. The step is still the batch's. Each piece's loss
+is divided by the whole batch's element count, and the outlier rule's threshold
+is taken over the whole batch from a forward pass without gradient before the
+pieces run, which costs that pass. The default, 1, runs every batch whole and
+writes the same checkpoint as before. A larger value changes only the order of
+the step's additions, and on Metal at 2 bits that moved Qwen2.5-1.5B-Instruct's
+checkpoint as far as a change of seed and took 1.9 times as long a block in
+eight pieces (row 122), so it is for a model whose step does not fit whole. It
+is not the reference's `gradient_accumulate_steps`, which makes the batch
+larger and which MRound still refuses. The comparison harness takes
+`--micro-batches` for MRound's side, puts it in the run's directory name and
+records it in the ledger row's `tuning`.
+
+The modules below the API export what these are built from.
+`mround.pipeline.loader.read_config` reads a model's configuration without its
+weights, and `load_model` takes `lazy`; `mround.pipeline.device` exports
+`device_memory`, `active_memory` and `StageMeter`, which keeps the peak of each
+stage of a run; `mround.pipeline.blocks` exports `checkpointed_blocks`,
+`piece_bounds` and `require_batch_free`, and `apply_block` takes `in_place`;
+`mround.core.losses` exports `outlier_threshold` and `piece_loss`;
+`mround.formats.mlx_export` exports `narrow_codes`; and `mround.exceptions`
+exports `MemoryBudgetError`, which the memory check raises. `BlockResult`
+carries each stage's peak, and `RunSummary` the stages before and after the
+block loop. Every new argument defaults to what the code did before.
+
+Row 122 is row 121's configuration with every tuning step in eight pieces,
+scored against the same reference arm. MRound's allocator peaked at 8.26 GB
+against 19.34, its block loop took 16,159 s against 11,004.8 (about 570 s a
+block against the 301 of the blocks of row 121 that ran with nothing else on
+the Mac), and its perplexity is 21.1863 against 20.8947, 12.35 percent below
+the reference's 24.1720 where row 121 is 13.56. The two checkpoints differ in
+62.6 percent of their weights and sit 0.33 apart, which is the reference's own
+distance between two seeds at 2 bits; MRound's three seeds at that size scored
+20.89 to 22.53.
+
+`scripts/compare_checkpoints.py` reads MRound's own checkpoints: MLX's packed
+codes, with the scales and biases beside them and each layer's width and group
+size from `config.json`. Two packed checkpoints are compared on what they
+store, codes and scales, with no lattice inferred; a packed checkpoint against
+a fake export is compared on the packed side's stored scales.
+
+Row 121 is row 92's MRound arm produced again after that change and scored
+against row 92's reference arm. Both perplexities repeat row 92's to the last
+digit, and MRound's allocator peaked at 19,338,070,546 bytes against
+27,265,701,016, its resident set at 1.44 GB against 4.03.
+
+Rows 117 and 118 are seed 42's two reference arms of the 2 bit
+Qwen2.5-0.5B-Instruct table produced again, the default tuning's (row 88) and
+the reference's own SignRound v2 tuning's (row 105), on the Linux machine after
+its operating system had been reinstalled and its environment rebuilt. Each
+checkpoint is the one its row scored, all 357,826,560 weights, and each row
+repeats its original's perplexities to the last digit. The change of operating
+system release that RESULTS.md listed among what the two SignRound v2 tables
+leave open therefore moved neither tuning at that seed, and the two reference
+columns are read as differing in the option alone. On one system the option
+made the reference's block loop 13.2 percent longer at that seed, where the
+reading across the two systems had given 16.9. RESULTS.md and README.md now say
+so where they raised the question, and `scripts/compare_checkpoints.py` prints
+the reproduction across a change of operating system beside the reference's
+other floors.
+
+Rows 119 and 120 are the same two arms produced under auto-round 0.16.0, the
+reference's current release when they were produced, on the same machine and
+system. Both checkpoints are the 0.15.0 ones to the bit, and both rows repeat
+the perplexities of rows 88 and 105 to the last digit, so the tables, all of
+them produced under 0.15.0, hold for 0.16.0 at that point; RESULTS.md says so
+under Which release of the reference. Under 0.16.0 the option made the block
+loop 14.3 percent longer, where the 0.15.0 pair had given 13.2.
+
+Row 123 is row 91's reference arm, seed 44 of the 2 bit Qwen2.5-0.5B-Instruct
+table on the Linux machine's integrated GPU, produced again there after the
+reinstall, on another release of the GPU's compute runtime and in its
+environment rebuilt. The checkpoint is row 91's, all 357,826,560 weights, the
+row repeats row 91's perplexities to the last digit and its device memory to
+the byte, and the arm took 4,995.8 s against 4,958.6. The reference's arms on
+that GPU repeat themselves across a change of system and runtime as its CPU
+arms do; RESULTS.md says so beside the reference's other floors, and
+`scripts/compare_checkpoints.py` prints the runtime among the changes that
+move nothing.
+
+Rows 124 to 126 are the 2 bit table on Qwen2.5-3B-Instruct, the fourth model
+and the first above two billion parameters: seeds 42, 43 and 44, the reference
+at auto-round 0.15.0 under its default tuning on the Linux machine's
+integrated GPU, in the environment row 123 cites, and MRound on one tree.
+MRound is ahead on every seed, 17.2031 against 19.8912 on the mean, 13.51
+percent, its worst seed 8.78 percent better than the reference's best, at 6.19
+percent more bytes. Against that tuning the 2 bit margin had narrowed from
+30.63 percent on Qwen2.5-0.5B-Instruct to 12.25 on Qwen2.5-1.5B-Instruct; at
+3 billion it did not narrow further. MRound's allocator peaked at 20.07 GB on
+every seed and its block loop took 16,497 to 16,562 s on the Apple GPU,
+against the reference's 21,759 to 21,771 s on the integrated GPU. RESULTS.md
+has the table and README.md its row, beside a row for the 1.5 billion table
+it had left out.
+
+Rows 127 to 129 are the same three Qwen2.5-3B-Instruct arms with the
+reference's own SignRound v2 tuning on, each produced on the integrated GPU on
+one system and in one environment beside its default twin, and scored against
+the same MRound checkpoint. The two implementations are level: MRound is ahead
+on seeds 43 and 44, by 4.34 and 2.34 percent, and 2.94 percent behind on seed
+42, 1.25 percent ahead on the mean (17.2031 against 17.4211). The option takes
+the reference 12.42 percent below its default arms on the mean and closes 92
+percent of the gap in mean perplexity, where on Qwen2.5-0.5B-Instruct at 2 bits
+it closed 77; it made the block loop 5.4 percent longer, both arms uncompiled.
+RESULTS.md, README.md and the paper carry the table, and the paper's Figures
+3 and 4 gain the 3B table of rows 124 to 126.
+
+### Tests
+
+`tests/unit/test_results_ledger.py` holds rows 117 and 118 to rows 88 and 105
+in every field but those of the system the reference arm was produced on, and
+to each other in every field of that system but the tuning, and rows 119 and
+120 to rows 117 and 118 in every field but the release and the environment that
+carries it, row 121 to row 92 in every field but what producing MRound's arm
+cost, row 122 to row 121 in every field but MRound's perplexity, its cost and
+the field that names the pieces, row 123 to row 91 in every field but those of
+the system its reference arm was produced on, its device memory to the byte,
+rows 124 to 126 to one configuration on three seeds, differing in what the seed
+decides alone, and rows 127 to 129 likewise and to their default twins in every
+field but the reference arm's, whose blocks differ in the tuning alone.
+`tests/unit/test_runner_memory.py` holds the memory levers to the bit: the
+export from one byte codes against the export from float32 codes at every width
+MLX stores, the in place stream against a fresh one, the weights a finished
+block gives back and the ones it keeps, the stage peaks, the lazy load reaching
+`mlx-lm`, every scale the sliced search gives against the whole matrix's, and
+the losses at both ends of a block's tuning to what computing the targets
+holds. `tests/unit/test_api_run_record.py` holds a mixed run to tuning a second
+lazy load rather than the scored model. `tests/unit/test_micro_batches.py`
+holds a step in pieces to the whole batch's loss and gradient, shows that a
+threshold taken piece by piece would be another rule, and holds the step's
+memory to falling with the pieces. `tests/unit/test_scoring_memory.py` holds
+the scoring pass's scores to the bit with checkpointing on and off, its rebuilt
+perturbations to the stored ones, and its memory to about one quantized copy of
+the block weights and one block's activations.
+`tests/unit/test_compare_checkpoints.py` reads packed words packed bit by bit
+at every width MLX stores, and a checkpoint MRound's own exporter wrote. Each
+lever was shown to fail its test when removed. `tests/unit/test_memory_rule.py`
+holds the memory rule to every run and every probe configuration it was fitted
+on, stage by stage, and `tests/unit/test_memory_check.py` and
+`tests/unit/test_api_run_record.py` hold the check to refusing before the model
+loads, to the configuration it reads and to the width the weights loaded at,
+and the command line to its budget, its switch and its dry run; 56 of 57
+mutations of the rule and 12 of 12 of its wiring fail them. The published suite
+collects 1,329 tests where MLX is installed, against 1,027 at 0.1.0a3.
+
+### Infrastructure
+
+`benchmarks/environments/` carries `91d06b756b312979`, the reference's Linux
+CPU environment as rebuilt on 2026-10-08 and inventoried by the process that
+ran the reference, which rows 117 and 118 cite, and the environment of
+auto-round 0.16.0 beside it, `a76996b3cffc0659` as its check inventories it and
+`ac1862f7cb75f30a` as the reference's process does, which rows 119 and 120
+cite, and `24635a7aabaa22ff`, the integrated GPU's environment as rebuilt on
+2026-10-14, which row 123 cites.
+
 ## 0.1.0a3
 
 The release in which the measurements outgrew the first two. The ledger grows

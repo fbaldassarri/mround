@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from mround.pipeline.loader import ModelBundle
     from mround.pipeline.runner import BlockResult, RunSummary
     from mround.pipeline.scoring import ScoringProgress
+    from mround.planner.memory import MemoryCheck, RunShape
 
 __all__ = [
     "Coverage",
@@ -62,6 +63,7 @@ __all__ = [
     "block_coverage",
     "default_scale_init",
     "plan_mixed_precision",
+    "predict_memory",
     "quantize",
     "quantize_round_to_nearest",
 ]
@@ -346,6 +348,8 @@ def quantize(
     scale_init: ScaleInit | str | None = None,
     min_block_coverage: float = MIN_BLOCK_COVERAGE,
     seed: int | None = None,
+    memory_budget: int | None = None,
+    memory_check: bool = True,
 ) -> QuantizeResult:
     """Quantize a model and write a checkpoint.
 
@@ -468,6 +472,18 @@ def quantize(
             than silently. Exposed for the repeat the results ask for: learned
             rounding's spread across seeds runs to tens of percent at low
             widths, so a single-seed gap is a reading rather than a result.
+        memory_budget: Bytes the run may be predicted to reach, or ``None``
+            for 85 percent of this Mac's memory
+            (:data:`mround.planner.memory.BUDGET_SHARE`). The peak is
+            predicted from the model's configuration before anything is
+            loaded, and for a Hub model before its weights are downloaded
+            (:func:`predict_memory`); a run predicted past the budget is
+            refused with the figure, the stage that sets it and the fewest
+            ``TuningConfig.micro_batches`` that would fit. The prediction is
+            printed and recorded in ``mround_run.json`` whatever it says.
+        memory_check: Refuse a run predicted past the budget. ``False`` still
+            predicts and records, and runs anyway, for the caller who has
+            measured the machine or is measuring the rule itself.
 
     Returns:
         Where the checkpoint went and what the run measured.
@@ -480,12 +496,14 @@ def quantize(
             ``holdout_batches`` is negative.
         UnsupportedSchemeError: If ``export_format`` cannot represent the scheme
             faithfully, or if a requested feature is not implemented yet.
+        MemoryBudgetError: If the run is predicted to need more memory than
+            ``memory_budget`` and ``memory_check`` is on.
+        ValueError: If ``memory_budget`` is not a positive number of bytes.
     """
     _require_supported_host()
 
     import json  # noqa: PLC0415
 
-    from mround.exceptions import ArchitectureError  # noqa: PLC0415
     from mround.formats.mlx_export import require_mlx_representable  # noqa: PLC0415
     from mround.pipeline.calibration import (  # noqa: PLC0415
         DEFAULT_CORPUS,
@@ -495,28 +513,19 @@ def quantize(
     from mround.pipeline.device import reset_peak_memory  # noqa: PLC0415
     from mround.pipeline.loader import load_model  # noqa: PLC0415
     from mround.pipeline.runner import QuantizationRunner  # noqa: PLC0415
+    from mround.planner.memory import RunShape  # noqa: PLC0415
 
     _refuse_unrunnable(export_format, holdout_batches)
 
-    # Every width this run can assign, not just ``bits``: a mixed run reaches
-    # widths ``bits`` alone does not name, the candidates and the remainder
-    # included, and two things below have to see all of them, the
-    # representability check and the scale initialization.
-    widths = {scheme.bits if scheme is not None else bits}
-    if average_bits is not None:
-        widths.update(int(width) for width in candidate_bits)
-        if remainder_bits is not None:
-            widths.add(int(remainder_bits))
-
-    resolved = scheme or QuantScheme(
+    resolved, widths = _resolve_scheme(
         bits=bits,
         group_size=group_size,
         symmetry=symmetry,
-        scale_init=(
-            default_scale_init(min(widths), symmetry)
-            if scale_init is None
-            else ScaleInit(scale_init)
-        ),
+        average_bits=average_bits,
+        candidate_bits=candidate_bits,
+        remainder_bits=remainder_bits,
+        scheme=scheme,
+        scale_init=scale_init,
     )
     tuning = tuning or TuningConfig()
     corpus = DEFAULT_CORPUS if calibration == "auto" else calibration
@@ -528,9 +537,30 @@ def quantize(
     for width in sorted(widths):
         require_mlx_representable(dataclasses.replace(resolved, bits=width))
 
+    # Predicted before anything is loaded, and for a Hub model before its
+    # weights are downloaded: a run that would swap is refused here with what
+    # would fit, rather than found out in the stage that does not fit, hours
+    # in (ROAD-TO-1.0.md M5, mround/planner/memory.py).
+    run_shape = RunShape.of(
+        resolved,
+        tuning,
+        candidate_bits=candidate_bits if average_bits is not None else None,
+        scoring_samples=scoring_samples,
+        scoring_seq_len=scoring_seq_len,
+        scoring_batch_size=scoring_batch_size,
+    )
+    config, memory = _check_memory_first(
+        model, run_shape, budget=memory_budget, enforce=memory_check
+    )
+
     reset_peak_memory()
-    bundle = load_model(model)
+    # Lazily: the block loop reads one block's weights at a time and releases
+    # each block once it is quantized, so the model is never resident whole.
+    bundle = load_model(model, lazy=True)
     _refuse_remote_code(bundle.config)
+    memory = _check_memory_loaded(
+        bundle, config, memory, run_shape, budget=memory_budget, enforce=memory_check
+    )
 
     _require_coverage(bundle, resolved, min_block_coverage)
 
@@ -566,6 +596,12 @@ def quantize(
         )
         remainder_scheme = dataclasses.replace(resolved, bits=int(plan_info["remainder_bits"]))
         print(f"  {plan_info['describe']}")
+        # The scoring backward read every weight, and they would stay resident
+        # through the whole block loop: 5.4 GB more at a 3B model's first block
+        # than a uniform run holds (log0151). A second lazy load gives the loop
+        # the same weights from disk one block at a time, and the scored copy
+        # goes with the first bundle.
+        bundle = load_model(model, lazy=True)
 
     runner = QuantizationRunner(
         resolved,
@@ -582,30 +618,20 @@ def quantize(
         expected_blocks=bundle.config.get("num_hidden_layers"),
     )
 
-    # Every linear layer and embedding outside the block stack: the embeddings
-    # and an untied output head (normalization weights are never quantized).
-    # Learned rounding has nothing to optimize for a lookup table, so these
-    # take round-to-nearest at the model level, which is what D-019 is about
-    # and what keeps a tied-embedding model from storing its largest tensor at
-    # full precision.
-    skipped: list[tuple[str, str]] = []
-    for path, layer, reason in _round_to_nearest_layers(
-        bundle, remainder_scheme, skip=set(quantized)
-    ):
-        if layer is None:
-            skipped.append((path, reason))
-        elif dense_remainder:
-            # Left at the model's own precision on purpose, and recorded as a
-            # skip so the checkpoint's own configuration says what was done to
-            # it rather than leaving a reader to infer it from the file size.
-            skipped.append((path, "dense by request, to match a reference's coverage"))
-        else:
-            quantized[path] = layer
-    if not quantized:
-        msg = f"nothing in {model!r} could be quantized at group_size={resolved.group_size}."
-        raise ArchitectureError(msg)
-
-    dense = _write_checkpoint(bundle, destination, quantized)
+    dense, skipped, after_blocks, after_peak = _finish_checkpoint(
+        bundle,
+        destination,
+        quantized,
+        remainder_scheme,
+        dense_remainder=dense_remainder,
+        model=model,
+    )
+    # The run's peak is the whole run's from here, the export included.
+    summary = dataclasses.replace(
+        summary,
+        after_blocks=after_blocks,
+        peak_memory_bytes=max(summary.peak_memory_bytes, after_peak),
+    )
     storage = _storage(bundle, quantized, dense)
     config_path = destination / "mround_run.json"
     config_path.write_text(
@@ -633,12 +659,18 @@ def quantize(
                 "mixed": None
                 if plan_info is None
                 else {key: value for key, value in plan_info.items() if key != "describe"},
+                # What the run was predicted to reach before it started, beside
+                # what it reached under "result", so every run checks the rule.
+                "memory_check": None if memory is None else memory.record(enforced=memory_check),
                 "result": {
                     "blocks": len(summary.blocks),
                     "reverted": summary.reverted,
                     "mean_improvement": summary.mean_improvement,
                     "total_seconds": summary.total_seconds,
                     "peak_memory_bytes": summary.peak_memory_bytes,
+                    # Where the peak was reached, stage by stage and block by
+                    # block (runner.BlockResult.stage_peaks), from 2026-10-10.
+                    "memory": summary.memory_record(),
                     "bits_per_weight": storage.bits_per_weight,
                     "stored_bytes": storage.stored_bytes,
                     "skipped": [list(entry) for entry in skipped],
@@ -801,6 +833,8 @@ def plan_mixed_precision(
     scoring_seq_len: int | None = None,
     scoring_batch_size: int | None = None,
     seed: int | None = None,
+    memory_budget: int | None = None,
+    memory_check: bool = True,
 ) -> dict[str, Any]:
     """Score and allocate, and stop there. Nothing is tuned and nothing written.
 
@@ -842,22 +876,29 @@ def plan_mixed_precision(
         scoring_batch_size: Sequences per scoring batch, or ``None`` to derive
             it from the budget at a fixed token count per batch.
         seed: Calibration seed.
+        memory_budget: As :func:`quantize` takes it, held to the scoring
+            pass, which is all this runs.
+        memory_check: As :func:`quantize` takes it.
 
     Returns:
         The same plain-data summary a mixed :func:`quantize` records under
-        ``mixed``, including the per layer ``assignments``.
+        ``mixed``, including the per layer ``assignments``, and the scoring
+        pass's predicted peak under ``memory_check``.
 
     Raises:
         PlatformError: If the host is not a supported Apple Silicon Mac.
         ArchitectureError: If the model cannot be loaded or planned.
         SchemeError: If the average lies outside the candidate range, or
             ``scoring_batch_size`` is below 1.
+        MemoryBudgetError: If the scoring pass is predicted to need more
+            memory than ``memory_budget`` and ``memory_check`` is on.
     """
     _require_supported_host()
 
     from mround.pipeline.calibration import DEFAULT_CORPUS  # noqa: PLC0415
     from mround.pipeline.device import reset_peak_memory  # noqa: PLC0415
     from mround.pipeline.loader import load_model  # noqa: PLC0415
+    from mround.planner.memory import RunShape  # noqa: PLC0415
 
     # The same resolution as ``quantize``: one scale initialization covers
     # every layer, so it keys on the narrowest width the plan can assign.
@@ -875,9 +916,32 @@ def plan_mixed_precision(
             else ScaleInit(scale_init)
         ),
     )
+    # The scoring pass alone, which is all of what this runs: it reads every
+    # weight, so its prediction holds the whole model (mround/planner/memory.py).
+    run_shape = RunShape.of(
+        resolved,
+        TuningConfig(),
+        candidate_bits=candidate_bits,
+        scoring_samples=scoring_samples,
+        scoring_seq_len=scoring_seq_len,
+        scoring_batch_size=scoring_batch_size,
+    )
+    scoring = {"scoring"}
+    config, memory = _check_memory_first(
+        model, run_shape, budget=memory_budget, enforce=memory_check, stages=scoring
+    )
     reset_peak_memory()
     bundle = load_model(model)
     _refuse_remote_code(bundle.config)
+    memory = _check_memory_loaded(
+        bundle,
+        config,
+        memory,
+        run_shape,
+        budget=memory_budget,
+        enforce=memory_check,
+        stages=scoring,
+    )
     _, info = _plan_mixed(
         bundle,
         resolved,
@@ -892,7 +956,104 @@ def plan_mixed_precision(
         scoring_batch_size=scoring_batch_size,
         seed=seed,
     )
+    if memory is not None:
+        info["memory_check"] = memory.record(enforced=memory_check)
     return info
+
+
+def predict_memory(
+    model: str | Path,
+    *,
+    bits: int = 4,
+    group_size: int = 64,
+    symmetry: Symmetry = Symmetry.SYMMETRIC,
+    average_bits: float | None = None,
+    candidate_bits: Sequence[int] = (2, 3, 4),
+    remainder_bits: int | None = None,
+    scoring_samples: int | None = None,
+    scoring_seq_len: int | None = None,
+    scoring_batch_size: int | None = None,
+    scheme: QuantScheme | None = None,
+    tuning: TuningConfig | None = None,
+    scale_init: ScaleInit | str | None = None,
+    memory_budget: int | None = None,
+) -> MemoryCheck:
+    """Predict the peak memory of the run :func:`quantize` would make, and stop.
+
+    Reads the model's configuration and nothing else: a local directory's
+    ``config.json``, or the one file fetched from the Hub, so a 7B's 15 GB
+    are not downloaded to learn that its run will not fit. The arguments are
+    :func:`quantize`'s and resolve as they do there, the scale initialization
+    included. Nothing here needs MLX or a Mac; without one the budget is
+    ``memory_budget`` or nothing, since only MLX can say how much memory this
+    machine has.
+
+    The prediction is the rule of :mod:`mround.planner.memory`, a fit to
+    measured runs: exact to the megabyte for what the block loop holds between
+    its stages, within a percent on the peak of every run it was fitted on,
+    and checked by every run since, which records it beside what it measured.
+
+    Args:
+        model: Hugging Face repository id or local path.
+        bits: As :func:`quantize` takes it.
+        group_size: As :func:`quantize` takes it.
+        symmetry: As :func:`quantize` takes it.
+        average_bits: As :func:`quantize` takes it; a mixed run is predicted
+            with its scoring pass.
+        candidate_bits: As :func:`quantize` takes it.
+        remainder_bits: As :func:`quantize` takes it.
+        scoring_samples: As :func:`quantize` takes it.
+        scoring_seq_len: As :func:`quantize` takes it.
+        scoring_batch_size: As :func:`quantize` takes it.
+        scheme: As :func:`quantize` takes it.
+        tuning: As :func:`quantize` takes it; ``micro_batches`` is what the
+            prediction most often moves.
+        scale_init: As :func:`quantize` takes it.
+        memory_budget: Bytes the run may reach, or ``None`` for 85 percent of
+            this Mac's memory, or for no budget where the memory is unknown.
+
+    Returns:
+        The prediction stage by stage, the budget, whether the run fits, and
+        the fewest ``micro_batches`` that would make it fit when it does not.
+        ``describe()`` says it in a line and ``explain()`` says what to change.
+
+    Raises:
+        ArchitectureError: If the configuration cannot be read, or describes
+            something other than a dense decoder the rule can read.
+        SchemeError: If the requested scheme is malformed.
+        ValueError: If ``memory_budget`` is not a positive number of bytes.
+    """
+    from mround.exceptions import ArchitectureError  # noqa: PLC0415
+    from mround.pipeline.loader import read_config  # noqa: PLC0415
+    from mround.planner.memory import ModelShape, RunShape, check_memory  # noqa: PLC0415
+
+    resolved, _ = _resolve_scheme(
+        bits=bits,
+        group_size=group_size,
+        symmetry=symmetry,
+        average_bits=average_bits,
+        candidate_bits=candidate_bits,
+        remainder_bits=remainder_bits,
+        scheme=scheme,
+        scale_init=scale_init,
+    )
+    config = read_config(model)
+    shape = ModelShape.from_config(config)
+    if shape is None:
+        msg = (
+            f"{model!r} does not describe a dense decoder the memory rule can read "
+            f"(model_type {config.get('model_type')!r}), so nothing can be predicted for it"
+        )
+        raise ArchitectureError(msg)
+    run = RunShape.of(
+        resolved,
+        tuning or TuningConfig(),
+        candidate_bits=candidate_bits if average_bits is not None else None,
+        scoring_samples=scoring_samples,
+        scoring_seq_len=scoring_seq_len,
+        scoring_batch_size=scoring_batch_size,
+    )
+    return check_memory(shape, run, budget=memory_budget, device=_device_memory())
 
 
 # ---------------------------------------------------------------------------
@@ -958,6 +1119,148 @@ def _storage(
         bits_per_weight=stored_bits / total_weights,
         stored_bytes=stored_bits // 8,
         original_bytes=total_weights * dtype_bits // 8,
+    )
+
+
+def _resolve_scheme(
+    *,
+    bits: int,
+    group_size: int,
+    symmetry: Symmetry,
+    average_bits: float | None,
+    candidate_bits: Sequence[int],
+    remainder_bits: int | None,
+    scheme: QuantScheme | None,
+    scale_init: ScaleInit | str | None,
+) -> tuple[QuantScheme, set[int]]:
+    """The scheme a run resolves to, and every width it can assign.
+
+    Every width, not just ``bits``: a mixed run reaches widths ``bits`` alone
+    does not name, the candidates and the remainder included, and two things
+    have to see all of them, the representability check and the scale
+    initialization. Shared by :func:`quantize` and :func:`predict_memory`, so
+    that a prediction is of the run that would be made.
+    """
+    widths = {scheme.bits if scheme is not None else bits}
+    if average_bits is not None:
+        widths.update(int(width) for width in candidate_bits)
+        if remainder_bits is not None:
+            widths.add(int(remainder_bits))
+
+    resolved = scheme or QuantScheme(
+        bits=bits,
+        group_size=group_size,
+        symmetry=symmetry,
+        scale_init=(
+            default_scale_init(min(widths), symmetry)
+            if scale_init is None
+            else ScaleInit(scale_init)
+        ),
+    )
+    return resolved, widths
+
+
+def _device_memory() -> int:
+    """This Mac's memory in bytes, or zero where MLX is absent or will not say."""
+    try:
+        from mround.pipeline.device import device_memory  # noqa: PLC0415
+    except ImportError:
+        return 0
+    return device_memory()
+
+
+def _check_memory_first(
+    model: str | Path,
+    run: RunShape,
+    *,
+    budget: int | None,
+    enforce: bool,
+    stages: Collection[str] | None = None,
+) -> tuple[dict[str, Any] | None, MemoryCheck | None]:
+    """The check before the load, from the configuration alone.
+
+    Returns:
+        The configuration, or ``None`` when it cannot be read before the
+        load, and the check made from it. An unreadable configuration leaves
+        the check to the one the loader reads (:func:`_check_memory_loaded`),
+        which costs the download the check exists to save and nothing else:
+        a name the Hub does not know then fails in the loader, with the
+        loader's own message.
+
+    Raises:
+        MemoryBudgetError: If the run does not fit and ``enforce`` is on.
+    """
+    from mround.exceptions import ArchitectureError  # noqa: PLC0415
+    from mround.pipeline.loader import read_config  # noqa: PLC0415
+
+    try:
+        config = read_config(model)
+    except ArchitectureError:
+        return None, None
+    return config, _check_memory(config, run, budget=budget, enforce=enforce, stages=stages)
+
+
+def _check_memory(
+    config: Mapping[str, Any],
+    run: RunShape,
+    *,
+    budget: int | None,
+    enforce: bool,
+    stages: Collection[str] | None = None,
+    dtype_bytes: int | None = None,
+) -> MemoryCheck | None:
+    """Predict a run's peak, say it, and refuse the run when it does not fit.
+
+    Returns:
+        The check, or ``None`` when the configuration does not describe a
+        model the rule can read, such as a mixture of experts: nothing is
+        predicted rather than something wrong, and the run goes ahead as it
+        did before the check existed.
+
+    Raises:
+        MemoryBudgetError: If the run does not fit and ``enforce`` is on.
+    """
+    from mround.exceptions import MemoryBudgetError  # noqa: PLC0415
+    from mround.planner.memory import ModelShape, check_memory  # noqa: PLC0415
+
+    shape = ModelShape.from_config(config)
+    if shape is None:
+        print("  memory: not predicted, the rule reads dense decoders only", flush=True)
+        return None
+    if dtype_bytes is not None:
+        shape = dataclasses.replace(shape, dtype_bytes=dtype_bytes)
+    check = check_memory(shape, run, budget=budget, device=_device_memory(), stages=stages)
+    print(f"  {check.describe()}", flush=True)
+    if enforce and not check.fits:
+        raise MemoryBudgetError(check.explain())
+    return check
+
+
+def _check_memory_loaded(
+    bundle: ModelBundle,
+    config: Mapping[str, Any] | None,
+    memory: MemoryCheck | None,
+    run: RunShape,
+    *,
+    budget: int | None,
+    enforce: bool,
+    stages: Collection[str] | None = None,
+) -> MemoryCheck | None:
+    """The check again, against what was loaded, where the first could not see it.
+
+    Done when the configuration could not be read before the load, and when
+    the weights loaded at a width other than the one the configuration names,
+    which moves every weight sized term. :func:`quantize` loads lazily, so
+    even there a refusal comes before any weight is read and any of the run's
+    hours are spent.
+    """
+    loaded = int(getattr(bundle.dtype, "size", 0) or 0) or None
+    if config is not None and (
+        memory is None or loaded is None or loaded == memory.prediction.model.dtype_bytes
+    ):
+        return memory
+    return _check_memory(
+        bundle.config, run, budget=budget, enforce=enforce, stages=stages, dtype_bytes=loaded
     )
 
 
@@ -1200,6 +1503,62 @@ def _plan_mixed(
     return overrides, info
 
 
+def _finish_checkpoint(
+    bundle: ModelBundle,
+    destination: Path,
+    quantized: dict[str, QuantizedLayer],
+    remainder_scheme: QuantScheme,
+    *,
+    dense_remainder: bool,
+    model: str | Path,
+) -> tuple[dict[str, Any], list[tuple[str, str]], dict[str, int], int]:
+    """Round the tensors outside the blocks, write the checkpoint, and measure both.
+
+    Every linear layer and embedding outside the block stack: the embeddings
+    and an untied output head (normalization weights are never quantized).
+    Learned rounding has nothing to optimize for a lookup table, so these take
+    round-to-nearest at the model level, which is what D-019 is about and what
+    keeps a model with tied embeddings from storing its largest tensor at full
+    precision. Both stages are measured like the loop's, so that the run's
+    peak is the whole run's and every run checks what
+    ``mround/planner/memory.py`` predicts for them.
+
+    Returns:
+        The tensors left dense, the skips with their reasons, the peak of each
+        stage (``remainder`` and ``export``), and the largest figure seen.
+
+    Raises:
+        ArchitectureError: If nothing at all could be quantized.
+    """
+    from mround.exceptions import ArchitectureError  # noqa: PLC0415
+    from mround.pipeline.device import StageMeter  # noqa: PLC0415
+
+    meter = StageMeter()
+    skipped: list[tuple[str, str]] = []
+    with meter.stage("remainder"):
+        for path, layer, reason in _round_to_nearest_layers(
+            bundle, remainder_scheme, skip=set(quantized)
+        ):
+            if layer is None:
+                skipped.append((path, reason))
+            elif dense_remainder:
+                # Left at the model's own precision on purpose, and recorded as
+                # a skip so the checkpoint's own configuration says what was
+                # done to it rather than leaving a reader to infer it from the
+                # file size.
+                skipped.append((path, "dense by request, to match a reference's coverage"))
+            else:
+                quantized[path] = layer
+    if not quantized:
+        msg = (
+            f"nothing in {model!r} could be quantized at group_size={remainder_scheme.group_size}."
+        )
+        raise ArchitectureError(msg)
+    with meter.stage("export"):
+        dense = _write_checkpoint(bundle, destination, quantized)
+    return dense, skipped, meter.take(), meter.peak
+
+
 def _round_to_nearest_layers(
     bundle: ModelBundle, scheme: QuantScheme, *, skip: Collection[str] = ()
 ) -> Iterator[tuple[str, QuantizedLayer | None, str]]:
@@ -1213,7 +1572,7 @@ def _round_to_nearest_layers(
     import mlx.core as mx  # noqa: PLC0415
 
     from mround.core.quantizer import quantize_codes  # noqa: PLC0415
-    from mround.formats.mlx_export import QuantizedLayer  # noqa: PLC0415
+    from mround.formats.mlx_export import QuantizedLayer, narrow_codes  # noqa: PLC0415
     from mround.pipeline.blocks import iter_quantizable_modules  # noqa: PLC0415
 
     for path, module, eligible in iter_quantizable_modules(
@@ -1239,6 +1598,11 @@ def _round_to_nearest_layers(
 
             init_scale = search_scales(widened, scheme)
         codes, scale, zero_point = quantize_codes(widened, None, scheme, init_scale=init_scale)
+        # Narrowed to a byte a code and evaluated here, layer by layer. Left
+        # lazy, every layer's codes would hold its float32 widening alive
+        # until the export evaluated them all at once.
+        codes = narrow_codes(codes, scheme)
+        mx.eval(codes, scale, *(() if zero_point is None else (zero_point,)))
         yield path, QuantizedLayer(codes, scale, zero_point, scheme), ""
 
 

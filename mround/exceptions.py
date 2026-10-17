@@ -14,6 +14,7 @@ __all__ = [
     "CalibrationError",
     "ExportError",
     "MRoundError",
+    "MemoryBudgetError",
     "PlatformError",
     "SchemeError",
     "UnsupportedSchemeError",
@@ -65,3 +66,13 @@ class ArchitectureError(MRoundError):
 
 class ExportError(MRoundError):
     """A checkpoint could not be written."""
+
+
+class MemoryBudgetError(MRoundError):
+    """A run is predicted to need more memory than it may use.
+
+    Raised before the model is loaded, by the check in ``mround/api.py`` that
+    applies the rule of ``mround/planner/memory.py``. On Apple Silicon a run
+    past the machine's memory does not fail, it swaps, hours in, so the
+    message says what the run would reach, against what, and what would fit.
+    """

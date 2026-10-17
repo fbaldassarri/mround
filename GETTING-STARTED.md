@@ -140,6 +140,24 @@ size can reach, and it refuses rather than proceeding when that share is below
 half. A run that silently quantizes a third of a model and reports success is
 worse than one that stops.
 
+Before it loads anything it also predicts the run's peak memory from the
+model's configuration alone, and refuses a run predicted past 85 percent of the
+Mac's memory, naming the number of pieces each tuning step should run in to
+fit. On a Mac, memory past its size does not fail, it swaps, and a run that
+swaps looks like a hung one hours in:
+
+```bash
+mround quantize Qwen/Qwen2.5-7B-Instruct --bits 2 --dry-run
+mround quantize Qwen/Qwen2.5-7B-Instruct -o ./qwen7b-2bit --bits 2 --micro-batches 4
+```
+
+`--dry-run` prints the prediction stage by stage, reading the configuration and
+not the weights, and exits 1 when the run would be refused. `--micro-batches`
+keeps each step the whole batch's, but a run in pieces is slower and its
+checkpoint is another draw, so the check names the fewest pieces that fit.
+`--memory-budget` and `--skip-memory-check` overrule it, and `mround doctor`
+shows the budget.
+
 Mixed precision chooses a width per layer from a menu, under an exact size
 budget:
 

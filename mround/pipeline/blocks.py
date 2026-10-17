@@ -46,6 +46,7 @@ that consumes all of this lives in ``runner.py``.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 from typing import TYPE_CHECKING, Any
@@ -64,9 +65,12 @@ __all__ = [
     "apply_block",
     "block_output",
     "capture_block_inputs",
+    "checkpointed_blocks",
     "discover_blocks",
     "iter_quantizable_linears",
     "iter_quantizable_modules",
+    "piece_bounds",
+    "require_batch_free",
 ]
 
 # A stack of one is a module that happens to live in a list, not a block stack.
@@ -162,6 +166,22 @@ class _CapturedCall(Exception):  # noqa: N818
         self.call_kwargs = call_kwargs
 
 
+def _delegated(stand_in: Any, key: str) -> Any:
+    """An attribute of a stand-in, answered as the block it displaced would.
+
+    Both lookups go through the dictionary protocol rather than attribute
+    access, so neither can recurse back through ``__getattr__``, and the
+    second guards the window during ``__init__`` before there is a block to
+    delegate to.
+    """
+    if key in stand_in:
+        return stand_in[key]
+    if "_wrapped" not in stand_in:
+        msg = f"{type(stand_in).__name__} has no attribute {key!r} and no block to answer for it"
+        raise AttributeError(msg)
+    return getattr(stand_in["_wrapped"], key)
+
+
 @functools.cache
 def _recorder_type() -> type:
     """Build the recording stand-in class on first use.
@@ -196,25 +216,69 @@ def _recorder_type() -> type:
         def __getattr__(self, key: str) -> Any:
             """Answer as the displaced block would.
 
-            Reached only when normal lookup fails. Both lookups go through the
-            dictionary protocol rather than attribute access, so neither can
-            recurse back through here, and the second guards the window during
-            ``__init__`` before there is a block to delegate to.
+            Reached only when normal lookup fails. See :func:`_delegated`.
             """
-            if key in self:
-                return self[key]
-            if "_wrapped" not in self:
-                msg = (
-                    f"{type(self).__name__} has no attribute {key!r} and no block to answer for it"
-                )
-                raise AttributeError(msg)
-            return getattr(self["_wrapped"], key)
+            return _delegated(self, key)
 
         def __call__(self, *args: Any, **kwargs: Any) -> Any:
             """Record and abort. Never returns."""
             raise _CapturedCall(args, kwargs)
 
     return _Recorder
+
+
+@functools.cache
+def _checkpointed_type() -> type:
+    """Build the checkpointing stand-in class on first use, as the recorder is."""
+    from mlx import nn as nn_  # noqa: PLC0415
+
+    class _Checkpointed(nn_.Module):  # type: ignore[misc]
+        """Stands where a block sits and runs it under gradient checkpointing.
+
+        A backward through it keeps the block's inputs from the forward pass
+        and recomputes everything inside the block when the backward reaches
+        it, so a backward through the whole model holds one block's
+        activations rather than every block's. The recomputation is the same
+        arithmetic on the same values, so the gradients are the same.
+        Attribute lookups go to the block it displaced, for the reason the
+        recording stand-in gives.
+        """
+
+        def __init__(self, wrapped: Any) -> None:
+            super().__init__()
+            self._wrapped = wrapped
+            self._checkpointed = nn_.utils.checkpoint(wrapped)
+
+        def __getattr__(self, key: str) -> Any:
+            """Answer as the displaced block would. See :func:`_delegated`."""
+            return _delegated(self, key)
+
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            """Run the block, keeping only its inputs for the backward."""
+            return self._checkpointed(*args, **kwargs)
+
+    return _Checkpointed
+
+
+@contextlib.contextmanager
+def checkpointed_blocks(model: nn.Module, blocks: Iterable[BlockRef]) -> Iterator[None]:
+    """Run every one of ``blocks`` under gradient checkpointing while inside.
+
+    For a backward through the whole model, such as the mixed precision
+    scoring pass: without it the forward keeps every block's activations for
+    the backward, which at 3B parameters and 2,048 tokens is a model's worth
+    of memory again. The blocks are restored on the way out, on every path.
+    """
+    from mlx.utils import tree_unflatten  # noqa: PLC0415
+
+    blocks = list(blocks)
+    stand_in = _checkpointed_type()
+    original = tree_unflatten([(block.name, block.module) for block in blocks])
+    model.update_modules(tree_unflatten([(block.name, stand_in(block.module)) for block in blocks]))
+    try:
+        yield
+    finally:
+        model.update_modules(original)
 
 
 def _group_by_index(paths: Iterable[str]) -> dict[str, dict[int, str]]:
@@ -469,7 +533,9 @@ def capture_block_inputs(
     return cache
 
 
-def apply_block(module: nn.Module, cache: ActivationCache) -> list[mx.array]:
+def apply_block(
+    module: nn.Module, cache: ActivationCache, *, in_place: bool = False
+) -> list[mx.array]:
     """Run ``module`` over every cached input, returning the hidden states.
 
     This is what propagation is made of. Running the full-precision block gives
@@ -480,6 +546,11 @@ def apply_block(module: nn.Module, cache: ActivationCache) -> list[mx.array]:
         module: A block, quantized or not.
         cache: Inputs and the rest of each call, from
             :func:`capture_block_inputs`.
+        in_place: Write each output over the input it came from, in
+            ``cache.inputs`` itself, and return that list. For a stream whose
+            inputs are not read again, this holds one stream and one batch
+            where a fresh list holds two streams. Every list that shares the
+            inputs' arrays without being ``cache.inputs`` keeps the inputs.
 
     Returns:
         One output per cached batch, already evaluated.
@@ -490,13 +561,17 @@ def apply_block(module: nn.Module, cache: ActivationCache) -> list[mx.array]:
     """
     import mlx.core as mx  # noqa: PLC0415
 
-    outputs: list[Any] = []
-    for hidden, rest, keywords in zip(cache.inputs, cache.args, cache.kwargs, strict=True):
+    outputs: list[Any] = cache.inputs if in_place else []
+    batches = zip(cache.inputs, cache.args, cache.kwargs, strict=True)
+    for index, (hidden, rest, keywords) in enumerate(batches):
         produced = block_output(module, hidden, rest, keywords)
         # Per batch rather than at the end: a whole corpus of unevaluated block
         # outputs is the same memory problem the capture above avoids.
         mx.eval(produced)
-        outputs.append(produced)
+        if in_place:
+            outputs[index] = produced
+        else:
+            outputs.append(produced)
     return outputs
 
 
@@ -529,6 +604,51 @@ def block_output(
 
     produced = module(hidden, *args, **(kwargs or {}))
     return _hidden_state(mx, produced, what="what the block returned")
+
+
+def piece_bounds(size: int, pieces: int) -> list[tuple[int, int]]:
+    """Split ``size`` sequences into contiguous runs, as even as they can be.
+
+    At most ``pieces`` runs and never an empty one; where they cannot be equal
+    the first ones are a sequence longer. This is how a step's batch is split
+    into micro batches (``TuningConfig.micro_batches``).
+    """
+    count = max(1, min(pieces, size))
+    base, extra = divmod(size, count)
+    bounds = []
+    start = 0
+    for piece in range(count):
+        stop = start + base + (1 if piece < extra else 0)
+        bounds.append((start, stop))
+        start = stop
+    return bounds
+
+
+def require_batch_free(
+    hidden: mx.array, args: tuple[Any, ...], kwargs: Mapping[str, Any], *, block: str
+) -> None:
+    """Refuse a block call whose other arguments may carry the batch.
+
+    A piece of a batch is given the call's other arguments as they were
+    captured, which is right for what every ``mlx-lm`` decoder passes today:
+    a mask that is the string ``"causal"`` or one array per position pair,
+    and no cache. An array with as many dimensions as the hidden state could
+    hold one row per sequence, and the piece would then be run against the
+    whole batch's, so it is refused rather than guessed at.
+
+    Raises:
+        ArchitectureError: If an argument holds such an array.
+    """
+    import mlx.core as mx  # noqa: PLC0415
+
+    for value in _arrays_in(mx, (args, kwargs)):
+        if value.ndim >= hidden.ndim:
+            msg = (
+                f"{block!r} is called with an array shaped {tuple(value.shape)} beside "
+                f"its hidden state {tuple(hidden.shape)}, which may hold one row per "
+                f"sequence; micro batches cannot split it, so run with micro_batches=1"
+            )
+            raise ArchitectureError(msg)
 
 
 def iter_quantizable_linears(block: nn.Module) -> Iterator[tuple[str, nn.Module]]:

@@ -25,11 +25,20 @@ whole magnitude is a few parts in a hundred, which is a noise floor of the same
 order as the signal being optimized (MEMORY.md D-026). That choice costs memory
 and is measured rather than assumed.
 
-**Memory discipline is this module's responsibility.** Beyond the weights,
-which mlx-lm loads whole and which stay resident, the working set is governed
-by the largest single block plus the cached activations of the two streams,
-not by the depth of the model (DOCUMENTATION.md section 2). Anything added here
-that keeps a per-block quantity alive across blocks breaks that silently.
+**Memory discipline is this module's responsibility.** The model can arrive
+with its weights still on disk (``load_model(lazy=True)``, which is how
+``api.quantize`` loads it): each block's weights are read when the block is
+reached, and a finished block's quantized layers are released once the
+quantized stream has passed through them. Two streams are resident while a
+block is tuned, not three: the targets are written over the reference inputs
+they are computed from, and the quantized stream advances in place. The codes
+wait for the export at one byte each. What remains grows with the largest
+single block, its tuning step and the two streams, and with the depth of the
+model only through those codes (DOCUMENTATION.md section 2), and every stage's
+peak is measured and reported (``BlockResult.stage_peaks``), which is what
+``mround/planner/memory.py`` is fitted on to predict a run before it starts.
+Anything added here that keeps a per block quantity alive across blocks breaks
+that silently, and the prediction with it.
 
 So is evaluation placement. MLX evaluates lazily, and both failure modes are
 reachable from a loop like this one: reading a scalar loss every step forces a
@@ -47,7 +56,12 @@ from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 
-from mround.core.losses import outlier_suppressed_loss, reconstruction_loss
+from mround.core.losses import (
+    outlier_suppressed_loss,
+    outlier_threshold,
+    piece_loss,
+    reconstruction_loss,
+)
 from mround.core.quantizer import fake_quantize, init_params, project_params, quantize_codes
 from mround.core.scale_search import search_scales
 from mround.core.signsgd import LinearDecay, SignSGD
@@ -59,8 +73,10 @@ from mround.pipeline.blocks import (
     capture_block_inputs,
     discover_blocks,
     iter_quantizable_linears,
+    piece_bounds,
+    require_batch_free,
 )
-from mround.pipeline.device import peak_memory
+from mround.pipeline.device import StageMeter, peak_memory
 from mround.schemes import DEFAULT_EPS_FP32, QuantScheme, ScaleInit, TuningConfig
 
 if TYPE_CHECKING:
@@ -115,6 +131,14 @@ class BlockResult:
         search_seconds: Wall clock spent collecting importance and running the
             v2 scale search, zero when the scheme did not ask for it. Recorded
             because Q-004's kernel question needs this number.
+        stage_peaks: Peak MLX allocation in each stage of this block, in bytes:
+            ``targets`` (the reference stream through the original block),
+            ``search`` (importance and the scale search), ``tune`` (the steps
+            and the losses at both ends), ``commit`` (codes and the
+            reconstruction) and ``advance`` (the quantized stream through the
+            quantized block). Each is the whole process's figure, weights and
+            streams included, so the largest is the block's peak and the stage
+            that set it says where memory goes.
     """
 
     index: int
@@ -129,6 +153,7 @@ class BlockResult:
     reverted: bool = False
     generalization_gap: float | None = None
     search_seconds: float = 0.0
+    stage_peaks: dict[str, int] = dataclasses.field(default_factory=dict)
 
     @property
     def improvement(self) -> float:
@@ -145,6 +170,9 @@ class BlockResult:
     def describe(self) -> str:
         """One line for a progress log."""
         note = "  reverted to round-to-nearest" if self.reverted else ""
+        if self.stage_peaks:
+            stage = max(self.stage_peaks, key=self.stage_peaks.__getitem__)
+            note = f"  peak {self.stage_peaks[stage] / 1e9:.2f} GB in {stage}{note}"
         if self.generalization_gap is not None:
             note = f"  gap {self.generalization_gap:+.1%}{note}"
         if self.search_seconds:
@@ -167,12 +195,21 @@ class RunSummary:
             determines the minimum machine for a given model.
         scheme_by_layer: The scheme each layer was quantized under, which is not
             uniform when mixed precision is in play.
+        before_blocks: Peak MLX allocation before the first block, keyed
+            ``entrance``: loading, a mixed run's scoring pass and the
+            calibration set, through the capture of the first block's inputs.
+        after_blocks: Peak MLX allocation after the last block, keyed by
+            stage, which the entry point that called the runner measures and
+            adds (``mround.api.quantize``: ``remainder``, the tensors outside
+            the blocks, and ``export``). Empty from the runner itself.
     """
 
     blocks: list[BlockResult]
     total_seconds: float
     peak_memory_bytes: int
     scheme_by_layer: dict[str, QuantScheme]
+    before_blocks: dict[str, int] = dataclasses.field(default_factory=dict)
+    after_blocks: dict[str, int] = dataclasses.field(default_factory=dict)
 
     @property
     def mean_improvement(self) -> float:
@@ -204,6 +241,30 @@ class RunSummary:
         """
         gaps = [b.generalization_gap for b in self.blocks if b.generalization_gap is not None]
         return sum(gaps) / len(gaps) if gaps else None
+
+    def stage_peaks(self) -> dict[str, int]:
+        """The largest peak each stage reached in any block, before them and after.
+
+        The run's peak is the largest of these, and the stage it belongs to is
+        where a larger model will run out of memory first.
+        """
+        peaks = dict(self.before_blocks)
+        for block in self.blocks:
+            for stage, reached in block.stage_peaks.items():
+                peaks[stage] = max(peaks.get(stage, 0), reached)
+        for stage, reached in self.after_blocks.items():
+            peaks[stage] = max(peaks.get(stage, 0), reached)
+        return peaks
+
+    def memory_record(self) -> dict[str, Any]:
+        """The run's memory, for the run record: the peak, and by stage and block."""
+        return {
+            "peak_bytes": self.peak_memory_bytes,
+            "by_stage_bytes": self.stage_peaks(),
+            "by_block_bytes": [
+                {"block": block.index, **block.stage_peaks} for block in self.blocks
+            ],
+        }
 
     def describe(self) -> str:
         """One line summarizing what the run achieved."""
@@ -280,6 +341,22 @@ def _tunable_type() -> type:
             return y if self.bias is None else y + self.bias
 
     return _TunableLinear
+
+
+def _release_weights(block: BlockRef, layers: Mapping[str, QuantizedLayer]) -> None:
+    """Drop the weights of a finished block's quantized layers.
+
+    Their codes are in ``layers`` and the block is never run again, so the
+    reconstruction committed into each layer has no reader left; keeping it
+    would hold a dense copy of every finished block until the run ends. Each
+    is replaced by an empty array of its dtype rather than deleted, so a walk
+    over the model's modules still finds a weight. Layers the block left dense
+    keep theirs, which the export writes as they are.
+    """
+    for name, linear in iter_quantizable_linears(block.module):
+        path = f"{block.name}.{name}" if block.name else name
+        if path in layers:
+            linear.weight = mx.zeros((0,), dtype=linear.weight.dtype)
 
 
 def block_recipe(
@@ -412,15 +489,20 @@ class QuantizationRunner:
                 behaves in a way the capture contract does not cover.
         """
         started = time.perf_counter()
+        meter = StageMeter()
         blocks = discover_blocks(model, expected=expected_blocks)
 
         # Captured once at the entrance. Propagation down the stack was verified
         # exact on hardware, so this is one prefix pass rather than one per
         # block. See MEMORY.md D-023.
-        entrance = capture_block_inputs(model, blocks[0], calibration_batches, with_outputs=False)
-        reference_stream = [hidden.astype(mx.float32) for hidden in entrance.inputs]
-        mx.eval(reference_stream)
-        entrance.inputs = []
+        with meter.stage("entrance"):
+            entrance = capture_block_inputs(
+                model, blocks[0], calibration_batches, with_outputs=False
+            )
+            reference_stream = [hidden.astype(mx.float32) for hidden in entrance.inputs]
+            mx.eval(reference_stream)
+            entrance.inputs = []
+        before_blocks = meter.take()
 
         quantized_stream = list(reference_stream) if self.quantized_inputs else None
 
@@ -430,16 +512,23 @@ class QuantizationRunner:
 
         for block in blocks:
             # Computed before the block is touched, so the target chain is the
-            # original model's activations all the way down. Q-001.
-            targets = apply_block(
-                block.module,
-                ActivationCache(
-                    inputs=reference_stream,
-                    outputs=[],
-                    args=entrance.args,
-                    kwargs=entrance.kwargs,
-                ),
-            )
+            # original model's activations all the way down. Q-001. With the
+            # quantized stream on, the reference input is never read again once
+            # its target exists, so each target is written over its input and
+            # the reference stream becomes the targets in place: two streams
+            # resident through tuning rather than three. With it off, the
+            # reference input is what the block is tuned on and has to stay.
+            with meter.stage("targets"):
+                targets = apply_block(
+                    block.module,
+                    ActivationCache(
+                        inputs=reference_stream,
+                        outputs=[],
+                        args=entrance.args,
+                        kwargs=entrance.kwargs,
+                    ),
+                    in_place=quantized_stream is not None,
+                )
 
             cache = ActivationCache(
                 inputs=quantized_stream if quantized_stream is not None else reference_stream,
@@ -448,30 +537,40 @@ class QuantizationRunner:
                 kwargs=entrance.kwargs,
             )
             result, layers = self.quantize_block(
-                block, cache, scheme_by_layer=scheme_by_layer, path_prefix=block.name
+                block, cache, scheme_by_layer=scheme_by_layer, path_prefix=block.name, meter=meter
             )
-            results.append(result)
             exported.update(layers)
             for path in layers:
                 schemes[path] = self._scheme_for(path, scheme_by_layer)
-            if self.progress is not None:
-                self.progress(result)
 
-            # Advance both streams, then drop everything this block held. The
+            # Advance the quantized stream in place, the last pass through this
+            # block, then release its quantized weights: their codes are in
+            # ``exported`` and nothing reads the reconstruction again. The
             # target the loop just used is by construction the next reference
             # input, so it is moved rather than recomputed.
-            if quantized_stream is not None:
-                quantized_stream = apply_block(block.module, cache)
+            with meter.stage("advance"):
+                if quantized_stream is not None:
+                    apply_block(block.module, cache, in_place=True)
+                _release_weights(block, layers)
             reference_stream = targets
             cache.clear()
 
+            result = dataclasses.replace(
+                result, peak_memory_bytes=meter.peak, stage_peaks=meter.take()
+            )
+            results.append(result)
+            if self.progress is not None:
+                self.progress(result)
+
+        meter.peak = max(meter.peak, peak_memory())
         total = time.perf_counter() - started
         return (
             RunSummary(
                 blocks=results,
                 total_seconds=total,
-                peak_memory_bytes=peak_memory(),
+                peak_memory_bytes=meter.peak,
                 scheme_by_layer=schemes,
+                before_blocks=before_blocks,
             ),
             exported,
         )
@@ -483,6 +582,7 @@ class QuantizationRunner:
         *,
         scheme_by_layer: Mapping[str, QuantScheme] | None = None,
         path_prefix: str = "",
+        meter: StageMeter | None = None,
     ) -> tuple[BlockResult, dict[str, QuantizedLayer]]:
         """Tune and quantize a single block, in place.
 
@@ -496,6 +596,8 @@ class QuantizationRunner:
                 needs.
             scheme_by_layer: Per-layer overrides, keyed by full dotted path.
             path_prefix: Prepended to layer names to form those paths.
+            meter: Where the stages' peaks go. A fresh one when ``None``, which
+                is what a call outside :meth:`run` wants.
 
         Returns:
             What tuning achieved, and the quantized layers keyed by full path.
@@ -507,6 +609,7 @@ class QuantizationRunner:
         from mlx.utils import tree_unflatten  # noqa: PLC0415
 
         started = time.perf_counter()
+        meter = meter if meter is not None else StageMeter()
         tunable_type = _tunable_type()
 
         originals: dict[str, Any] = {}
@@ -541,8 +644,9 @@ class QuantizationRunner:
 
         try:
             block.module.update_modules(tree_unflatten(list(tunables.items())))
-            search_seconds = self._search_scales(block, cache, tunables)
-            outcome = self._tune(block, cache, tunables)
+            with meter.stage("search"):
+                search_seconds = self._search_scales(block, cache, tunables)
+            outcome = self._tune(block, cache, tunables, meter)
         finally:
             # Restored before anything else touches the block, including on the
             # way out of a failure. A stand-in left installed would be found by
@@ -550,11 +654,12 @@ class QuantizationRunner:
             block.module.update_modules(tree_unflatten(list(originals.items())))
 
         exported: dict[str, QuantizedLayer] = {}
-        for name, linear in originals.items():
-            path = f"{path_prefix}.{name}" if path_prefix else name
-            exported[path] = self._commit(
-                linear, tunables[name], outcome.params[name], schemes[name]
-            )
+        with meter.stage("commit"):
+            for name, linear in originals.items():
+                path = f"{path_prefix}.{name}" if path_prefix else name
+                exported[path] = self._commit(
+                    linear, tunables[name], outcome.params[name], schemes[name]
+                )
 
         return (
             BlockResult(
@@ -564,7 +669,8 @@ class QuantizationRunner:
                 final_loss=outcome.final_loss,
                 iterations=self.tuning.iters,
                 seconds=time.perf_counter() - started,
-                peak_memory_bytes=peak_memory(),
+                peak_memory_bytes=meter.peak,
+                stage_peaks=dict(meter.stages),
                 tuned=tuple(sorted(tunables)),
                 skipped=tuple(skipped),
                 reverted=outcome.reverted,
@@ -635,10 +741,16 @@ class QuantizationRunner:
         once as an integer with its scale.
         """
         from mround.formats.mlx_export import QuantizedLayer as Layer  # noqa: PLC0415
+        from mround.formats.mlx_export import narrow_codes  # noqa: PLC0415
 
         codes, scale, zero_point = quantize_codes(
             tunable.weight, params, scheme, eps=self.eps, init_scale=tunable.init_scale
         )
+        # One byte a code rather than four: the codes wait here for the export
+        # until the last block is done, and in float32 they came to twice the
+        # model's own size in bfloat16 by the end of the run. The values are
+        # the same integers either way.
+        codes = narrow_codes(codes, scheme)
         reconstructed = fake_quantize(
             tunable.weight, params, scheme, eps=self.eps, init_scale=tunable.init_scale
         )
@@ -646,7 +758,13 @@ class QuantizationRunner:
         mx.eval(linear.weight, codes, scale, zero_point)
         return Layer(codes, scale, zero_point, scheme)
 
-    def _tune(self, block: BlockRef, cache: ActivationCache, tunables: Mapping[str, Any]) -> _Tuned:
+    def _tune(
+        self,
+        block: BlockRef,
+        cache: ActivationCache,
+        tunables: Mapping[str, Any],
+        meter: StageMeter,
+    ) -> _Tuned:
         """Run signed gradient descent on the block's rounding parameters.
 
         **The parameters kept are the last ones, not the best-scoring ones.**
@@ -670,6 +788,12 @@ class QuantizationRunner:
         measured on them, so the comparison is against data the rounding has
         never seen and the revert rule can see a block that has memorized rather
         than learned.
+
+        **A step's batch may run in pieces** (``TuningConfig.micro_batches``),
+        which bounds the step's activations by one piece's rather than the
+        whole batch's. The step stays the batch's: see :meth:`_step_in_pieces`.
+        The measurements at both ends are taken in the same pieces, and are the
+        ``score`` stage of the block's memory, the steps its ``tune`` stage.
 
         Returns the loss before tuning, the loss after, the parameters to
         commit, and whether the fallback fired.
@@ -714,9 +838,36 @@ class QuantizationRunner:
 
             return objective
 
+        pieces = self.tuning.micro_batches
+        if pieces > 1:
+            for index in range(n_batches):
+                require_batch_free(
+                    cache.inputs[index], cache.args[index], cache.kwargs[index], block=block.name
+                )
+
         def mean_loss(params: Mapping[str, Params], over: list[int]) -> float:
-            """The loss averaged over a set of batches."""
-            mean = sum(objective_for(i)(params) for i in over) / len(over)
+            """The loss averaged over a set of batches, evaluated one batch at a time.
+
+            The same losses added in the same order as one lazy sum over the
+            batches, which kept every batch's forward pass alive at once and
+            was the largest stage of a 3B run, 25.42 GB against the steps'
+            20.07 (log0149). In pieces, a batch's output is assembled from its
+            pieces and its loss is the whole batch's, the same function of the
+            same output.
+            """
+            losses = []
+            for index in over:
+                loss = (
+                    objective_for(index)(params)
+                    if pieces == 1
+                    else loss_fn(
+                        self._output_in_pieces(block, cache, tunables, params, index, pieces),
+                        cache.outputs[index],
+                    )
+                )
+                mx.eval(loss)
+                losses.append(loss)
+            mean = sum(losses) / len(over)
             mx.eval(mean)
             return float(mean)
 
@@ -725,31 +876,40 @@ class QuantizationRunner:
             name: SignSGD(LinearDecay(rates[name], self.tuning.iters)) for name in tunables
         }
 
-        initial_loss = mean_loss(start, scoring_batches)
-        initial_tuning = mean_loss(start, tuning_batches) if held else initial_loss
+        with meter.stage("score"):
+            initial_loss = mean_loss(start, scoring_batches)
+            initial_tuning = mean_loss(start, tuning_batches) if held else initial_loss
         params = start
 
-        for step in range(self.tuning.iters):
-            # Cycled rather than sampled. Every batch is then used the same
-            # number of times, which a random draw only approaches, and the run
-            # is reproducible without carrying a second seed.
-            batch = tuning_batches[step % len(tuning_batches)]
-            loss, grads = mx.value_and_grad(objective_for(batch))(params)
+        with meter.stage("tune"):
+            for step in range(self.tuning.iters):
+                # Cycled rather than sampled. Every batch is then used the same
+                # number of times, which a random draw only approaches, and
+                # the run is reproducible without carrying a second seed.
+                batch = tuning_batches[step % len(tuning_batches)]
+                if pieces == 1:
+                    loss, grads = mx.value_and_grad(objective_for(batch))(params)
+                else:
+                    loss, grads = self._step_in_pieces(
+                        block, cache, tunables, params, batch, pieces, suppress=suppress
+                    )
 
-            params = {
-                name: project_params(
-                    optimizers[name].apply(params[name], grads[name]), layer.scheme
-                )
-                for name, layer in tunables.items()
-            }
+                params = {
+                    name: project_params(
+                        optimizers[name].apply(params[name], grads[name]), layer.scheme
+                    )
+                    for name, layer in tunables.items()
+                }
 
-            # One synchronization per step, covering the loss and every new
-            # parameter together. Evaluating less often lets the graph grow
-            # across steps; evaluating the loss separately pays two round trips.
-            mx.eval(loss, *[value for group in params.values() for value in group.values()])
+                # One synchronization per step, covering the loss and every new
+                # parameter together. Evaluating less often lets the graph grow
+                # across steps; evaluating the loss separately pays two round
+                # trips.
+                mx.eval(loss, *[value for group in params.values() for value in group.values()])
 
-        final_loss = mean_loss(params, scoring_batches)
-        final_tuning = mean_loss(params, tuning_batches) if held else final_loss
+        with meter.stage("score"):
+            final_loss = mean_loss(params, scoring_batches)
+            final_tuning = mean_loss(params, tuning_batches) if held else final_loss
 
         # The gap between what tuning achieved on its own data and what it
         # achieved on data it never saw. Positive means the block learned
@@ -762,3 +922,94 @@ class QuantizationRunner:
         if final_loss >= initial_loss:
             return _Tuned(initial_loss, initial_loss, gap, start, reverted=True)
         return _Tuned(initial_loss, final_loss, gap, params, reverted=False)
+
+    @staticmethod
+    def _output_in_pieces(
+        block: BlockRef,
+        cache: ActivationCache,
+        tunables: Mapping[str, Any],
+        params: Mapping[str, Params],
+        index: int,
+        pieces: int,
+    ) -> mx.array:
+        """One batch's output under ``params``, computed and evaluated a piece at a time.
+
+        No gradient flows through it: it is what the measurements at both ends
+        of the tuning and the outlier threshold of a step are taken from.
+        """
+        for name, layer in tunables.items():
+            layer.params = params[name]
+        hidden = cache.inputs[index]
+        produced = []
+        for low, high in piece_bounds(hidden.shape[0], pieces):
+            piece = block_output(
+                block.module,
+                hidden[low:high].astype(mx.float32),
+                cache.args[index],
+                cache.kwargs[index],
+            )
+            mx.eval(piece)
+            produced.append(piece)
+        return mx.concatenate(produced, axis=0)
+
+    def _step_in_pieces(
+        self,
+        block: BlockRef,
+        cache: ActivationCache,
+        tunables: Mapping[str, Any],
+        params: Mapping[str, Params],
+        index: int,
+        pieces: int,
+        *,
+        suppress: bool,
+    ) -> tuple[mx.array, dict[str, Params]]:
+        """One step's loss and gradient, the batch run in pieces.
+
+        The batch's loss is a mean over all of its elements, so each piece's
+        sum of squared errors is divided by the whole batch's count
+        (:func:`~mround.core.losses.piece_loss`) and the pieces' gradients are
+        added: the batch's own gradient, up to the order of the additions. The
+        outlier rule is not a sum over pieces, since it excludes the batch's
+        largest errors wherever they fall, so its threshold is taken first,
+        over the whole batch's output from a forward pass without gradient
+        (:meth:`_output_in_pieces`), and every piece is masked by it. Each
+        piece is evaluated before the next runs, which is what bounds the
+        step's activations by one piece's.
+        """
+        from mlx.utils import tree_map  # noqa: PLC0415
+
+        target = cache.outputs[index]
+        elements = target.size
+        threshold = None
+        if suppress:
+            predicted = self._output_in_pieces(block, cache, tunables, params, index, pieces)
+            residual = predicted.astype(mx.float32) - target.astype(mx.float32)
+            threshold = outlier_threshold(residual)
+            mx.eval(threshold)
+            del predicted, residual
+
+        hidden = cache.inputs[index]
+        rest, keywords = cache.args[index], cache.kwargs[index]
+
+        def objective_for(low: int, high: int) -> Callable[[Mapping[str, Params]], mx.array]:
+            def objective(values: Mapping[str, Params]) -> mx.array:
+                for name, layer in tunables.items():
+                    layer.params = values[name]
+                predicted = block_output(
+                    block.module, hidden[low:high].astype(mx.float32), rest, keywords
+                )
+                return piece_loss(
+                    predicted, target[low:high], elements=elements, threshold=threshold
+                )
+
+            return objective
+
+        first, *others = piece_bounds(hidden.shape[0], pieces)
+        loss, grads = mx.value_and_grad(objective_for(*first))(params)
+        mx.eval(loss, grads)
+        for low, high in others:
+            share, share_grads = mx.value_and_grad(objective_for(low, high))(params)
+            loss = loss + share
+            grads = tree_map(mx.add, grads, share_grads)
+            mx.eval(loss, grads)
+        return loss, grads

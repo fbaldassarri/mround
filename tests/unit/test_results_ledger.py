@@ -345,7 +345,7 @@ class TestProjectLedger:
                 # their own environment block, which describes the scorer.
                 assert original["environment"]["auto_round"] == "0.14.2"
 
-    # Rows 55 to 116 in the order they were appended. The paper and RESULTS.md
+    # Rows 55 to 129 in the order they were appended. The paper and RESULTS.md
     # cite most of them by number, so their kinds are history as much as the
     # head to head rows of SCHEMA_ONE_HEAD_TO_HEAD are.
     SCHEMA_TWO_KINDS = (
@@ -355,16 +355,22 @@ class TestProjectLedger:
         + ("zeroshot",) * 8  # rows 97 to 104
         + ("parity-reference",) * 6  # rows 105 to 110
         + ("zeroshot",) * 6  # rows 111 to 116
+        + ("parity-reference",) * 4  # rows 117 to 120
+        + ("parity-reference",)  # row 121
+        + ("parity-reference",)  # row 122
+        + ("parity-reference",)  # row 123
+        + ("parity-reference",) * 3  # rows 124 to 126
+        + ("parity-reference",) * 3  # rows 127 to 129
     )
     KINDS = frozenset(
         {"rtn", "quantize", "generate", "parity-reference", "provenance", "retraction", "zeroshot"}
     )
 
-    def test_rows_55_to_116_are_schema_2_and_keep_their_kinds(self) -> None:
+    def test_rows_55_to_129_are_schema_2_and_keep_their_kinds(self) -> None:
         entries = self._entries()
-        assert len(entries) >= 116
+        assert len(entries) >= 129
         assert {entry["kind"] for entry in entries} <= self.KINDS, "a reader filters on kind"
-        assert tuple(entry["kind"] for entry in entries[54:116]) == self.SCHEMA_TWO_KINDS
+        assert tuple(entry["kind"] for entry in entries[54:129]) == self.SCHEMA_TWO_KINDS
         for number, entry in enumerate(entries[54:], start=55):
             assert entry["schema"] >= 2, f"row {number} predates schema 2"
             if entry["kind"] == "parity-reference":
@@ -454,7 +460,8 @@ class TestProjectLedger:
         # and in two things, both of which the documents name: its tuning, and
         # the system it was produced on, since the Linux machine changed
         # operating system release between the default arms and these with
-        # one package environment.
+        # one package environment. The host control below shows the second to
+        # have moved neither checkpoint.
         entries = self._entries()
         assert len(entries) >= 110
         provenance = {
@@ -538,6 +545,387 @@ class TestProjectLedger:
             for key, value in theirs.items():
                 if key.startswith(("cost.mround_", "memory.mround_", "scheme.mround_")):
                     assert ours[key] == value, f"row {number} {key}"
+
+    # The host control, 2026-10-09: seed 42's two 2 bit reference arms
+    # produced again after the Linux machine had been reinstalled and its
+    # environment rebuilt, one under each tuning, each beside the row whose arm
+    # it repeats.
+    HOST_CONTROLS = ((117, 88), (118, 105))
+    # Where the arm was produced and what producing it cost: what a
+    # reproduction on another system is allowed to change.
+    OF_THE_SYSTEM = ("cost.reference_", "memory.reference_", "reference_environment")
+    # What the reference was asked to do, and what it ran on.
+    OF_THE_ARM = (
+        "auto_round",
+        "torch",
+        "python",
+        "machine",
+        "device",
+        "precision",
+        "torch_compile",
+    )
+
+    def test_the_host_controls_repeat_their_rows_but_for_the_system(self) -> None:
+        # Both checkpoints are the ones rows 88 and 105 scored, all
+        # 357,826,560 weights (scripts/compare_checkpoints.py, MEMORY.md
+        # 2026-10-09), so each control repeats its row field for field, its
+        # perplexities to the last digit, the reference's included. Its
+        # reference arm differs in the system it was produced on, in the
+        # environment as rebuilt and in the time and memory that go with them,
+        # and in nothing it was asked to do. The two controls share that
+        # system, so they differ from each other in the tuning alone, which is
+        # what lets the documents read rows 105 to 110 as differing from their
+        # default twins in the switch alone.
+        entries = self._entries()
+        assert len(entries) >= 118
+        for number, original_number in self.HOST_CONTROLS:
+            row, original = entries[number - 1], entries[original_number - 1]
+            assert row["kind"] == original["kind"] == "parity-reference", f"row {number}"
+            ours = self._leaves(row)
+            for key, value in self._leaves(original).items():
+                if key in self.OF_THE_ROW or key.startswith(self.OF_THE_SYSTEM):
+                    continue
+                assert key in ours, f"row {number} records no {key}"
+                assert ours[key] == value, f"row {number} {key}"
+            block, before = row["reference_environment"], original["reference_environment"]
+            for key in self.OF_THE_ARM:
+                assert block[key] == before[key], f"row {number} reference {key}"
+            # Row 88 predates the two fields and ran the default tuning, its
+            # block forward compiled as every default arm's was.
+            assert block["algorithm"] == before.get("algorithm", "SignRoundConfig")
+            assert block["block_forward_compile"] == before.get("block_forward_compile", True)
+            # The reinstalled system, and the rebuilt environment as the
+            # reference's own process inventories it; the originals were
+            # produced in the first build, seen the same way.
+            assert block["host"] == "Linux x86_64 Ubuntu 26.04.1 LTS", f"row {number}"
+            assert block["system"] == "Linux 7.0.0-38-generic", f"row {number}"
+            assert row["cost"]["reference_host"] == block["host"], f"row {number}"
+            assert block["packages"] == "91d06b756b312979", f"row {number}"
+            assert before["packages"] == "813625b7640e0168", f"row {original_number}"
+            assert "ar0.15.0-u2604" in row["notes"], f"row {number}"
+        default, own_tuning = (
+            entries[number - 1]["reference_environment"] for number, _ in self.HOST_CONTROLS
+        )
+        tuning = {"algorithm", "block_forward_compile"}
+        assert default["algorithm"] != own_tuning["algorithm"]
+        assert {key: value for key, value in default.items() if key not in tuning} == {
+            key: value for key, value in own_tuning.items() if key not in tuning
+        }
+
+    # The current release, 2026-10-09: the two host control arms produced
+    # again under auto-round 0.16.0 on the same machine and system, each beside
+    # the 0.15.0 control whose arm it repeats.
+    CURRENT_RELEASE = ((119, 117), (120, 118))
+
+    def test_the_current_release_repeats_the_controls_but_for_the_release(self) -> None:
+        # Both 0.16.0 checkpoints are the 0.15.0 ones, all 357,826,560
+        # weights (scripts/compare_checkpoints.py, MEMORY.md 2026-10-10), so
+        # each row repeats its control field for field, its perplexities to the
+        # last digit, the reference's included. What differs is the release,
+        # the environment that carries it and the time and memory of producing
+        # the arm; the machine, the system and everything the reference was
+        # asked to do are the control's.
+        entries = self._entries()
+        assert len(entries) >= 120
+        for number, control_number in self.CURRENT_RELEASE:
+            row, control = entries[number - 1], entries[control_number - 1]
+            assert row["kind"] == control["kind"] == "parity-reference", f"row {number}"
+            ours = self._leaves(row)
+            for key, value in self._leaves(control).items():
+                if key in self.OF_THE_ROW or key.startswith(self.OF_THE_SYSTEM):
+                    continue
+                assert key in ours, f"row {number} records no {key}"
+                assert ours[key] == value, f"row {number} {key}"
+            block, before = row["reference_environment"], control["reference_environment"]
+            assert (block["auto_round"], before["auto_round"]) == ("0.16.0", "0.15.0")
+            # The 0.16.0 environment as the reference's own process inventories
+            # it, beside the rebuilt 0.15.0 one seen the same way.
+            assert (block["packages"], before["packages"]) == (
+                "ac1862f7cb75f30a",
+                "91d06b756b312979",
+            )
+            assert set(block) == set(before), f"row {number}"
+            for key in set(block) - {"auto_round", "packages"}:
+                assert block[key] == before[key], f"row {number} reference {key}"
+            assert row["cost"]["reference_host"] == block["host"], f"row {number}"
+            assert "auto-round 0.16.0" in row["notes"], f"row {number}"
+            assert "ar0.16.0" in row["notes"], f"row {number}"
+
+    # The Arc control, 2026-10-15: row 91's reference arm, seed 44 at 2 bits
+    # on the Linux machine's Arc graphics, produced again after the machine
+    # was reinstalled, on Ubuntu 26.04's own GPU compute runtime and in the
+    # XPU environment as rebuilt, and scored against row 91's MRound arm.
+    ARC_CONTROL = (123, 91)
+
+    def test_the_arc_control_repeats_row_91_but_for_the_system(self) -> None:
+        # The checkpoint is row 91's, all 357,826,560 weights (log0161), so the
+        # row repeats row 91 field for field, its perplexities to the last
+        # digit, the reference's included, as the CPU controls of rows 117 and
+        # 118 repeat theirs. Its reference arm differs in the system, the GPU
+        # runtime that no field records and the environment as rebuilt, and in
+        # the time that goes with them, and in nothing it was asked to do; the
+        # device pool it reserved is row 91's to the byte. The rebuilt
+        # environment is cited by the hash its own check wrote, the process
+        # that ran the reference on this device not having imported setuptools.
+        entries = self._entries()
+        assert len(entries) >= 123
+        number, original_number = self.ARC_CONTROL
+        row, original = entries[number - 1], entries[original_number - 1]
+        assert row["kind"] == original["kind"] == "parity-reference"
+        ours = self._leaves(row)
+        for key, value in self._leaves(original).items():
+            if key in self.OF_THE_ROW or key.startswith(self.OF_THE_SYSTEM):
+                continue
+            assert key in ours, f"row {number} records no {key}"
+            assert ours[key] == value, f"row {number} {key}"
+        block, before = row["reference_environment"], original["reference_environment"]
+        for key in self.OF_THE_ARM:
+            assert block[key] == before[key], f"row {number} reference {key}"
+        assert (block["device"], block["precision"], block["torch_compile"]) == (
+            "xpu",
+            "bfloat16 autocast",
+            False,
+        )
+        # Row 91 predates the two fields; it ran the default tuning with the
+        # compiler off, so its block forward was not compiled either.
+        assert before.get("algorithm") is None
+        assert (block["algorithm"], block["block_forward_compile"]) == ("SignRoundConfig", False)
+        assert (block["host"], before["host"]) == (
+            "Linux x86_64 Ubuntu 26.04.1 LTS",
+            "Linux x86_64 Ubuntu 24.04.5 LTS",
+        )
+        assert (block["system"], before["system"]) == (
+            "Linux 7.0.0-38-generic",
+            "Linux 7.0.0-31-generic",
+        )
+        assert row["cost"]["reference_host"] == block["host"]
+        assert (block["packages"], before["packages"]) == ("24635a7aabaa22ff", "5cf84f77cc0b531e")
+        manifest = json.loads(
+            (REPO_ROOT / ENVIRONMENTS_DIR / "24635a7aabaa22ff.json").read_text(encoding="utf-8")
+        )
+        assert manifest["hash"] == block["packages"]
+        assert (manifest["pip"]["auto-round"], manifest["pip"]["torch"]) == (
+            block["auto_round"],
+            block["torch"],
+        )
+        assert "autocommand" not in manifest["pip"], "nothing setuptools vendors"
+        assert row["memory"]["reference_peak_bytes"] == original["memory"]["reference_peak_bytes"]
+        assert (row["cost"]["reference_seconds"], original["cost"]["reference_seconds"]) == (
+            4_995.8,
+            4_958.6,
+        )
+        assert row["notes"] == original["notes"].replace(
+            "labelled ar0.15.0,", "labelled ar0.15.0-u2604,"
+        ).replace("Ubuntu 24.04.5 LTS", "Ubuntu 26.04.1 LTS").replace(
+            "5cf84f77cc0b531e", "24635a7aabaa22ff"
+        )
+
+    # Q1's table under the reference's default tuning, scored on 2026-10-16:
+    # Qwen2.5-3B-Instruct at 2 bits on seeds 42 to 44, the reference on the
+    # Arc graphics in the environment row 123 cites, MRound's three arms of
+    # the tree labelled tree1012.
+    THREE_B_DEFAULT = (124, 125, 126)
+    # What the calibration seed decides: both arms' perplexities and what
+    # producing each arm cost in time and resident memory.
+    OF_THE_SEED = (
+        "calibration.seed",
+        "perplexity.quantized",
+        "perplexity.reference",
+        "cost.mround_seconds",
+        "cost.reference_seconds",
+        "memory.mround_rss_bytes",
+        "memory.reference_rss_bytes",
+    )
+
+    def test_the_3b_table_is_one_configuration_on_three_seeds(self) -> None:
+        # The three rows differ in what the seed decides and in nothing else:
+        # one model, one recipe, one release on one device in one environment,
+        # one MRound tree, the original's perplexity, every size, and both
+        # peaks, MRound's allocator at 20,069,954,386 bytes and the reference's
+        # device pool at 15,900,606,464, on every seed. MRound is ahead on
+        # every seed, by 10.80 to 15.13 percent, and its worst seed beats the
+        # reference's best (MEMORY.md, "Rows 124 to 126").
+        entries = self._entries()
+        assert len(entries) >= 126
+        rows = [entries[number - 1] for number in self.THREE_B_DEFAULT]
+        first = self._leaves(rows[0])
+        for number, row in zip(self.THREE_B_DEFAULT[1:], rows[1:], strict=True):
+            ours = self._leaves(row)
+            assert set(ours) == set(first), f"row {number}"
+            for key, value in first.items():
+                if key in self.OF_THE_ROW or key.startswith(self.OF_THE_SEED):
+                    continue
+                assert ours[key] == value, f"row {number} {key}"
+        assert [row["calibration"]["seed"] for row in rows] == [42, 43, 44]
+        assert rows[0]["kind"] == "parity-reference"
+        assert rows[0]["model"] == "Qwen/Qwen2.5-3B-Instruct"
+        assert rows[0]["scheme"]["bits"] == 2
+        block = rows[0]["reference_environment"]
+        assert (block["device"], block["auto_round"], block["algorithm"], block["packages"]) == (
+            "xpu",
+            "0.15.0",
+            "SignRoundConfig",
+            "24635a7aabaa22ff",
+        )
+        assert all("labelled tree1012" in row["notes"] for row in rows)
+        assert rows[0]["memory"]["mround_peak_bytes"] == 20_069_954_386
+        assert rows[0]["memory"]["reference_peak_bytes"] == 15_900_606_464
+        mround = [row["perplexity"]["quantized"] for row in rows]
+        reference = [row["perplexity"]["reference"] for row in rows]
+        assert all(ours < theirs for ours, theirs in zip(mround, reference, strict=True))
+        assert max(mround) < min(reference)
+
+    # Q1's table under the reference's own SignRound v2 tuning, scored on
+    # 2026-10-17: the three arms of THREE_B_DEFAULT produced again with
+    # enable_alg_ext on, on one system in one environment, each scored against
+    # the MRound checkpoint its default twin was scored against.
+    THREE_B_OWN_TUNING = ((127, 124), (128, 125), (129, 126))
+
+    def test_the_3b_own_tuning_table_is_one_configuration_on_three_seeds(self) -> None:
+        # As the default table: the three rows differ in what the seed decides
+        # alone, MRound's allocator at 20,069,954,386 bytes and the
+        # reference's device pool at 14,084,472,832 on every seed, a pool
+        # smaller than the default arms' 15,900,606,464. The reading the
+        # documents make is pinned too: MRound is ahead on seeds 43 and 44 and
+        # behind on seed 42, 1.25 percent ahead on the mean, and the two ranges
+        # overlap (MEMORY.md, "Rows 127 to 129").
+        entries = self._entries()
+        assert len(entries) >= 129
+        numbers = [number for number, _ in self.THREE_B_OWN_TUNING]
+        rows = [entries[number - 1] for number in numbers]
+        first = self._leaves(rows[0])
+        for number, row in zip(numbers[1:], rows[1:], strict=True):
+            ours = self._leaves(row)
+            assert set(ours) == set(first), f"row {number}"
+            for key, value in first.items():
+                if key in self.OF_THE_ROW or key.startswith(self.OF_THE_SEED):
+                    continue
+                assert ours[key] == value, f"row {number} {key}"
+        assert [row["calibration"]["seed"] for row in rows] == [42, 43, 44]
+        block = rows[0]["reference_environment"]
+        assert (block["device"], block["auto_round"], block["algorithm"], block["packages"]) == (
+            "xpu",
+            "0.15.0",
+            "SignRoundV2Config",
+            "24635a7aabaa22ff",
+        )
+        assert all("labelled tree1012" in row["notes"] for row in rows)
+        assert all("enable_alg_ext" in row["notes"] for row in rows)
+        assert rows[0]["memory"]["mround_peak_bytes"] == 20_069_954_386
+        assert rows[0]["memory"]["reference_peak_bytes"] == 14_084_472_832
+        mround = [row["perplexity"]["quantized"] for row in rows]
+        reference = [row["perplexity"]["reference"] for row in rows]
+        behind = [ours > theirs for ours, theirs in zip(mround, reference, strict=True)]
+        assert behind == [True, False, False]
+        assert sum(mround) < sum(reference)
+        assert max(mround) > min(reference), "the two ranges overlap"
+
+    def test_the_3b_own_tuning_rows_differ_from_their_twins_in_the_switch_alone(self) -> None:
+        # Unlike the Qwen2.5-0.5B tables, whose two tunings were produced
+        # under two operating system releases, each pair here was produced on
+        # one system in one environment, so the reference arms' blocks differ
+        # in the algorithm the release resolved and in nothing else. Outside
+        # the reference arm the row repeats its twin to the last digit, MRound's
+        # perplexity, time and memory included, since both were scored against
+        # one MRound checkpoint. The switch made the block loop 5 to 6 percent
+        # longer, both arms uncompiled.
+        entries = self._entries()
+        assert len(entries) >= 129
+        for number, twin_number in self.THREE_B_OWN_TUNING:
+            row, twin = entries[number - 1], entries[twin_number - 1]
+            ours, theirs = self._leaves(row), self._leaves(twin)
+            assert set(ours) == set(theirs), f"row {number}"
+            for key, value in theirs.items():
+                if key in self.OF_THE_ROW or key.startswith(self.REFERENCE_ARM):
+                    continue
+                assert ours[key] == value, f"row {number} {key}"
+            block, twin_block = row["reference_environment"], twin["reference_environment"]
+            assert {key for key in block if block[key] != twin_block[key]} == {"algorithm"}
+            assert (block["algorithm"], twin_block["algorithm"]) == (
+                "SignRoundV2Config",
+                "SignRoundConfig",
+            )
+            assert row["perplexity"]["reference"] < twin["perplexity"]["reference"]
+            seconds = row["cost"]["reference_seconds_detail"]["quantize"]
+            twin_seconds = twin["cost"]["reference_seconds_detail"]["quantize"]
+            assert 1.05 < seconds / twin_seconds < 1.06, f"row {number}"
+
+    # The memory work, 2026-10-11: row 92's MRound arm produced again by the
+    # tree that loads lazily, releases each finished block, keeps two streams
+    # and holds the codes one byte each, and scored against row 92's
+    # reference arm.
+    MEMORY_REPEAT = (121, 92)
+
+    def test_the_memory_work_writes_row_92_again_in_less_memory(self) -> None:
+        # MRound's checkpoint is row 92's to the byte (both model.safetensors
+        # files share one sha256, MEMORY.md 2026-10-11), so the row repeats
+        # row 92 field for field, both perplexities to the last digit, in the
+        # same environment and against the same reference arm. What may differ
+        # is what producing MRound's arm cost: its peak, which is the point,
+        # its resident set and its time. The label is the run's own.
+        entries = self._entries()
+        assert len(entries) >= 121
+        number, original_number = self.MEMORY_REPEAT
+        row, original = entries[number - 1], entries[original_number - 1]
+        assert row["kind"] == original["kind"] == "parity-reference"
+        ours, theirs = self._leaves(row), self._leaves(original)
+        # Three fields the harness has written since row 92 was, empty here
+        # because the reference arm's sidecar predates what fills them.
+        later = {
+            "tasks",
+            "reference_environment.algorithm",
+            "reference_environment.block_forward_compile",
+        }
+        assert set(ours) == set(theirs) | later
+        assert all(ours[key] is None for key in later)
+        for key, value in theirs.items():
+            if key in self.OF_THE_ROW or key.startswith(("cost.mround_", "memory.mround_")):
+                continue
+            assert ours[key] == value, f"row {number} {key}"
+        assert row["notes"] == original["notes"].replace("labelled tree0926", "labelled m1")
+        assert (row["memory"]["mround_peak_bytes"], original["memory"]["mround_peak_bytes"]) == (
+            19_338_070_546,
+            27_265_701_016,
+        )
+
+    # M1b's A/B, 2026-10-12: row 121's configuration with every tuning step
+    # run in eight pieces, scored against the same reference arm.
+    MICRO_BATCH_AB = (122, 121)
+
+    def test_the_step_in_pieces_is_row_121_but_for_the_arm_it_tuned(self) -> None:
+        # The pieces change the order of the step's additions, and on Metal
+        # at 2 bits that moved the checkpoint as far as a change of seed does
+        # (log0153: 0.3302 from row 121's, against the reference's 0.30 to
+        # 0.34 between seeds), so MRound's perplexity is the one figure of
+        # substance allowed to move, with what producing its arm cost and the
+        # field that says how. The reference arm, its scores and every
+        # setting are row 121's.
+        entries = self._entries()
+        assert len(entries) >= 122
+        number, original_number = self.MICRO_BATCH_AB
+        row, original = entries[number - 1], entries[original_number - 1]
+        assert row["kind"] == original["kind"] == "parity-reference"
+        ours, theirs = self._leaves(row), self._leaves(original)
+        assert set(ours) == set(theirs) | {"tuning.mround_micro_batches"}
+        assert row["tuning"]["mround_micro_batches"] == 8
+        moved = {"perplexity.quantized"}
+        for key, value in theirs.items():
+            if key in self.OF_THE_ROW | moved or key.startswith(("cost.mround_", "memory.mround_")):
+                continue
+            assert ours[key] == value, f"row {number} {key}"
+        assert row["perplexity"]["quantized"] == 21.186325713912435
+        assert row["notes"] == original["notes"].replace(
+            "remainder dense, labelled m1",
+            "remainder dense, mround runs each tuning step in 8 pieces, labelled m1",
+        ).replace("-13.56% on perplexity", "-12.35% on perplexity")
+        assert (row["memory"]["mround_peak_bytes"], original["memory"]["mround_peak_bytes"]) == (
+            8_263_006_710,
+            19_338_070_546,
+        )
+        assert (row["cost"]["mround_seconds"], original["cost"]["mround_seconds"]) == (
+            16_159.0,
+            11_004.8,
+        )
 
     # Zero shot rows of the six pairs with the reference's own tuning, each
     # beside the zero shot row of its default twin. The two head to head rows

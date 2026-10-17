@@ -1,6 +1,6 @@
 # MRound Technical Documentation
 
-**Version: 0.1.0a3. Last updated: 2026-10-08.**
+**Version: 0.1.0a4. Last updated: 2026-10-17.**
 
 This document specifies what MRound does and how it is built. It is the
 authoritative technical reference; where it disagrees with a comment in the
@@ -251,10 +251,37 @@ discipline within a block more important, not less.
 **The memory ceiling is high, and this is the project's central opportunity.** A
 128 GB Mac has more memory available to a quantization run than most single
 discrete GPUs. Because quantization is block-wise, the working set beyond the
-weights is governed by the largest block plus cached activations. MRound as
-built still loads the whole model eagerly through mlx-lm, and a mixed precision
-run's scoring pass holds a float32 copy of the block weights per candidate width
-plus one (MEMORY.md D-036), so today the whole model must fit; whether a Mac can
+weights is governed by the largest block plus cached activations. Since
+2026-10-10 the weights are not the whole model either: a quantization run loads
+the model lazily, the block loop reads each block's weights when it reaches the
+block and releases its quantized layers once the quantized stream has passed
+through them, the two activation streams are kept in place rather than copied,
+and the codes wait for the export at one byte each (MEMORY.md, 2026-10-10). A
+uniform run therefore holds the embedding, one block and two streams, plus that
+block's tuning step, and since 2026-10-11 the step can run its batch in pieces
+(`TuningConfig.micro_batches`, `--micro-batches`), holding one piece's
+activations rather than the whole batch's while the step stays the batch's
+(section 5.5); on Metal that moves the checkpoint as far as a change of seed
+and costs about twice the time a block at eight pieces (ledger row 122), so it
+is for a model whose step does not fit whole. A mixed precision run's scoring
+pass runs the whole model backward. Since 2026-10-11 it holds one float32 copy of the block weights, the
+one the backward runs through, where it held one per candidate width plus one:
+each width keeps its searched grid and its perturbation is rebuilt when the
+layer's gradient arrives, and every block runs under gradient checkpointing, so
+the backward holds one block's activations (MEMORY.md D-036 and M1c). The
+whole model is still read for that pass. The scale search takes a layer a slice
+of rows at a time (section 5.10), the losses before and after a block's tuning
+are measured one batch at a time, and a mixed run loads the model lazily again
+after scoring, so its block loop holds what a uniform run's does. Every stage's
+peak is recorded in the run record, and since 2026-10-17 it is predicted
+before the run starts, from the model's configuration alone, by a rule fitted
+on those records and on a probe of synthetic blocks on Metal
+(`planner/memory.py`, `scripts/probe_memory.py`): a run predicted past 85
+percent of the Mac's memory is refused before anything is loaded, with the
+fewest pieces that would fit. On
+Qwen2.5-1.5B-Instruct at 2 bits the peak fell from 27.27 GB to 19.34 GB with
+the checkpoint unchanged to the byte (ledger rows 92 and 121). Whether a Mac
+can
 quantize models that require multi-GPU setups elsewhere is the project's
 headline claim, and it will be established by measurement in Phase 5, not
 asserted.
@@ -341,7 +368,9 @@ data with no model loaded, which is what makes fast iteration possible.
 **The planner layer knows nothing about MLX.** It consumes sensitivity scores
 and costs and produces an allocation. It is testable with hand-computed
 examples, including adversarial ones where greedy allocation is provably
-suboptimal.
+suboptimal. It also predicts what a run will hold, from the model's
+configuration and the run's settings alone (`planner/memory.py`), which is
+what lets a run that would not fit be refused before anything is loaded.
 
 **The pipeline layer holds all model-specific knowledge**, so adding an
 architecture touches one layer.
@@ -368,13 +397,14 @@ mround/
 ├── planner/
 │   ├── importance.py      importance matrix accumulation
 │   ├── sensitivity.py     DeltaLoss definition, storage costs, option assembly
+│   ├── memory.py          a run's peak memory, predicted before it starts
 │   └── allocator.py       multiple-choice knapsack via DP
 ├── pipeline/
 │   ├── loader.py          model loading, architecture detection
 │   ├── blocks.py          block discovery, activation capture
 │   ├── calibration.py     dataset handling, batching
 │   ├── scoring.py         whole-model DeltaLoss, backward at the widest width
-│   ├── device.py          peak memory as the array framework reports it
+│   ├── device.py          peak and device memory as the array framework reports them
 │   └── runner.py          orchestration, memory discipline
 ├── formats/
 │   ├── packing.py         uint32 bit packing for all widths
@@ -642,7 +672,9 @@ iteration. The clipping coefficients share `v`'s learning rate; the reference
 accepts a separate rate for them (`minmax_lr`) and MRound's `TuningConfig`
 carries the field but refuses any value other than `None`, because no tuning
 loop consumes it yet, and the same holds for `gradient_accumulate_steps`
-other than 1.
+other than 1, the reference's knob that makes a step's batch larger.
+`micro_batches` is MRound's own and a different thing: it runs a step's batch
+in pieces for memory and leaves the step the batch's (section 5.5).
 
 **Which parameters a layer keeps.** The single layer loop, `tune_layer` in both
 implementations, measures the loss with the current parameters, records them if
@@ -709,8 +741,14 @@ be honored exactly because each choice changes the gradient:
 - Excluded elements are zeroed in the numerator; the denominator remains the
   full element count. Excluded elements therefore dilute the mean rather than
   being removed from it.
-- The reduction is always the mean. Gradient accumulation is not implemented
-  (`TuningConfig` refuses any value but 1), so this holds trivially today.
+- The reduction is always the mean over the whole batch. When a step's batch
+  runs in pieces (`TuningConfig.micro_batches`), each piece's sum of squares
+  is divided by the whole batch's element count and the pieces' gradients are
+  added, and the threshold is taken first over the whole batch, from one
+  forward pass without gradient, so the excluded elements are the batch's
+  largest wherever they fall. A threshold taken per piece would exclude each
+  piece's largest errors instead, which is a different objective. The losses
+  measured before and after a block's tuning are computed in the same pieces.
 
 The third point is counterintuitive and easy to get wrong in either direction.
 It is specified here so the implementation is a decision rather than an accident.
@@ -862,6 +900,11 @@ start every layer from the same grid (MEMORY.md D-048).
 - `qw` is the per input channel importance where the search is importance
   weighted, and 1 otherwise.
 - An all zero group returns scale 0, which no candidate can beat.
+- Every group's search is its own, so how a layer is cut up to search it
+  changes no scale. MLX evaluates sixteen candidates at a time and, since
+  2026-10-11, a slice of whole rows at a time, sized so each sixteen candidate
+  intermediate stays near 256 MB: the search held about 270 bytes per weight of
+  a layer at once, 18 GB for a 7B model's widest layer (MEMORY.md, M1d).
 
 Two conventions are worth naming because they look like inconsistencies and
 are not. First, the anchor's tie rule (first index of the largest magnitude)

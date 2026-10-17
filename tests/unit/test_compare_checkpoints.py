@@ -5,7 +5,9 @@
 Built on synthetic groups whose scales and codes are known, so every count the
 script prints is checked against the arithmetic that produced the values, and
 on a safetensors file written by hand, so the reader is checked against the
-format rather than against a library that would hide a misread.
+format rather than against a library that would hide a misread. MRound's packed
+checkpoints are written by hand too, their words packed here bit by bit, and
+once by MRound's own exporter where MLX is installed.
 """
 
 from __future__ import annotations
@@ -21,16 +23,21 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from compare_checkpoints import (
+    PackedLayer,
     coarse_sides,
     compare,
     compare_layer,
+    compare_packed,
     find_checkpoint,
     implied_scales,
     linear_weights,
     main,
+    packed_layers,
     read_header,
+    read_packed,
     read_tensor,
     same_architecture,
+    unpack_words,
 )
 
 
@@ -430,3 +437,266 @@ class TestMain:
             tmp_path / "right", {"model.layers.0.mlp.down_proj.weight": np.zeros((1, 64))}
         )
         assert main([str(left), str(right)]) == 1
+
+
+def _pack(codes: np.ndarray, bits: int) -> np.ndarray:
+    """MLX's layout, one bit at a time: code i at bits [i * bits, (i + 1) * bits)."""
+    rows, columns = codes.shape
+    words = np.zeros((rows, columns * bits // 32), dtype=np.uint64)
+    for row in range(rows):
+        for column in range(columns):
+            for place in range(bits):
+                if (int(codes[row, column]) >> place) & 1:
+                    position = column * bits + place
+                    words[row, position // 32] |= np.uint64(1 << (position % 32))
+    return words.astype("<u4")
+
+
+def _write_mixed(path: Path, tensors: dict[str, tuple[str, np.ndarray]]) -> None:
+    """A safetensors file whose tensors each keep their own dtype."""
+    header: dict[str, object] = {}
+    payload = b""
+    for name, (dtype, array) in tensors.items():
+        if dtype == "BF16":
+            raw = _bfloat16_bits(array)
+        elif dtype == "U32":
+            raw = array.astype("<u4").tobytes()
+        else:
+            raw = array.astype(np.float32).tobytes()
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(array.shape),
+            "data_offsets": [len(payload), len(payload) + len(raw)],
+        }
+        payload += raw
+    encoded = json.dumps(header).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
+
+
+def _packed_checkpoint(
+    directory: Path,
+    layers: dict[str, tuple[np.ndarray, np.ndarray, int, int]],
+    dense: dict[str, np.ndarray] | None = None,
+) -> Path:
+    """An MLX checkpoint: each layer's stored codes, signed scales, width and group size.
+
+    Written as MRound writes a symmetric layer: the bias is minus the stored
+    scale times ``2 ** (bits - 1)``, and the first layer's width and group
+    size are the defaults of the quantization block, the others overrides.
+    """
+    directory.mkdir(parents=True)
+    tensors: dict[str, tuple[str, np.ndarray]] = {}
+    first = next(iter(layers.values()))
+    block: dict[str, object] = {"group_size": first[3], "bits": first[2], "mode": "affine"}
+    for path, (codes, scales, bits, group_size) in layers.items():
+        stored = np.frombuffer(_bfloat16_bits(scales), dtype=np.uint16).astype(np.uint32) << 16
+        rounded = stored.view(np.float32).reshape(scales.shape)
+        tensors[f"{path}.weight"] = ("U32", _pack(codes, bits))
+        tensors[f"{path}.scales"] = ("BF16", rounded)
+        tensors[f"{path}.biases"] = ("BF16", -rounded * 2.0 ** (bits - 1))
+        if (bits, group_size) != (first[2], first[3]):
+            block[path] = {"group_size": group_size, "bits": bits, "mode": "affine"}
+    for name, values in (dense or {}).items():
+        tensors[name] = ("BF16", values)
+    settings = {"model_type": "qwen2", "hidden_size": 64, "num_hidden_layers": 1, "vocab_size": 10}
+    settings["quantization"] = block
+    (directory / "config.json").write_text(json.dumps(settings), encoding="utf-8")
+    _write_mixed(directory / "model.safetensors", tensors)
+    return directory
+
+
+class TestUnpackWords:
+    @pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+    def test_reads_back_every_width_mlx_packs(self, bits: int) -> None:
+        rng = np.random.default_rng(bits)
+        codes = rng.integers(0, 2**bits, size=(3, 64))
+        raw = _pack(codes, bits).tobytes()
+        np.testing.assert_array_equal(unpack_words(raw, 3, 64, bits), codes)
+
+    def test_a_code_that_straddles_two_words_is_read_whole(self) -> None:
+        # At 3 bits code 10 occupies bits 30, 31 and 32: two in the first word
+        # and one in the second.
+        codes = np.zeros((1, 32), dtype=np.int64)
+        codes[0, 10] = 0b101
+        words = _pack(codes, 3)
+        assert int(words[0, 0]) == 1 << 30
+        assert int(words[0, 1]) == 1
+        assert unpack_words(words.tobytes(), 1, 32, 3)[0, 10] == 0b101
+
+    def test_refuses_words_that_do_not_hold_the_codes(self) -> None:
+        raw = _pack(np.zeros((2, 64), dtype=np.int64), 2).tobytes()
+        with pytest.raises(ValueError, match="do not hold"):
+            unpack_words(raw, 2, 64, 4)
+
+
+def _layer(codes: np.ndarray, scales: list[float], bits: int = 2) -> PackedLayer:
+    stored = np.array(scales, dtype=np.float64).reshape(codes.shape[0], -1)
+    group_size = codes.shape[1] // stored.shape[1]
+    return PackedLayer(codes, stored, -stored * 2.0 ** (bits - 1), bits, group_size)
+
+
+class TestComparePacked:
+    def test_counts_the_stored_codes_that_moved(self) -> None:
+        rng = np.random.default_rng(0)
+        codes = rng.integers(0, 4, size=(2, 64))
+        moved = codes.copy()
+        moved[0, :3] = (moved[0, :3] + 1) % 4  # one step, or three where it wrapped
+        moved[1, 0] = (moved[1, 0] + 2) % 4
+        report = compare_packed("layer", _layer(codes, [0.5, -0.25]), _layer(moved, [0.5, -0.25]))
+        summary = report.summary
+        assert summary.groups == 2
+        assert summary.identical_scale == 2
+        assert summary.same_lattice == 2
+        assert summary.off_lattice == 0
+        assert summary.codes == 128
+        assert summary.flipped == 4
+        steps = np.abs(codes - moved)
+        assert summary.one_apart == int((steps == 1).sum())
+        assert report.width == 2
+        assert report.differing == 4
+        assert report.relative_disagreement > 0
+
+    def test_identical_layers_agree_to_the_bit(self) -> None:
+        codes = np.tile(np.arange(4), (2, 16))
+        report = compare_packed("layer", _layer(codes, [0.5, 0.25]), _layer(codes, [0.5, 0.25]))
+        assert report.summary.flipped == 0
+        assert report.differing == 0
+        assert report.relative_disagreement == 0.0
+
+    def test_a_scale_that_changed_sign_is_another_lattice(self) -> None:
+        codes = np.tile(np.arange(4), (1, 16))
+        report = compare_packed("layer", _layer(codes, [0.5]), _layer(codes, [-0.5]))
+        assert report.summary.same_lattice == 0
+        assert report.summary.codes == 0
+        assert report.summary.scale_drift == [2.0]
+
+    def test_a_moved_bias_is_another_lattice(self) -> None:
+        codes = np.tile(np.arange(4), (1, 16))
+        left = _layer(codes, [0.5])
+        right = PackedLayer(codes, left.scales, left.biases + 0.5, 2, 64)
+        report = compare_packed("layer", left, right)
+        assert report.summary.identical_scale == 0
+        assert report.summary.same_lattice == 0
+
+    def test_the_values_are_the_scale_times_the_signed_code(self) -> None:
+        codes = np.array([[0, 1, 2, 3] * 16])
+        values = _layer(codes, [0.5]).values()
+        np.testing.assert_array_equal(values[0, :4], [-1.0, -0.5, 0.0, 0.5])
+
+    def test_refuses_two_group_sizes(self) -> None:
+        codes = np.zeros((1, 64), dtype=np.int64)
+        with pytest.raises(ValueError, match="groups of 64 on the left and 32"):
+            compare_packed("layer", _layer(codes, [1.0]), _layer(codes, [1.0, 1.0]))
+
+
+class TestPackedCheckpoints:
+    def test_two_runs_of_one_model_compared_end_to_end(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rng = np.random.default_rng(1)
+        q = "model.layers.0.self_attn.q_proj"
+        up = "model.layers.0.mlp.up_proj"
+        dense = {"model.layers.0.mlp.down_proj.weight": rng.normal(size=(64, 48))}
+        q_codes = rng.integers(0, 4, size=(4, 128))
+        up_codes = rng.integers(0, 8, size=(2, 64))
+        q_scales = np.array([[0.5, -0.25], [0.125, 0.75], [-0.5, 0.25], [1.0, -1.0]])
+        up_scales = np.array([[0.25, 0.5], [-0.125, 1.5]])
+        left = _packed_checkpoint(
+            tmp_path / "left",
+            {q: (q_codes, q_scales, 2, 64), up: (up_codes, up_scales, 3, 32)},
+            dense,
+        )
+        moved = q_codes.copy()
+        moved[0, 0] = (moved[0, 0] + 1) % 4
+        right = _packed_checkpoint(
+            tmp_path / "right",
+            {q: (moved, q_scales, 2, 64), up: (up_codes, up_scales, 3, 32)},
+            dense,
+        )
+        entries = read_header(left / "model.safetensors")
+        assert packed_layers(entries) == {f"{q}.weight", f"{up}.weight"}
+        assert coarse_sides(left, right) == []
+
+        reports = {r.name: r for r in compare(left, right)}
+        assert reports[f"{q}.weight"].summary.flipped == 1
+        assert reports[f"{q}.weight"].width == 2
+        assert reports[f"{up}.weight"].summary.flipped == 0
+        assert reports[f"{up}.weight"].width == 3
+        assert reports[f"{up}.weight"].summary.groups == 4
+        assert reports["model.layers.0.mlp.down_proj.weight"].dense
+
+        assert main([str(left), str(right)]) == 0
+        out = capsys.readouterr().out
+        assert "1 layers left dense by a packed side: 0 of 3,072 weights differ" in out
+        assert "flipped 1 (0.16%)" in out
+        assert "2 bit, 1 layers" in out
+        assert "3 bit, 1 layers" in out
+
+    def test_a_group_size_given_against_the_checkpoint_is_refused(self, tmp_path: Path) -> None:
+        codes = np.zeros((1, 64), dtype=np.int64)
+        layer = {"model.layers.0.self_attn.q_proj": (codes, np.array([[1.0]]), 2, 64)}
+        left = _packed_checkpoint(tmp_path / "left", layer)
+        right = _packed_checkpoint(tmp_path / "right", layer)
+        with pytest.raises(ValueError, match="groups of 64, not the 32 given"):
+            compare(left, right, 32)
+        assert main([str(left), str(right), "--group-size", "64"]) == 0
+
+    def test_a_packed_side_against_a_fake_export_uses_its_stored_scales(
+        self, tmp_path: Path
+    ) -> None:
+        # The packed group holds signed codes -2 and 0 only, so its values
+        # imply twice its scale; the fake side's one -1 makes its own values
+        # imply the true one. On the stored scale the two share a lattice and
+        # one code moved; on the implied ones they would share none.
+        name = "model.layers.0.self_attn.q_proj"
+        codes = np.array([[0, 2] * 32])
+        signed = codes - 2
+        signed[0, 0] = -1
+        packed = _packed_checkpoint(tmp_path / "packed", {name: (codes, np.array([[0.5]]), 2, 64)})
+        fake = _checkpoint(tmp_path / "fake", {f"{name}.weight": signed * 0.5})
+        (report,) = compare(packed, fake)
+        assert report.summary.same_lattice == 1
+        assert report.summary.flipped == 1
+        assert report.summary.one_apart == 1
+        assert report.differing == 1
+        assert report.width == 2
+        implied = compare_layer("layer", (codes - 2) * 0.5, signed * 0.5, 64)
+        assert implied.summary.same_lattice == 0
+
+
+class TestMRoundExport:
+    """The reader against the exporter it has to agree with, where MLX is installed."""
+
+    @pytest.mark.parametrize("bits", [2, 3, 4, 8])
+    def test_reads_the_codes_mround_wrote(self, tmp_path: Path, bits: int) -> None:
+        mx = pytest.importorskip("mlx.core", reason="MRound's exporter is MLX's")
+        quantizer = pytest.importorskip("mround.core.quantizer")
+        mlx_export = pytest.importorskip("mround.formats.mlx_export")
+        schemes = pytest.importorskip("mround.schemes")
+
+        scheme = schemes.QuantScheme(bits=bits, group_size=32, symmetry=schemes.Symmetry.SYMMETRIC)
+        mx.random.seed(bits)
+        weight = mx.random.normal((8, 64))
+        codes, scale, zero_point = quantizer.quantize_codes(weight, None, scheme)
+        path = "model.layers.0.mlp.up_proj"
+        config = {"model_type": "qwen2", "hidden_size": 64, "num_hidden_layers": 1}
+        mlx_export.export_mlx(
+            tmp_path / "out",
+            {"model.layers.0.input_layernorm.weight": mx.ones((64,))},
+            {path: mlx_export.QuantizedLayer(codes, scale, zero_point, scheme)},
+            config,
+        )
+        root = tmp_path / "out"
+        entries = {e.name: e for e in read_header(root / "model.safetensors")}
+        layer = read_packed(root, entries, f"{path}.weight")
+        expected = np.array(codes.astype(mx.int32)).reshape(8, 64) + 2 ** (bits - 1)
+        np.testing.assert_array_equal(layer.codes, expected)
+        stored = np.array(scale.astype(mx.bfloat16).astype(mx.float32)).reshape(8, 2)
+        np.testing.assert_array_equal(layer.scales, stored)
+        np.testing.assert_array_equal(
+            layer.values(), stored.repeat(32, axis=1) * np.array(codes).reshape(8, 64)
+        )
+        (report,) = compare(root, root)
+        assert report.width == bits
+        assert report.summary.identical_scale == report.summary.groups == 16
+        assert report.differing == 0

@@ -16,6 +16,14 @@ matrix. A chunk of candidates is stacked on a leading axis, reduced to per-group
 losses, and folded into the running best, which bounds memory at ``chunk x
 weight`` while keeping the evaluation count small.
 
+**And the weight is searched a slice of rows at a time.** ``chunk x weight``
+is itself about 270 bytes per weight of the layer once its intermediates are
+counted, measured through the block loop's search stage at 1.5B and 3B: 6 GB
+for a 3B model's widest layer, 18 for a 7B's, and more for an embedding. Every
+group's search is its own, so the rows are taken in slices whose chunk
+intermediates stay near ``_SLICE_BYTES`` each, and each group's scale is the
+one the whole matrix would have given it, to the bit (MEMORY.md, M1d).
+
 **Losses accumulate in float32.** The reference oracle uses float64, which the
 GPU does not have. The parity suite therefore demands the same choice in at
 least 98 percent of groups (95 under importance) rather than all of them, since
@@ -48,6 +56,11 @@ __all__ = ["SearchGrid", "search_scales"]
 # intermediates live at once, while cutting launches to about thirteen per
 # layer.
 _CHUNK = 16
+
+# Bytes one float32 ``chunk x slice`` intermediate may take. A slice is a whole
+# number of rows, at least one, so a layer narrower than this is one slice and
+# searched exactly as before.
+_SLICE_BYTES = 1 << 28
 
 
 def _reciprocal(values: mx.array) -> mx.array:
@@ -89,13 +102,8 @@ def search_scales(
         )
         raise ValueError(msg)
 
-    grouped = weight.astype(mx.float32).reshape(-1, scheme.group_size)
-    nmax = float(2 ** (scheme.bits - 1))
-    lo, hi = -nmax, nmax - 1.0
-
-    if importance is None:
-        qw = None
-    else:
+    flat = None
+    if importance is not None:
         flat = mx.array(importance).astype(mx.float32).reshape(-1)
         if flat.size != weight.shape[-1]:
             msg = (
@@ -103,7 +111,33 @@ def search_scales(
                 f"{weight.shape[-1]} input features"
             )
             raise ValueError(msg)
-        qw = mx.broadcast_to(flat[None, :], weight.shape).reshape(-1, scheme.group_size)
+
+    rows = weight.shape[0]
+    per_row = _CHUNK * weight.shape[-1] * 4
+    step_rows = max(1, _SLICE_BYTES // per_row)
+    slices = [
+        _search_rows(weight[start : start + step_rows], flat, scheme, grid)
+        for start in range(0, rows, step_rows)
+    ]
+    return slices[0] if len(slices) == 1 else mx.concatenate(slices, axis=0)
+
+
+def _search_rows(
+    weight: mx.array,
+    importance: mx.array | None,
+    scheme: QuantScheme,
+    grid: SearchGrid | None,
+) -> mx.array:
+    """The search over a slice of whole rows, one scale per group, evaluated."""
+    grouped = weight.astype(mx.float32).reshape(-1, scheme.group_size)
+    nmax = float(2 ** (scheme.bits - 1))
+    lo, hi = -nmax, nmax - 1.0
+
+    qw = (
+        None
+        if importance is None
+        else mx.broadcast_to(importance[None, :], weight.shape).reshape(-1, scheme.group_size)
+    )
 
     anchor_index = mx.argmax(mx.abs(grouped), axis=-1, keepdims=True)
     group_max = mx.take_along_axis(grouped, anchor_index, axis=-1)

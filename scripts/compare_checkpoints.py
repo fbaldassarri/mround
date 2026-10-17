@@ -23,7 +23,11 @@ it ran (MEMORY.md 2026-09-24): two reference arms that differ only in the
 device they tuned on differ in 64 percent of their weights, on different
 lattices in 94 percent of their groups, and by 0.22 in that figure at mixed
 2.5, which is what a change of release (0.22) or of seed (0.24) also does,
-while the same seed on the same device reproduces the checkpoint to the bit.
+while the same seed on the same device reproduces the checkpoint to the bit,
+across a change of operating system as well (MEMORY.md 2026-10-09), across
+the change of release from auto-round 0.15.0 to 0.16.0 (2026-10-10), and on
+the integrated GPU across a change of its compute runtime (2026-10-15); the
+change of release that moved it was the one from 0.14.2 to 0.15.0.
 A change of the reference's tuning algorithm is a different event (MEMORY.md
 2026-10-02): at 2 bits its default checkpoint and its SignRound v2 checkpoint
 of one seed share a lattice in 0.3 percent of their groups, with the scales
@@ -38,15 +42,30 @@ of either tuning sit 0.22 to 0.24 apart. Layer by layer the figure follows the
 width, 0.40 at the 2 bit layers and 0.22 at the 3 bit ones there, so a mixed
 pair's figure is a mean over its widths.
 
+MRound's own checkpoints are read too (since 2026-10-11, for M1b's A/B,
+MEMORY.md). They hold no dequantized floats: each quantized layer is MLX's
+packed form, ``uint32`` words of codes with a ``scales`` and a ``biases``
+tensor beside them, and ``config.json``'s ``quantization`` block gives each
+layer's width and group size. Nothing has to be inferred there. Two such
+layers share a lattice in a group when their stored scales and biases agree,
+and their stored codes are compared one by one; the relative disagreement is
+taken over the dequantized values, ``scales * codes + biases``, which are
+exact in float64. Against a fake export, a packed side is dequantized and its
+stored scales stand in for the ones the other side's values imply. A layer a
+packed checkpoint left dense holds its source's weights rather than a
+quantization, so it is counted apart from the table.
+
 Usage, from the repository root::
 
     python scripts/compare_checkpoints.py LEFT RIGHT --group-size 64
 
 ``LEFT`` and ``RIGHT`` are checkpoint directories holding ``config.json`` and
 ``model.safetensors``, or a parent with one such directory under it, which is
-how the reference writes its output. Needs numpy and nothing else: the
-safetensors header is read directly and one tensor at a time, so the two
-checkpoints never have to fit in memory together.
+how the reference writes its output. ``--group-size`` is the fake exports'
+group size, 64 when it is not given; a packed checkpoint carries its own, and
+a group size given against it has to agree with it. Needs numpy and nothing
+else: the safetensors header is read directly and one tensor at a time, so the
+two checkpoints never have to fit in memory together.
 """
 
 from __future__ import annotations
@@ -77,15 +96,23 @@ WORST_SHOWN = 5
 # No integer scheme is wider than this, so the search for a width stops here
 # whatever the codes are.
 WIDEST = 32
+# The group size of a fake export when none is given, the reference's default.
+DEFAULT_GROUP_SIZE = 64
+# MLX packs codes into words of this many bits, least significant field first.
+WORD_BITS = 32
+# How a packed layer's words are stored in the safetensors header.
+PACKED = "U32"
 # The reference's distance from itself, measured with this script on the
 # ledger's own checkpoints and published in RESULTS.md, printed beside every
 # result so that a figure is read against the floor for its width rather than
 # taken as a verdict on its own.
 SELF_DISAGREEMENT = (
     "\n  Read against the reference's disagreement with itself (RESULTS.md): 0.30 to\n"
-    "  0.34 at 2 bits across a change of release or seed, 0.22 to 0.24 at mixed 2.5\n"
-    "  across a change of device, release or seed, 0.095 at 4 bits across a change\n"
-    "  of device or precision, and 0.0000 for one seed reproduced on one device.\n"
+    "  0.34 at 2 bits across a change of release (0.14.2 to 0.15.0) or seed, 0.22\n"
+    "  to 0.24 at mixed 2.5 across a change of device, release or seed, 0.095 at 4\n"
+    "  bits across a change of device or precision, and 0.0000 for one seed\n"
+    "  produced again on one device, even after a change of its operating system,\n"
+    "  of its GPU runtime or of release from 0.15.0 to 0.16.0.\n"
     "  A change of its tuning algorithm at one seed is 0.40 to 0.41 at 2 bits with\n"
     "  the default arm on the left and 0.43 with it on the right, and 0.284 to\n"
     "  0.285 and 0.296 to 0.297 at mixed 2.5: the figure is relative to the left\n"
@@ -129,7 +156,12 @@ class GroupSummary:
 
 @dataclass
 class LayerReport:
-    """One layer, both sides."""
+    """One layer, both sides.
+
+    ``dense`` marks a layer a packed checkpoint left unquantized on either
+    side: it holds its source's weights, so it is no lattice's and is reported
+    apart from the quantized layers.
+    """
 
     name: str
     width: int
@@ -137,6 +169,34 @@ class LayerReport:
     relative_disagreement: float
     elements: int
     differing: int
+    dense: bool = False
+
+
+@dataclass
+class PackedLayer:
+    """One layer of an MLX checkpoint as it is stored, codes unpacked.
+
+    ``codes`` is shaped ``(out_features, in_features)`` and holds the stored,
+    unsigned codes; ``scales`` and ``biases`` are shaped ``(out_features,
+    groups)``, widened to float64, which holds bfloat16 exactly.
+    """
+
+    codes: np.ndarray
+    scales: np.ndarray
+    biases: np.ndarray
+    bits: int
+    group_size: int
+
+    def values(self) -> np.ndarray:
+        """``scales * codes + biases``, the weights MLX reconstructs, in float64.
+
+        Exact for MRound's symmetric layers: the bias is minus the stored scale
+        times a power of two, so every value is the scale times an integer.
+        """
+        rows, columns = self.codes.shape
+        grouped = self.codes.reshape(rows, -1, self.group_size).astype(np.float64)
+        values: np.ndarray = grouped * self.scales[:, :, None] + self.biases[:, :, None]
+        return values.reshape(rows, columns)
 
 
 def read_header(path: Path) -> list[TensorEntry]:
@@ -175,6 +235,75 @@ def read_tensor(path: Path, entry: TensorEntry) -> np.ndarray:
         msg = f"{entry.name} is stored as {entry.dtype}, which this reader does not decode"
         raise ValueError(msg)
     return np.frombuffer(raw, dtype=dtype).reshape(entry.shape).astype(np.float64)
+
+
+def unpack_words(raw: bytes, rows: int, in_features: int, bits: int) -> np.ndarray:
+    """The codes of a packed layer, from the bytes of its ``uint32`` words.
+
+    MLX's layout (``mround/formats/packing.py``): code ``i`` of a row occupies
+    bits ``[i * bits, (i + 1) * bits)`` of the row read as one little endian
+    bit stream, which covers both the even layout of 2, 4 and 8 bits and the
+    stream that straddles words at 3, 5 and 6. The words are stored little
+    endian, so the stream is the row's bytes in order, least significant bit
+    first, on any host.
+    """
+    per_row = len(raw) // rows if rows else 0
+    if rows * per_row != len(raw) or per_row * 8 != in_features * bits:
+        msg = (
+            f"{len(raw)} bytes over {rows} rows do not hold {in_features} codes of "
+            f"{bits} bits a row"
+        )
+        raise ValueError(msg)
+    stream = np.unpackbits(
+        np.frombuffer(raw, dtype=np.uint8).reshape(rows, per_row), axis=1, bitorder="little"
+    )
+    fields = stream.reshape(rows, in_features, bits)
+    codes = np.zeros((rows, in_features), dtype=np.int64)
+    for place in range(bits):
+        codes |= fields[:, :, place].astype(np.int64) << place
+    return codes
+
+
+def packed_layers(entries: list[TensorEntry]) -> set[str]:
+    """The block linear weights stored packed: ``uint32`` words with scales beside."""
+    names = {entry.name for entry in entries}
+    return {
+        entry.name
+        for entry in linear_weights(entries)
+        if entry.dtype == PACKED and entry.name.removesuffix(".weight") + ".scales" in names
+    }
+
+
+def layer_setting(root: Path, path: str) -> tuple[int, int]:
+    """A packed layer's ``(bits, group_size)``, from ``config.json``.
+
+    The quantization block is flat: the run's defaults, and a dictionary under
+    a layer's module path for each layer that differs from them.
+    """
+    config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+    block = config.get("quantization")
+    if not isinstance(block, dict):
+        msg = f"{root} holds packed weights but its config.json has no quantization block"
+        raise ValueError(msg)
+    override = block.get(path)
+    setting = override if isinstance(override, dict) else block
+    return int(setting["bits"]), int(setting["group_size"])
+
+
+def read_packed(root: Path, entries: dict[str, TensorEntry], name: str) -> PackedLayer:
+    """One packed layer, its codes unpacked and its scales and biases widened."""
+    path = name.removesuffix(".weight")
+    bits, group_size = layer_setting(root, path)
+    weights = root / "model.safetensors"
+    scales = read_tensor(weights, entries[f"{path}.scales"])
+    biases = read_tensor(weights, entries[f"{path}.biases"])
+    entry = entries[name]
+    with weights.open("rb") as handle:
+        handle.seek(entry.start)
+        raw = handle.read(entry.end - entry.start)
+    rows = entry.shape[0]
+    codes = unpack_words(raw, rows, scales.shape[1] * group_size, bits)
+    return PackedLayer(codes, scales, biases, bits, group_size)
 
 
 def find_checkpoint(root: Path) -> Path:
@@ -224,11 +353,15 @@ def compare_layer(
     group_size: int,
     *,
     lattice: bool = True,
+    stored: tuple[np.ndarray | None, np.ndarray | None] = (None, None),
 ) -> LayerReport:
     """Codes, lattices and the harness's own disagreement figure for one layer.
 
     With ``lattice`` off only the float figures are computed, which is what a
-    side stored in bfloat16 allows (see ``_COARSE``).
+    side stored in bfloat16 allows (see ``_COARSE``). ``stored`` gives a side's
+    scales when its checkpoint stores them, one per group in the order the
+    values are grouped, and they are used in place of the ones its values
+    imply.
     """
     if left.shape != right.shape:
         msg = f"{name}: shapes differ, {left.shape} against {right.shape}"
@@ -249,7 +382,10 @@ def compare_layer(
             elements=int(a.size),
             differing=int((a != b).sum()),
         )
-    scale_a, scale_b = implied_scales(a), implied_scales(b)
+    scale_a, scale_b = (
+        implied_scales(values) if known is None else _magnitudes(known)
+        for values, known in ((a, stored[0]), (b, stored[1]))
+    )
 
     finite = np.isfinite(scale_a) & np.isfinite(scale_b)
     drift = np.where(finite, np.abs(scale_b / np.where(finite, scale_a, 1.0) - 1.0), 0.0)
@@ -306,6 +442,60 @@ def compare_layer(
     )
 
 
+def _magnitudes(scales: np.ndarray) -> np.ndarray:
+    """Stored scales as the lattice test reads them: magnitudes, a zero as none."""
+    magnitudes = np.abs(scales.reshape(-1)).astype(np.float64)
+    return np.where(magnitudes > 0, magnitudes, np.inf)
+
+
+def compare_packed(name: str, left: PackedLayer, right: PackedLayer) -> LayerReport:
+    """Two packed layers, compared on what they store.
+
+    A group is on one lattice when its stored scale and bias agree on both
+    sides to ``SAME_LATTICE`` of the left scale, and identical when they agree
+    to the bit; its stored codes are then compared one by one. A scale that
+    changed sign is a different lattice, since its codes mean the opposite
+    values. No code is off its lattice, the codes being integers by storage.
+    """
+    if left.codes.shape != right.codes.shape:
+        msg = f"{name}: shapes differ, {left.codes.shape} against {right.codes.shape}"
+        raise ValueError(msg)
+    if left.group_size != right.group_size:
+        msg = f"{name}: groups of {left.group_size} on the left and {right.group_size} on the right"
+        raise ValueError(msg)
+    scale_a, scale_b = left.scales.reshape(-1), right.scales.reshape(-1)
+    bias_a, bias_b = left.biases.reshape(-1), right.biases.reshape(-1)
+    identical = (scale_a == scale_b) & (bias_a == bias_b)
+    nonzero = scale_a != 0
+    drift = np.where(nonzero, np.abs(scale_b / np.where(nonzero, scale_a, 1.0) - 1.0), np.inf)
+    same = identical | (
+        (drift <= SAME_LATTICE) & (np.abs(bias_b - bias_a) <= SAME_LATTICE * np.abs(scale_a))
+    )
+
+    summary = GroupSummary(groups=int(scale_a.size))
+    summary.identical_scale = int(identical.sum())
+    summary.same_lattice = int(same.sum())
+    summary.scale_drift = drift[~same & np.isfinite(drift)].tolist()
+    codes_a = left.codes.reshape(-1, left.group_size)[same]
+    codes_b = right.codes.reshape(-1, right.group_size)[same]
+    moved = np.abs(codes_a - codes_b)
+    summary.codes = int(moved.size)
+    summary.flipped = int((moved > 0).sum())
+    summary.one_apart = int((moved == 1).sum())
+
+    a, b = left.values(), right.values()
+    difference = float(np.sqrt(np.mean((a - b) ** 2)))
+    magnitude = float(np.sqrt(np.mean(a * a)))
+    return LayerReport(
+        name=name,
+        width=left.bits,
+        summary=summary,
+        relative_disagreement=difference / max(magnitude, 1e-12),
+        elements=int(a.size),
+        differing=int((a != b).sum()),
+    )
+
+
 def _width(codes: np.ndarray) -> int:
     """The narrowest symmetric width whose code range holds these codes.
 
@@ -329,30 +519,84 @@ def _width(codes: np.ndarray) -> int:
 
 
 def coarse_sides(left: Path, right: Path) -> list[str]:
-    """Which of the two checkpoints, if either, is stored too coarsely for the lattice."""
+    """Which of the two checkpoints, if either, is stored too coarsely for the lattice.
+
+    A packed checkpoint never is: its quantized layers store their codes, and
+    the layers it left dense are reported apart (``LayerReport.dense``).
+    """
     coarse = []
     for label, root in (("left", left), ("right", right)):
-        dtypes = {e.dtype for e in linear_weights(read_header(root / "model.safetensors"))}
+        entries = read_header(root / "model.safetensors")
+        if packed_layers(entries):
+            continue
+        dtypes = {e.dtype for e in linear_weights(entries)}
         if dtypes & _COARSE:
             coarse.append(f"{label} ({', '.join(sorted(dtypes & _COARSE))})")
     return coarse
 
 
-def compare(left: Path, right: Path, group_size: int) -> list[LayerReport]:
-    """Every block linear weight of the two checkpoints, one report each."""
-    left_entries = {e.name: e for e in linear_weights(read_header(left / "model.safetensors"))}
-    right_entries = {e.name: e for e in linear_weights(read_header(right / "model.safetensors"))}
+def compare(left: Path, right: Path, group_size: int | None = None) -> list[LayerReport]:
+    """Every block linear weight of the two checkpoints, one report each.
+
+    ``group_size`` is the fake exports' (``DEFAULT_GROUP_SIZE`` when it is
+    ``None``); a packed layer is grouped as its checkpoint says, and a group
+    size given against it has to agree.
+    """
+    left_all = {e.name: e for e in read_header(left / "model.safetensors")}
+    right_all = {e.name: e for e in read_header(right / "model.safetensors")}
+    left_entries = {e.name: e for e in linear_weights(list(left_all.values()))}
+    right_entries = {e.name: e for e in linear_weights(list(right_all.values()))}
     if set(left_entries) != set(right_entries):
         only = sorted(set(left_entries) ^ set(right_entries))
         msg = f"the two checkpoints do not hold the same layers; only on one side: {only[:5]}"
         raise ValueError(msg)
+    packed = (packed_layers(list(left_all.values())), packed_layers(list(right_all.values())))
     lattice = not coarse_sides(left, right)
     reports = []
     for name in sorted(left_entries):
-        a = read_tensor(left / "model.safetensors", left_entries[name])
-        b = read_tensor(right / "model.safetensors", right_entries[name])
-        reports.append(compare_layer(name, a, b, group_size, lattice=lattice))
+        sides: list[PackedLayer | np.ndarray] = []
+        for root, entries, own in ((left, left_all, packed[0]), (right, right_all, packed[1])):
+            if name in own:
+                layer = read_packed(root, entries, name)
+                if group_size is not None and group_size != layer.group_size:
+                    msg = (
+                        f"{root} stores {name} in groups of {layer.group_size}, "
+                        f"not the {group_size} given"
+                    )
+                    raise ValueError(msg)
+                sides.append(layer)
+            else:
+                sides.append(read_tensor(root / "model.safetensors", entries[name]))
+        reports.append(_compare_sides(name, sides[0], sides[1], group_size, lattice, packed))
     return reports
+
+
+def _compare_sides(
+    name: str,
+    left: PackedLayer | np.ndarray,
+    right: PackedLayer | np.ndarray,
+    group_size: int | None,
+    lattice: bool,
+    packed: tuple[set[str], set[str]],
+) -> LayerReport:
+    """One layer, whatever each side stores it as."""
+    if isinstance(left, PackedLayer) and isinstance(right, PackedLayer):
+        return compare_packed(name, left, right)
+    # A packed checkpoint that stores this layer dense left it unquantized.
+    left_dense = bool(packed[0]) and not isinstance(left, PackedLayer)
+    right_dense = bool(packed[1]) and not isinstance(right, PackedLayer)
+    a = left.values() if isinstance(left, PackedLayer) else left
+    b = right.values() if isinstance(right, PackedLayer) else right
+    if left_dense or right_dense:
+        report = compare_layer(name, a, b, a.shape[1], lattice=False)
+        report.dense = True
+        return report
+    size = next(
+        (side.group_size for side in (left, right) if isinstance(side, PackedLayer)),
+        group_size if group_size is not None else DEFAULT_GROUP_SIZE,
+    )
+    stored = tuple(side.scales if isinstance(side, PackedLayer) else None for side in (left, right))
+    return compare_layer(name, a, b, size, lattice=lattice, stored=(stored[0], stored[1]))
 
 
 def same_architecture(left: Path, right: Path) -> str | None:
@@ -375,7 +619,20 @@ def report(reports: list[LayerReport], coarse: list[str] | None = None) -> None:
     ``coarse`` names the side or sides stored in bfloat16 or float16, for
     which only the float figures were computed; the lattice columns and lines
     are then left out rather than printed as zeros that look like a result.
+    Layers a packed checkpoint left dense get one line of their own and stay
+    out of the table and the means.
     """
+    dense = [r for r in reports if r.dense]
+    reports = [r for r in reports if not r.dense]
+    if dense:
+        weights = sum(r.elements for r in dense)
+        differing = sum(r.differing for r in dense)
+        print(
+            f"\n  {len(dense)} layers left dense by a packed side: {differing:,} of "
+            f"{weights:,} weights differ ({_percent(differing, weights)})"
+        )
+    if not reports:
+        return
     if coarse:
         _report_floats(reports, coarse)
         return
@@ -480,7 +737,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("left", type=Path)
     parser.add_argument("right", type=Path)
-    parser.add_argument("--group-size", type=int, default=64)
+    parser.add_argument(
+        "--group-size",
+        type=int,
+        default=None,
+        help=f"the fake exports' group size (default {DEFAULT_GROUP_SIZE}); "
+        "a packed checkpoint carries its own",
+    )
     args = parser.parse_args(argv)
     try:
         left, right = find_checkpoint(args.left), find_checkpoint(args.right)
@@ -491,7 +754,12 @@ def main(argv: list[str] | None = None) -> int:
     if refusal:
         print(f"refusing: these are two different models: {refusal}", file=sys.stderr)
         return 1
-    print(f"left   {left}\nright  {right}\ngroups of {args.group_size}")
+    grouping = (
+        f"groups of {args.group_size}"
+        if args.group_size is not None
+        else f"groups as each packed checkpoint stores them, of {DEFAULT_GROUP_SIZE} otherwise"
+    )
+    print(f"left   {left}\nright  {right}\n{grouping}")
     try:
         reports = compare(left, right, args.group_size)
     except ValueError as exc:

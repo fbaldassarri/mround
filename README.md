@@ -12,7 +12,7 @@ method. It is not a fork of any existing quantizer and contains no source copied
 from one.
 
 > **Alpha.** The method works and is measured against the reference
-> implementation on three models: see [RESULTS.md](RESULTS.md), where every
+> implementation on four models: see [RESULTS.md](RESULTS.md), where every
 > number cites the run that produced it. What is not built yet is listed under
 > [What is not here](#what-is-not-here). Interfaces may change before 1.0.
 
@@ -117,39 +117,52 @@ reported so that a weak opponent cannot flatter a broken model.
 | uniform 4 bit | Qwen2.5-0.5B-Instruct | 15.2197 | 15.0260 | -1.27 percent |
 | uniform 4 bit | SmolLM2-135M-Instruct | 22.1758 | 18.9400 | **-14.59 percent** |
 | uniform 2 bit | Qwen2.5-0.5B-Instruct | 56.4871 | 39.1842 | **-30.63 percent** |
+| uniform 2 bit | Qwen2.5-1.5B-Instruct | 24.6497 | 21.6290 | **-12.25 percent** |
+| uniform 2 bit | Qwen2.5-3B-Instruct | 19.8912 | 17.2031 | **-13.51 percent** |
 | uniform 2 bit, the reference's own SignRound v2 tuning on | Qwen2.5-0.5B-Instruct | 43.1769 | 39.1842 | -9.25 percent |
+| uniform 2 bit, the reference's own SignRound v2 tuning on | Qwen2.5-3B-Instruct | 17.4211 | 17.2031 | -1.25 percent |
 | mixed 2.5 bit | Qwen2.5-0.5B-Instruct | 28.2033 | 22.3707 | **-20.68 percent** |
 | mixed 2.5 bit, the reference's own SignRound v2 tuning on | Qwen2.5-0.5B-Instruct | 25.6777 | 22.3707 | **-12.88 percent** |
 | mixed 2.5 bit | SmolLM2-135M-Instruct | 52.0300 | 30.3866 | **-41.60 percent** |
 
 Perplexity on wikitext2, lower is better, every row against auto-round 0.15.0.
-The three seed rows, the two 2 bit ones and the three mixed ones, are means
-over calibration seeds 42, 43 and 44. In each of them MRound is ahead on every
-seed, and in all but one the worst MRound draw still beats the best reference
-draw. The exception is the 2 bit row with the reference's own SignRound v2
-tuning on, where the two ranges overlap. The reference keeps that tuning
-behind an option, `enable_alg_ext`, that is off by default, and the two
-Qwen2.5-0.5B-Instruct comparisons are the only ones run both ways so far. At 2
-bits the margin is 9.25 percent with the option on against 30.63 with it off,
-so most of the 30.63 sat between the reference's two tunings and not between
-the two implementations; at mixed 2.5 bits it is 12.88 against 20.68, so less
-than half of the 20.68 sat there (RESULTS.md says what the pairs leave open, a
-change of operating system release on the reference's machine included). The
-4 bit Qwen2.5-0.5B-Instruct row is a tie: the reference's own productions of
-it at that seed span 1.17 percent, at the same bytes, which MRound reaches at
-group size 128, the reference is 0.50 percent ahead, and on the reference's own
-twelve task zero-shot suite the two checkpoints' mean accuracies are 0.16 points
-apart (47.42 against 47.58 percent), the reference 0.60 points ahead at the
-same bytes. At 2 bits on the same model that suite puts MRound 2.05 points
-ahead on the mean, on every seed, against the reference's default arms; at
-mixed 2.5 bits, against the default arms again, it is equivocal, MRound
-0.69 points ahead on the mean and behind on one seed of three. Against the
-arms with the option on it puts MRound 0.49 points ahead at 2 bits, still on
-every seed, and 0.10 at mixed 2.5 bits, behind on one seed of three: on the
-tasks the option closes most of the distance at both schemes. MRound's
-checkpoints run 2.4 to 4.9 percent larger at the same nominal width and group
-size 64 (1.2 percent at 128), which is stated in every table rather than left
-out.
+auto-round 0.16.0, a later release, wrote the same reference checkpoints as
+0.15.0 at the one operating point it has been run at, under both of the
+reference's tunings (RESULTS.md, Which release of the reference), and 0.16.1,
+published since, has not been run. The reference arms of the
+Qwen2.5-1.5B-Instruct and Qwen2.5-3B-Instruct rows ran on the Linux machine's
+integrated GPU, the others on CPUs. The three seed rows, the five 2 bit ones
+and the three mixed ones, are means over calibration seeds 42, 43 and 44. In
+all but two of them MRound is ahead on every seed and its worst draw still
+beats the reference's best. The exceptions are the two 2 bit rows with the
+reference's own SignRound v2 tuning on: on Qwen2.5-0.5B-Instruct MRound is
+ahead on every seed but the two ranges overlap, and on Qwen2.5-3B-Instruct it
+is behind on one seed of three and the two are level. The reference keeps that
+tuning behind an option, `enable_alg_ext`, that is off by default, and three
+comparisons have been run both ways so far. At 2 bits the margin is 9.25
+percent with the option on against 30.63 with it off on Qwen2.5-0.5B-Instruct
+and 1.25 against 13.51 on Qwen2.5-3B-Instruct, so most of each sat between the
+reference's two tunings and not between the two implementations, nearly all of
+it on the larger model; at mixed 2.5 bits it is 12.88 against 20.68, so less
+than half of the 20.68 sat there (RESULTS.md says what the pairs leave open;
+the reference's machine changed operating system release between the two
+tunings of the smaller model, and both arms of one seed, produced again on one
+system, are the same checkpoints to the bit, while the larger model's pairs ran
+on one system). The 4 bit Qwen2.5-0.5B-Instruct row is a tie: the reference's
+own productions of it at that seed span 1.17 percent, at the same bytes, which
+MRound reaches at group size 128, the reference is 0.50 percent ahead, and on
+the reference's own twelve task zero-shot suite the two checkpoints' mean
+accuracies are 0.16 points apart (47.42 against 47.58 percent), the reference
+0.60 points ahead at the same bytes. At 2 bits on the same model that suite
+puts MRound 2.05 points ahead on the mean, on every seed, against the
+reference's default arms; at mixed 2.5 bits, against the default arms again, it
+is equivocal, MRound 0.69 points ahead on the mean and behind on one seed of
+three. Against the arms with the option on it puts MRound 0.49 points ahead at
+2 bits, still on every seed, and 0.10 at mixed 2.5 bits, behind on one seed of
+three: on the tasks the option closes most of the distance at both schemes.
+MRound's checkpoints run 2.4 to 6.2 percent larger at the same nominal width
+and group size 64, the larger figures on the larger models (1.2 percent at
+128), which is stated in every table rather than left out.
 
 [RESULTS.md](RESULTS.md) has all of it: the per seed numbers, the sizes, the
 original model's perplexity beside every comparison, what happens when the
@@ -162,15 +175,18 @@ figures that come from a run's own output rather than the ledger (checkpoint
 distances, the evaluator check, a peak read from a log) say so where they
 appear.
 
-The honest caveat, stated once here and again there: these are three models, all
-under two billion parameters, scored by perplexity on one corpus, and only five
-comparisons so far by a zero-shot task suite as well. At 2 bits against the
-reference's default tuning the largest model measured shows the smallest
-margin. Nothing here is a claim about seven billion. And outside the two rows
-that say otherwise, every reference arm ran AutoRound's default tuning: only
-the 2 bit and the mixed 2.5 bit Qwen2.5-0.5B-Instruct arms have been run with
-`enable_alg_ext` as well, and there the margins are 9.25 and 12.88 percent
-where they are 30.63 and 20.68 with the option off. The other margins are
+The honest caveat, stated once here and again there: these are four models, of
+three billion parameters at most, scored by perplexity on one corpus, and only
+five comparisons so far by a zero-shot task suite as well. At 2 bits against
+the reference's default tuning the margin narrowed from 30.63 percent at 0.5
+billion parameters to 12.25 at 1.5 billion and then held, 13.51 at 3 billion;
+against its own SignRound v2 tuning it is 9.25 at 0.5 billion and 1.25 at 3
+billion, a tie. Nothing here is a claim about seven billion. And outside the
+three rows that say otherwise, every reference arm ran AutoRound's default
+tuning: only the 2 bit and the mixed 2.5 bit Qwen2.5-0.5B-Instruct arms and
+the 2 bit Qwen2.5-3B-Instruct arms have been run with `enable_alg_ext` as
+well, and there the margins are 9.25, 12.88 and 1.25 percent where they are
+30.63, 20.68 and 13.51 with the option off. The other margins are
 against the reference as it ships, and none is against the configuration its
 documentation recommends at 2 bits, that option together with its stronger
 recipe.
@@ -221,12 +237,25 @@ Activation quantization is out of scope, as is quantization aware training, as
 is any non-Apple hardware target.
 
 Memory requirements are not yet characterized. MRound quantizes one block at a
-time, so the working set beyond the weights should be governed by the largest
-single block plus cached activations, but as built it loads the whole model,
-which therefore has to fit (DOCUMENTATION.md section 2). Its MLX allocator peak
-has been recorded at two sizes, 13.58 GB on Qwen2.5-0.5B-Instruct at 4 bits and
-27.27 GB on Qwen2.5-1.5B-Instruct at 2 bits, both at the standard recipe
-([RESULTS.md](RESULTS.md)), which is not yet enough to say how it scales.
+time, and it now reads one block's weights at a time as well, releasing each
+block once it is quantized, so a uniform run no longer has to hold the whole
+model. A mixed precision run's scoring pass still reads every weight, but holds
+one quantized copy of the block weights rather than one per candidate width,
+and a tuning step can run its batch in pieces (`--micro-batches`) for a model
+whose step does not fit whole (DOCUMENTATION.md section 2). Each checkpoint's
+`mround_run.json` records the peak of every stage of every block, and every run
+predicts its own peak before it starts, from the model's configuration alone,
+by a rule fitted on those records and on a probe of synthetic blocks on Metal
+(`scripts/probe_memory.py`): a run predicted past 85 percent of the Mac's
+memory is refused before the model loads, with the number of pieces that would
+fit, and `mround quantize --dry-run` asks without running. The MLX allocator
+peak was recorded at two sizes before that change, 13.58 GB on
+Qwen2.5-0.5B-Instruct at 4 bits and 27.27 GB on Qwen2.5-1.5B-Instruct at 2
+bits, both at the standard recipe; after it, the
+second configuration wrote the same checkpoint to the byte at 19.34 GB
+([RESULTS.md](RESULTS.md), row 121 of the ledger), and Qwen2.5-3B-Instruct at
+2 bits peaked at 20.07 GB on each of three seeds (rows 124 to 126). That is
+not yet enough to say how memory scales.
 
 There is no serving runtime and there will not be one. MRound produces
 checkpoints; `mlx-lm` runs them.
