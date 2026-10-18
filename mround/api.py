@@ -548,6 +548,7 @@ def quantize(
         scoring_samples=scoring_samples,
         scoring_seq_len=scoring_seq_len,
         scoring_batch_size=scoring_batch_size,
+        dense_remainder=dense_remainder,
     )
     config, memory = _check_memory_first(
         model, run_shape, budget=memory_budget, enforce=memory_check
@@ -970,6 +971,7 @@ def predict_memory(
     average_bits: float | None = None,
     candidate_bits: Sequence[int] = (2, 3, 4),
     remainder_bits: int | None = None,
+    dense_remainder: bool = False,
     scoring_samples: int | None = None,
     scoring_seq_len: int | None = None,
     scoring_batch_size: int | None = None,
@@ -1002,6 +1004,8 @@ def predict_memory(
             with its scoring pass.
         candidate_bits: As :func:`quantize` takes it.
         remainder_bits: As :func:`quantize` takes it.
+        dense_remainder: As :func:`quantize` takes it; a remainder left
+            dense is not rounded, so it holds nothing of its own.
         scoring_samples: As :func:`quantize` takes it.
         scoring_seq_len: As :func:`quantize` takes it.
         scoring_batch_size: As :func:`quantize` takes it.
@@ -1052,6 +1056,7 @@ def predict_memory(
         scoring_samples=scoring_samples,
         scoring_seq_len=scoring_seq_len,
         scoring_batch_size=scoring_batch_size,
+        dense_remainder=dense_remainder,
     )
     return check_memory(shape, run, budget=memory_budget, device=_device_memory())
 
@@ -1537,16 +1542,10 @@ def _finish_checkpoint(
     skipped: list[tuple[str, str]] = []
     with meter.stage("remainder"):
         for path, layer, reason in _round_to_nearest_layers(
-            bundle, remainder_scheme, skip=set(quantized)
+            bundle, remainder_scheme, skip=set(quantized), dense=dense_remainder
         ):
             if layer is None:
                 skipped.append((path, reason))
-            elif dense_remainder:
-                # Left at the model's own precision on purpose, and recorded as
-                # a skip so the checkpoint's own configuration says what was
-                # done to it rather than leaving a reader to infer it from the
-                # file size.
-                skipped.append((path, "dense by request, to match a reference's coverage"))
             else:
                 quantized[path] = layer
     if not quantized:
@@ -1560,7 +1559,11 @@ def _finish_checkpoint(
 
 
 def _round_to_nearest_layers(
-    bundle: ModelBundle, scheme: QuantScheme, *, skip: Collection[str] = ()
+    bundle: ModelBundle,
+    scheme: QuantScheme,
+    *,
+    skip: Collection[str] = (),
+    dense: bool = False,
 ) -> Iterator[tuple[str, QuantizedLayer | None, str]]:
     """Quantize every eligible module with nothing learned.
 
@@ -1568,6 +1571,12 @@ def _round_to_nearest_layers(
     ``reason`` is meaningful. Reporting the skips rather than counting them is
     the point: "this model is 4-bit" is false in a way nobody can see if a large
     tensor quietly stayed dense.
+
+    With ``dense`` every eligible module is reported as left dense by request
+    and nothing is rounded. Rounding a module only to set the result aside, as
+    the remainder of a run with ``dense_remainder`` did until 2026-10-18, held
+    15.9 GB at once for a 7B model's head and embedding and took that stage to
+    25.02 GB (log0170).
     """
     import mlx.core as mx  # noqa: PLC0415
 
@@ -1585,6 +1594,12 @@ def _round_to_nearest_layers(
                 f"last dimension {module.weight.shape[-1]} is not a multiple of {scheme.group_size}"
             )
             yield path, None, reason
+            continue
+        if dense:
+            # Left at the model's own precision on purpose, and recorded as a
+            # skip so the checkpoint's own configuration says what was done to
+            # it rather than leaving a reader to infer it from the file size.
+            yield path, None, "dense by request, to match a reference's coverage"
             continue
         # float32 for the forward, whatever the model stores. DOCUMENTATION 5.1.
         widened = module.weight.astype(mx.float32)

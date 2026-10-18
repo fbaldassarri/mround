@@ -24,7 +24,7 @@ from mround import api
 from mround.exceptions import ArchitectureError, CalibrationError, MemoryBudgetError, SchemeError
 from mround.pipeline import loader
 from mround.pipeline.runner import QuantizationRunner
-from mround.planner.memory import RULE_VERSION
+from mround.planner.memory import RULE_VERSION, ModelShape, RunShape, predict_memory
 from mround.schemes import QuantScheme, TuningConfig
 
 if TYPE_CHECKING:
@@ -224,6 +224,30 @@ class TestTheMemoryCheck:
         assert set(result.summary.after_blocks) == {"remainder", "export"}
         # The run's peak is the whole run's now, the export included.
         assert memory["peak_bytes"] >= max(memory["by_stage_bytes"].values())
+
+    def test_a_dense_remainder_is_left_dense_and_predicted_as_one(
+        self, corpus: str, tmp_path: Path
+    ) -> None:
+        # Left dense, the remainder rounds nothing, the checkpoint keeps the
+        # embedding at the model's width, and the check says so.
+        result = api.quantize(
+            "tiny",
+            output_dir=tmp_path / "out",
+            tuning=TUNING,
+            calibration=corpus,
+            dense_remainder=True,
+        )
+        record = json.loads(result.config_path.read_text(encoding="utf-8"))
+        assert [
+            "model.embed_tokens",
+            "dense by request, to match a reference's coverage",
+        ] in record["result"]["skipped"]
+        predicted = record["memory_check"]
+        assert predicted["run"]["dense_remainder"] is True
+        shape = ModelShape(**predicted["model"])
+        rounded = RunShape(**{**predicted["run"], "dense_remainder": False})
+        remainder = predicted["by_stage_bytes"]["remainder"]
+        assert remainder < predict_memory(shape, rounded).stages["remainder"]
 
     def test_a_run_past_its_budget_is_refused_before_the_model_loads(
         self, corpus: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

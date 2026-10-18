@@ -9,15 +9,18 @@ layout and they must agree, which is the same argument as
 `test_mlx_parity.py` makes for the quantizer.
 
 The export tests are conformance tests, and they are weaker by nature. They
-check that the checkpoint has the structure MLX's source says it needs. They
-cannot check that mlx-lm actually loads it, because that needs a real model and
-a real tokenizer. Until an integration test does that, these establish that the
-shapes, names, dtypes, and configuration keys are right, and no more. See
+check that the checkpoint has the structure MLX's source says it needs, and one
+of them, since the checkpoint can be split (ROAD-TO-1.0.md X2), has mlx-lm's
+own ``load_model``, which reads the weights and needs no tokenizer, load a tiny
+model from one file and from shards. That a real model loaded this way
+generates is an integration test's to show; these establish that the shapes,
+names, dtypes, files and configuration keys are right, and no more. See
 MEMORY.md D-017 for what was verified against MLX's source and what was not.
 """
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import subprocess
@@ -363,6 +366,156 @@ class TestExport:
         )
         unpacked = mlx_packing.unpack_codes(words, 256, bits)
         assert np.array_equal(np.array(unpacked), np.array(codes).astype(np.uint32))
+
+
+def _weight_files(directory: Path) -> list[str]:
+    """The weight files mlx-lm would load from ``directory``, by its own glob."""
+    return sorted(path.name for path in directory.glob("model*.safetensors"))
+
+
+def _shard_contents(directory: Path) -> dict[str, dict[str, mx.array]]:
+    return {name: mx.load(str(directory / name)) for name in _weight_files(directory)}
+
+
+class TestShards:
+    """Past :data:`mlx_export.SHARD_BYTES` the checkpoint is split as mlx-lm splits one.
+
+    The limit is the argument's, so these run on bytes rather than gigabytes:
+    one 4 bit layer of 8 by 64 at group size 32 stores 256 bytes of words and
+    32 each of scales and biases.
+    """
+
+    def test_past_the_limit_it_is_split_into_numbered_shards(self, tmp_path: Path) -> None:
+        layers = {f"model.layers.{i}.mlp.up_proj": a_layer(bits=4) for i in range(5)}
+        dense = {"model.embed_tokens.weight": mx.zeros((10, 64), dtype=mx.bfloat16)}
+        limit = 1000
+        mlx_export.export_mlx(tmp_path, dense, layers, config={}, shard_bytes=limit)
+
+        files = _weight_files(tmp_path)
+        assert len(files) > 1
+        assert files == mlx_export.shard_names(len(files))
+        shards = _shard_contents(tmp_path)
+        held: dict[str, str] = {}
+        sizes = []
+        for file in files:
+            shard = shards[file]
+            assert shard, f"{file} holds nothing"
+            sizes.append(sum(t.nbytes for t in shard.values()))
+            assert sizes[-1] <= limit or len(shard) == 1, f"{file} is past the limit"
+            for name in shard:
+                assert name not in held, f"{name} is in {held.get(name)} and in {file}"
+                held[name] = file
+        # Greedy, as mlx-lm's own split is: no two neighbours would fit in one.
+        assert all(a + b > limit for a, b in itertools.pairwise(sizes))
+        index = json.loads((tmp_path / "model.safetensors.index.json").read_text())
+        assert index["weight_map"] == held
+        assert set(held) == {"model.embed_tokens.weight"} | {
+            f"{path}.{kind}" for path in layers for kind in ("weight", "scales", "biases")
+        }
+        assert index["metadata"]["total_size"] == sum(sizes)
+
+    def test_a_checkpoint_of_exactly_the_limit_stays_one_file(self, tmp_path: Path) -> None:
+        layers = {"layers.0.mlp": a_layer(bits=4), "layers.1.mlp": a_layer(bits=4)}
+        size = 2 * (256 + 32 + 32)
+        mlx_export.export_mlx(tmp_path / "at", {}, layers, config={}, shard_bytes=size)
+        mlx_export.export_mlx(tmp_path / "under", {}, layers, config={}, shard_bytes=size - 1)
+        assert _weight_files(tmp_path / "at") == ["model.safetensors"]
+        index = json.loads((tmp_path / "at" / "model.safetensors.index.json").read_text())
+        assert set(index["weight_map"].values()) == {"model.safetensors"}
+        assert _weight_files(tmp_path / "under") == mlx_export.shard_names(2)
+
+    def test_a_tensor_past_the_limit_fills_a_shard_of_its_own(self, tmp_path: Path) -> None:
+        # Each layer's 256 bytes of words are past a limit of 100, and its
+        # scales and biases fit together under it. mlx-lm's own split closes
+        # the empty shard it starts with when the first tensor is too large,
+        # and writes it; this writes none.
+        layers = {"layers.0.mlp": a_layer(bits=4), "layers.1.mlp": a_layer(bits=4)}
+        mlx_export.export_mlx(tmp_path, {}, layers, config={}, shard_bytes=100)
+        shards = _shard_contents(tmp_path)
+        assert [sorted(shard) for shard in shards.values()] == [
+            ["layers.0.mlp.weight"],
+            ["layers.0.mlp.biases", "layers.0.mlp.scales"],
+            ["layers.1.mlp.weight"],
+            ["layers.1.mlp.biases", "layers.1.mlp.scales"],
+        ]
+
+    def test_the_names_are_mlx_lms(self) -> None:
+        assert mlx_export.shard_names(1) == ["model.safetensors"]
+        assert mlx_export.shard_names(3) == [
+            "model-00001-of-00003.safetensors",
+            "model-00002-of-00003.safetensors",
+            "model-00003-of-00003.safetensors",
+        ]
+        with pytest.raises(ExportError, match="at least one"):
+            mlx_export.shard_names(0)
+
+    def test_the_limit_is_five_binary_gigabytes(self) -> None:
+        assert mlx_export.SHARD_BYTES == 5 * 1024**3
+
+    def test_an_export_over_an_earlier_one_leaves_none_of_its_weight_files(
+        self, tmp_path: Path
+    ) -> None:
+        # mlx-lm loads every model*.safetensors in the directory, so a shard
+        # left from a larger checkpoint would be loaded with the new one.
+        layers = {f"layers.{i}.mlp": a_layer(bits=4) for i in range(3)}
+        (tmp_path / "other.safetensors").write_bytes(b"not a weight file of this export")
+        mlx_export.export_mlx(tmp_path, {}, layers, config={}, shard_bytes=300)
+        assert _weight_files(tmp_path) == mlx_export.shard_names(5)
+        mlx_export.export_mlx(tmp_path, {}, layers, config={}, shard_bytes=700)
+        assert _weight_files(tmp_path) == mlx_export.shard_names(2)
+        mlx_export.export_mlx(tmp_path, {}, layers, config={})
+        assert _weight_files(tmp_path) == ["model.safetensors"]
+        mlx_export.export_mlx(tmp_path, {}, layers, config={}, shard_bytes=700)
+        assert _weight_files(tmp_path) == mlx_export.shard_names(2)
+        assert (tmp_path / "other.safetensors").read_bytes() == b"not a weight file of this export"
+
+    def test_mlx_lm_loads_the_shards_as_it_loads_one_file(self, tmp_path: Path) -> None:
+        # mlx-lm's own loader, which reads the weights and needs no tokenizer,
+        # on a tiny Llama quantized whole at 4 bits: loaded from shards it is
+        # the model loaded from one file, parameter for parameter, and strict
+        # loading leaves no tensor missing or extra.
+        mlx_lm_utils = pytest.importorskip("mlx_lm.utils", reason="the loader is mlx-lm's")
+        from mlx.utils import tree_flatten  # noqa: PLC0415
+        from mlx_lm.models import llama  # noqa: PLC0415
+
+        config = {
+            "model_type": "llama",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 64,
+            "tie_word_embeddings": True,
+        }
+        mx.random.seed(0)
+        weights = dict(tree_flatten(llama.Model(llama.ModelArgs(**config)).parameters()))
+        scheme = QuantScheme(bits=4, group_size=32)
+        quantized = {}
+        for name, weight in weights.items():
+            if ".layers." in name and weight.ndim == 2:
+                codes, scale, zero_point = mlx_quant.quantize_codes(
+                    weight, mlx_quant.init_params(weight, scheme), scheme
+                )
+                quantized[name.removesuffix(".weight")] = mlx_export.QuantizedLayer(
+                    codes=codes, scale=scale, zero_point=zero_point, scheme=scheme
+                )
+        dense = {n: w for n, w in weights.items() if n.removesuffix(".weight") not in quantized}
+        for label, limit in (("one", mlx_export.SHARD_BYTES), ("shards", 20_000)):
+            mlx_export.export_mlx(
+                tmp_path / label, dense, quantized, config, dtype="float32", shard_bytes=limit
+            )
+        assert len(_weight_files(tmp_path / "shards")) > 2
+
+        loaded = {
+            label: dict(tree_flatten(mlx_lm_utils.load_model(tmp_path / label)[0].parameters()))
+            for label in ("one", "shards")
+        }
+        assert loaded["one"].keys() == loaded["shards"].keys()
+        assert "model.layers.1.mlp.down_proj.scales" in loaded["shards"]
+        for name, value in loaded["one"].items():
+            assert mx.array_equal(value, loaded["shards"][name]).item(), name
 
 
 # Two layers at 2 bits and two at 4: a tie on the count that picks the default.

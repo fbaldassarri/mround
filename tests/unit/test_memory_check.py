@@ -173,6 +173,17 @@ class TestPredictMemory:
         )
         assert pieces.fits
 
+    def test_a_dense_remainder_rounds_nothing(self, tmp_path: Path) -> None:
+        directory = _model_dir(tmp_path, QWEN_7B)
+        rounded = api.predict_memory(directory, bits=2).prediction
+        dense = api.predict_memory(directory, bits=2, dense_remainder=True).prediction
+        assert dense.run.dense_remainder
+        assert not rounded.run.dense_remainder
+        assert dense.stages["remainder"] < rounded.stages["remainder"]
+        assert dense.stages["export"] < rounded.stages["export"]
+        for stage in ("entrance", "targets", "search", "score", "tune", "commit", "advance"):
+            assert dense.stages[stage] == rounded.stages[stage], stage
+
     def test_a_model_the_rule_cannot_read_is_refused(self, tmp_path: Path) -> None:
         directory = _model_dir(tmp_path, {**QWEN_7B, "num_local_experts": 8})
         with pytest.raises(ArchitectureError, match="dense decoder"):

@@ -71,13 +71,22 @@ block's activations under checkpointing (MEMORY.md D-036, M1c). Its one
 measurement on the current tree is a 3B at the matched budget, 23.95 GB
 (log0160), on which the logits' share is fitted.
 
-**After the loop, accounting alone.** The tensors outside the blocks are
-rounded one at a time in float32, and the checkpoint is packed and written with
-every block's codes still held. No run record measured either before this
-module, so both are estimated from what they hold, with four float32 copies
-of the largest tensor for the rounding, and ``mround_run.json`` measures both
-from now on as ``remainder`` and ``export``. Neither comes near the loop's
-peak in any configuration this rule has been asked about.
+**After the loop, measured once.** The tensors outside the blocks are rounded
+one at a time in float32, unless the run leaves them dense, and the checkpoint
+is packed a layer at a time and written with every block's codes still held.
+The first run to measure either stage, Qwen2.5-7B-Instruct at 2 bits in four
+pieces (log0170), found both doing more than that: its export packed every
+layer at once and reached 35.95 GB, past the Mac it ran on, and its remainder
+rounded the embedding and the head only to set them aside. Both are fixed
+(``mround/formats/mlx_export.py``, ``mround/api.py``). That discarded rounding
+is the one measurement of what rounding holds: 15.9 GB above the codes and the
+tensors, for a tensor of 545 million weights at 2 bits with its scale searched.
+On MLX's CPU backend the same rounding holds 7.4 float32 copies of the tensor
+without the search and 1.46 GB more for the search's slices, which the rule
+takes, so that it errs high by a tenth on that run; a dense remainder holds
+nothing. The export holds the packed checkpoint beside the layer being packed,
+at eight bytes a weight, which a test measures on the CPU backend. The next run
+measures both stages as they are now.
 
 The rule is a fit to the runs it names and nothing more. Every run records its
 prediction beside its measured stages, so the next measurement checks it, and
@@ -118,8 +127,9 @@ __all__ = [
 # Which fit this is. Recorded with every prediction, so that a run record says
 # which rule its prediction came from when the constants below are refitted.
 # "2026-10-17" was fitted on the run records alone, "2026-10-17b" on them and
-# the probe of log0169.
-RULE_VERSION = "2026-10-17b"
+# the probe of log0169, and "2026-10-18" holds the stages after the loop to the
+# first run that measured them, log0170.
+RULE_VERSION = "2026-10-18"
 
 # The share of the Mac's memory a run may be predicted to reach. The largest
 # peak a run on the 32 GB Mac reached and finished is 30.11 GB, 88 percent of
@@ -153,7 +163,9 @@ _TUNABLE_WEIGHT = 8.0  # the float32 weight and the rounding perturbation, per w
 _SCORING_LOGITS = 2.40  # logits sized float32 tensors in the scoring backward
 _SCORING_GRADIENT = 16.0  # one block's gradients and rebuilt perturbations, per weight
 _SCORING_FIXED = 0.89e9  # what the GPU held in flight whatever the depth (log0148)
-_REMAINDER_COPIES = 4.0  # float32 copies of the largest tensor outside the blocks
+_REMAINDER_COPIES = 7.4  # float32 copies of the tensor outside the blocks being rounded
+_REMAINDER_SEARCH = 1.46e9  # and the scale search's slices over it, when it is searched
+_EXPORT_LAYER = 8.0  # bytes a weight of the layer the export is packing
 
 # Architectures whose MLP is two matrices rather than three. Everything else
 # is read as the gated layout of Llama, Qwen2, Mistral and Gemma, which counts
@@ -268,6 +280,11 @@ class ModelShape:
         return self.embedding_weights * (1 if self.tied else 2)
 
     @property
+    def largest_layer_weights(self) -> int:
+        """Weights of a block's largest linear layer, an MLP projection as a rule."""
+        return max(self.hidden * self.intermediate, self.hidden * self.heads * self.head_dim)
+
+    @property
     def model_weights(self) -> int:
         """Every weight a forward pass reads: blocks, embedding and head."""
         return self.layers * self.block_weights + self.outside_weights
@@ -290,6 +307,8 @@ class RunShape:
         candidate_widths: How many widths the scoring pass scores.
         scoring_sequences: Sequences per scoring batch.
         scoring_seq_len: Tokens per scoring sequence.
+        dense_remainder: Whether the tensors outside the blocks stay at the
+            model's width, so that nothing is rounded after the loop.
     """
 
     samples: int = 128
@@ -304,6 +323,7 @@ class RunShape:
     candidate_widths: int = 3
     scoring_sequences: int = 2
     scoring_seq_len: int = 1024
+    dense_remainder: bool = False
 
     @classmethod
     def of(
@@ -315,6 +335,7 @@ class RunShape:
         scoring_samples: int | None = None,
         scoring_seq_len: int | None = None,
         scoring_batch_size: int | None = None,
+        dense_remainder: bool = False,
     ) -> RunShape:
         """The shape of a run with these settings, resolved as the run resolves them.
 
@@ -327,6 +348,7 @@ class RunShape:
             scoring_seq_len: As :func:`mround.api.quantize` takes it.
             scoring_batch_size: As :func:`mround.api.quantize` takes it, or
                 ``None`` for the batch the scoring budget derives.
+            dense_remainder: As :func:`mround.api.quantize` takes it.
         """
         widths = sorted({int(width) for width in candidate_bits or ()})
         samples = SENSITIVITY_SAMPLES if scoring_samples is None else int(scoring_samples)
@@ -349,6 +371,7 @@ class RunShape:
             candidate_widths=max(1, len(widths)),
             scoring_sequences=batch,
             scoring_seq_len=sequence,
+            dense_remainder=dense_remainder,
         )
 
     def with_micro_batches(self, pieces: int) -> RunShape:
@@ -473,14 +496,28 @@ def predict_memory(model: ModelShape, run: RunShape) -> MemoryPrediction:
         + _SCORE_FIXED
     )
 
-    # After the loop: every code, the tensors outside the blocks at the
-    # model's width, and either the rounding of the largest of them or the
-    # packed checkpoint (the packed codes, and a scale and a bias a group at
-    # the model's width), whichever the stage holds.
+    # After the loop: every code and the tensors outside the blocks at the
+    # model's width, and then what the stage itself holds. The remainder
+    # rounds the tensors outside the blocks one at a time, holding the
+    # rounding of the largest beside the codes of any rounded before it, and
+    # nothing when the run leaves them dense. The export holds the packed
+    # checkpoint (the packed codes, and a scale and a bias a group at the
+    # model's width) beside the layer it is packing.
     all_codes = model.layers * codes
     outside = model.outside_weights * width
     group = run.group_size if run.group_size > 0 else model.hidden
-    packed = model.layers * weights * (run.bits / 8 + 2 * width / group)
+    per_weight = _codes_per_weight(run, model)
+    packed_per_weight = run.bits / 8 + 2 * width / group
+    packed = model.layers * weights * packed_per_weight
+    rounded = 0 if run.dense_remainder else model.outside_weights
+    rounding = 0.0
+    if rounded:
+        rounding = (
+            _REMAINDER_COPIES * 4 * model.embedding_weights
+            + (_REMAINDER_SEARCH if run.searched else 0.0)
+            + (rounded - model.embedding_weights) * per_weight
+        )
+    packing = model.embedding_weights if rounded else model.largest_layer_weights
 
     stages: dict[str, float] = {
         # The reference stream in float32, the captured inputs at the model's
@@ -496,8 +533,12 @@ def predict_memory(model: ModelShape, run: RunShape) -> MemoryPrediction:
         + batch_copies,
         "commit": resident + tunables + _COMMIT_WEIGHT * weights + _COMMIT_FIXED,
         "advance": resident + width * weights + codes + forward,
-        "remainder": all_codes + outside + _REMAINDER_COPIES * 4 * model.embedding_weights,
-        "export": all_codes + outside + packed,
+        "remainder": all_codes + outside + rounding,
+        "export": all_codes
+        + outside
+        + rounded * (per_weight + packed_per_weight)
+        + packed
+        + _EXPORT_LAYER * max(packing, model.largest_layer_weights),
     }
     if run.mixed:
         scoring_tokens = run.scoring_sequences * (run.scoring_seq_len - 1)

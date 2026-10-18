@@ -60,12 +60,16 @@ Usage, from the repository root::
     python scripts/compare_checkpoints.py LEFT RIGHT --group-size 64
 
 ``LEFT`` and ``RIGHT`` are checkpoint directories holding ``config.json`` and
-``model.safetensors``, or a parent with one such directory under it, which is
-how the reference writes its output. ``--group-size`` is the fake exports'
-group size, 64 when it is not given; a packed checkpoint carries its own, and
-a group size given against it has to agree with it. Needs numpy and nothing
-else: the safetensors header is read directly and one tensor at a time, so the
-two checkpoints never have to fit in memory together.
+the weights, or a parent with one such directory under it, which is how the
+reference writes its output. The weights are the files ``mlx-lm`` loads: one
+``model.safetensors``, or the shards of a larger checkpoint,
+``model-00001-of-00002.safetensors`` and on, as MRound writes past five binary
+gigabytes (since 2026-10-18) and ``transformers`` past its own limit; each
+tensor is read from the shard that holds it. ``--group-size`` is the fake
+exports' group size, 64 when it is not given; a packed checkpoint carries its
+own, and a group size given against it has to agree with it. Needs numpy and
+nothing else: the safetensors header is read directly and one tensor at a time,
+so the two checkpoints never have to fit in memory together.
 """
 
 from __future__ import annotations
@@ -119,6 +123,12 @@ SELF_DISAGREEMENT = (
     "  side."
 )
 
+# The weight files of a checkpoint, as mlx-lm's loader finds them, and the
+# index a sharded one carries, naming the file each tensor is in.
+WEIGHT_FILES = "model*.safetensors"
+INDEX = "model.safetensors.index.json"
+SHOWN = 3
+
 _DTYPES = {"F32": np.float32, "F16": np.float16, "F64": np.float64}
 # Exports the reference writes after tuning under autocast hold bfloat16
 # weights: eight significant bits, so a dequantized value is rounded by up to
@@ -131,13 +141,14 @@ _ARCHITECTURE_FIELDS = ("model_type", "hidden_size", "num_hidden_layers", "vocab
 
 @dataclass
 class TensorEntry:
-    """One tensor's location inside a safetensors file."""
+    """One tensor's location: the safetensors file it is in, and its bytes there."""
 
     name: str
     dtype: str
     shape: tuple[int, ...]
     start: int
     end: int
+    file: Path
 
 
 @dataclass
@@ -216,14 +227,65 @@ def read_header(path: Path) -> list[TensorEntry]:
             continue
         start, end = spec["data_offsets"]
         entries.append(
-            TensorEntry(name, spec["dtype"], tuple(spec["shape"]), base + start, base + end)
+            TensorEntry(name, spec["dtype"], tuple(spec["shape"]), base + start, base + end, path)
         )
     return sorted(entries, key=lambda entry: entry.name)
 
 
-def read_tensor(path: Path, entry: TensorEntry) -> np.ndarray:
-    """One tensor, read from its byte range and nothing else, as float64."""
-    with path.open("rb") as handle:
+def read_checkpoint(root: Path) -> dict[str, TensorEntry]:
+    """Every tensor of a checkpoint directory by name, whichever file holds it.
+
+    The weight files are the ones ``mlx-lm`` loads, ``model*.safetensors``, so
+    that what is compared is what is scored. A sharded checkpoint carries an
+    index, which has to place every tensor in the file that holds it. A tensor
+    in two files, or an index that disagrees with the files, means the
+    directory holds more than one checkpoint's files, or part of one, and is
+    refused: a loader keeps whichever copy it reads last, and a missing shard
+    takes its layers with it.
+
+    Raises:
+        FileNotFoundError: When the directory holds no weight file.
+        ValueError: When a tensor is in two files, or the index disagrees.
+    """
+    files = sorted(root.glob(WEIGHT_FILES))
+    if not files:
+        msg = f"{root} holds no weight file ({WEIGHT_FILES})"
+        raise FileNotFoundError(msg)
+    entries: dict[str, TensorEntry] = {}
+    for file in files:
+        for entry in read_header(file):
+            if entry.name in entries:
+                msg = (
+                    f"{root} holds {entry.name} in both {entries[entry.name].file.name} "
+                    f"and {file.name}"
+                )
+                raise ValueError(msg)
+            entries[entry.name] = entry
+    index = root / INDEX
+    if index.is_file():
+        named = json.loads(index.read_text(encoding="utf-8")).get("weight_map", {})
+        found = {name: entry.file.name for name, entry in entries.items()}
+        if named != found:
+            missing = sorted(set(named) - set(found))
+            unlisted = sorted(set(found) - set(named))
+            moved = sorted(n for n in set(named) & set(found) if named[n] != found[n])
+            parts = [
+                f"{label}: {names[:SHOWN]}"
+                for label, names in (
+                    ("in no weight file", missing),
+                    ("not in the index", unlisted),
+                    ("in another file than the index names", moved),
+                )
+                if names
+            ]
+            msg = f"{root}'s {INDEX} disagrees with its weight files; " + "; ".join(parts)
+            raise ValueError(msg)
+    return entries
+
+
+def read_tensor(entry: TensorEntry) -> np.ndarray:
+    """One tensor, read from its byte range in its file and nothing else, as float64."""
+    with entry.file.open("rb") as handle:
         handle.seek(entry.start)
         raw = handle.read(entry.end - entry.start)
     if entry.dtype == "BF16":
@@ -294,11 +356,12 @@ def read_packed(root: Path, entries: dict[str, TensorEntry], name: str) -> Packe
     """One packed layer, its codes unpacked and its scales and biases widened."""
     path = name.removesuffix(".weight")
     bits, group_size = layer_setting(root, path)
-    weights = root / "model.safetensors"
-    scales = read_tensor(weights, entries[f"{path}.scales"])
-    biases = read_tensor(weights, entries[f"{path}.biases"])
+    # Each from its own file: a shard can end between a layer's words and its
+    # scales.
+    scales = read_tensor(entries[f"{path}.scales"])
+    biases = read_tensor(entries[f"{path}.biases"])
     entry = entries[name]
-    with weights.open("rb") as handle:
+    with entry.file.open("rb") as handle:
         handle.seek(entry.start)
         raw = handle.read(entry.end - entry.start)
     rows = entry.shape[0]
@@ -526,7 +589,7 @@ def coarse_sides(left: Path, right: Path) -> list[str]:
     """
     coarse = []
     for label, root in (("left", left), ("right", right)):
-        entries = read_header(root / "model.safetensors")
+        entries = list(read_checkpoint(root).values())
         if packed_layers(entries):
             continue
         dtypes = {e.dtype for e in linear_weights(entries)}
@@ -542,8 +605,8 @@ def compare(left: Path, right: Path, group_size: int | None = None) -> list[Laye
     ``None``); a packed layer is grouped as its checkpoint says, and a group
     size given against it has to agree.
     """
-    left_all = {e.name: e for e in read_header(left / "model.safetensors")}
-    right_all = {e.name: e for e in read_header(right / "model.safetensors")}
+    left_all = read_checkpoint(left)
+    right_all = read_checkpoint(right)
     left_entries = {e.name: e for e in linear_weights(list(left_all.values()))}
     right_entries = {e.name: e for e in linear_weights(list(right_all.values()))}
     if set(left_entries) != set(right_entries):
@@ -566,7 +629,7 @@ def compare(left: Path, right: Path, group_size: int | None = None) -> list[Laye
                     raise ValueError(msg)
                 sides.append(layer)
             else:
-                sides.append(read_tensor(root / "model.safetensors", entries[name]))
+                sides.append(read_tensor(entries[name]))
         reports.append(_compare_sides(name, sides[0], sides[1], group_size, lattice, packed))
     return reports
 
@@ -762,7 +825,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"left   {left}\nright  {right}\n{grouping}")
     try:
         reports = compare(left, right, args.group_size)
-    except ValueError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         print(f"refusing: {exc}", file=sys.stderr)
         return 1
     report(reports, coarse_sides(left, right))

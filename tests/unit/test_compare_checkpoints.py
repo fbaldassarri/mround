@@ -7,7 +7,8 @@ script prints is checked against the arithmetic that produced the values, and
 on a safetensors file written by hand, so the reader is checked against the
 format rather than against a library that would hide a misread. MRound's packed
 checkpoints are written by hand too, their words packed here bit by bit, and
-once by MRound's own exporter where MLX is installed.
+once by MRound's own exporter where MLX is installed. A sharded checkpoint is
+the one file's bytes split across shards with an index, and is read as one.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from compare_checkpoints import (
     linear_weights,
     main,
     packed_layers,
+    read_checkpoint,
     read_header,
     read_packed,
     read_tensor,
@@ -342,6 +344,51 @@ def _checkpoint(
     return directory
 
 
+def _reshard(directory: Path, parts: list[list[str]]) -> list[str]:
+    """Split a checkpoint's one weight file into shards holding ``parts``, with an index.
+
+    The bytes of every tensor are copied as they are, so a shard holds what the
+    one file held, dtype for dtype; the names are the ones a sharded checkpoint
+    carries, ``model-00001-of-00002.safetensors`` and on.
+    """
+    source = directory / "model.safetensors"
+    entries = {entry.name: entry for entry in read_header(source)}
+    raw = source.read_bytes()
+    assert sorted(name for part in parts for name in part) == sorted(entries)
+    files = [f"model-{i:05d}-of-{len(parts):05d}.safetensors" for i in range(1, len(parts) + 1)]
+    weight_map = {}
+    for file, part in zip(files, parts, strict=True):
+        header: dict[str, object] = {}
+        payload = b""
+        for name in part:
+            entry = entries[name]
+            chunk = raw[entry.start : entry.end]
+            header[name] = {
+                "dtype": entry.dtype,
+                "shape": list(entry.shape),
+                "data_offsets": [len(payload), len(payload) + len(chunk)],
+            }
+            payload += chunk
+            weight_map[name] = file
+        encoded = json.dumps(header).encode("utf-8")
+        (directory / file).write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
+    source.unlink()
+    index = {"metadata": {"total_size": len(raw)}, "weight_map": weight_map}
+    (directory / "model.safetensors.index.json").write_text(json.dumps(index), encoding="utf-8")
+    return files
+
+
+_SHARDED = {
+    "model.embed_tokens.weight": np.zeros((10, 64), dtype=np.float32),
+    "model.layers.0.mlp.up_proj.weight": np.arange(128, dtype=np.float32).reshape(2, 64),
+    "model.layers.0.input_layernorm.weight": np.ones(64, dtype=np.float32),
+}
+_PARTS = [
+    ["model.embed_tokens.weight"],
+    ["model.layers.0.input_layernorm.weight", "model.layers.0.mlp.up_proj.weight"],
+]
+
+
 class TestReader:
     def test_reads_back_what_was_written(self, tmp_path: Path) -> None:
         tensors = {
@@ -354,7 +401,7 @@ class TestReader:
         entries = read_header(path)
         assert [e.name for e in entries] == sorted(tensors)
         for entry in entries:
-            np.testing.assert_array_equal(read_tensor(path, entry), tensors[entry.name])
+            np.testing.assert_array_equal(read_tensor(entry), tensors[entry.name])
         # Only the block's two dimensional weights count as linear layers.
         assert [e.name for e in linear_weights(entries)] == ["model.layers.0.mlp.up_proj.weight"]
 
@@ -365,12 +412,64 @@ class TestReader:
         _write_safetensors(path, {"model.layers.0.mlp.up_proj.weight": values}, "BF16")
         (entry,) = read_header(path)
         assert entry.dtype == "BF16"
-        decoded = read_tensor(path, entry)
+        decoded = read_tensor(entry)
         assert decoded[0, 0] == 1.0
         assert decoded[0, 1] == 0.5
         assert decoded[0, 3] == -2.5
         assert decoded[0, 2] == pytest.approx(1.0 / 3.0, rel=2**-8)
         assert decoded[0, 2] != 1.0 / 3.0
+
+    def test_reads_a_sharded_checkpoint_as_one(self, tmp_path: Path) -> None:
+        root = _checkpoint(tmp_path / "sharded", _SHARDED)
+        files = _reshard(root, _PARTS)
+        entries = read_checkpoint(root)
+        assert sorted(entries) == sorted(_SHARDED)
+        for file, part in zip(files, _PARTS, strict=True):
+            for name in part:
+                assert entries[name].file == root / file
+                np.testing.assert_array_equal(read_tensor(entries[name]), _SHARDED[name])
+
+    def test_one_file_needs_no_index(self, tmp_path: Path) -> None:
+        root = _checkpoint(tmp_path / "one", _SHARDED)
+        entries = read_checkpoint(root)
+        assert {entry.file for entry in entries.values()} == {root / "model.safetensors"}
+
+    def test_a_tensor_in_two_files_is_refused(self, tmp_path: Path) -> None:
+        # A shard of a larger checkpoint left beside a smaller one written
+        # without removing it: a loader would keep whichever copy it read last.
+        root = _checkpoint(tmp_path / "stale", _SHARDED)
+        _reshard(root, _PARTS)
+        stale = {"model.embed_tokens.weight": np.ones((10, 64), dtype=np.float32)}
+        _write_safetensors(root / "model-00003-of-00003.safetensors", stale)
+        with pytest.raises(ValueError, match=r"model\.embed_tokens\.weight in both"):
+            read_checkpoint(root)
+
+    def test_a_missing_shard_is_refused_by_the_index(self, tmp_path: Path) -> None:
+        root = _checkpoint(tmp_path / "partial", _SHARDED)
+        files = _reshard(root, _PARTS)
+        (root / files[1]).unlink()
+        with pytest.raises(ValueError, match="in no weight file"):
+            read_checkpoint(root)
+
+    def test_an_index_that_places_a_tensor_elsewhere_is_refused(self, tmp_path: Path) -> None:
+        root = _checkpoint(tmp_path / "moved", _SHARDED)
+        files = _reshard(root, _PARTS)
+        index_path = root / "model.safetensors.index.json"
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        index["weight_map"]["model.embed_tokens.weight"] = files[1]
+        index_path.write_text(json.dumps(index), encoding="utf-8")
+        with pytest.raises(ValueError, match="in another file than the index names"):
+            read_checkpoint(root)
+
+    def test_a_directory_without_weights_is_refused(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        root = _checkpoint(tmp_path / "empty", {})
+        (root / "model.safetensors").unlink()
+        with pytest.raises(FileNotFoundError, match="no weight file"):
+            read_checkpoint(root)
+        assert main([str(root), str(root)]) == 1
+        assert "refusing" in capsys.readouterr().err
 
     def test_finds_the_checkpoint_under_a_parent(self, tmp_path: Path) -> None:
         inner = _checkpoint(tmp_path / "reference" / "model-w2g64", {})
@@ -632,6 +731,35 @@ class TestPackedCheckpoints:
         assert "2 bit, 1 layers" in out
         assert "3 bit, 1 layers" in out
 
+    def test_a_sharded_checkpoint_compares_as_the_same_one_in_one_file(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The shard ends between a layer's words and its scales, which is
+        # where a split of consecutive tensors can fall.
+        rng = np.random.default_rng(2)
+        q = "model.layers.0.self_attn.q_proj"
+        layers = {q: (rng.integers(0, 4, size=(2, 64)), np.array([[0.5], [-0.25]]), 2, 64)}
+        dense = {"model.layers.0.mlp.down_proj.weight": rng.normal(size=(64, 48))}
+        one = _packed_checkpoint(tmp_path / "one", layers, dense)
+        sharded = _packed_checkpoint(tmp_path / "sharded", layers, dense)
+        _reshard(
+            sharded,
+            [
+                [f"{q}.weight", "model.layers.0.mlp.down_proj.weight"],
+                [f"{q}.scales", f"{q}.biases"],
+            ],
+        )
+        entries = read_checkpoint(sharded)
+        assert entries[f"{q}.weight"].file != entries[f"{q}.scales"].file
+        reports = {r.name: r for r in compare(one, sharded)}
+        assert reports[f"{q}.weight"].summary.identical_scale == 2
+        assert reports[f"{q}.weight"].differing == 0
+        assert reports[f"{q}.weight"].relative_disagreement == 0.0
+        assert reports["model.layers.0.mlp.down_proj.weight"].dense
+        assert reports["model.layers.0.mlp.down_proj.weight"].differing == 0
+        assert main([str(sharded), str(one)]) == 0
+        assert "flipped 0 (0.00%)" in capsys.readouterr().out
+
     def test_a_group_size_given_against_the_checkpoint_is_refused(self, tmp_path: Path) -> None:
         codes = np.zeros((1, 64), dtype=np.int64)
         layer = {"model.layers.0.self_attn.q_proj": (codes, np.array([[1.0]]), 2, 64)}
@@ -697,6 +825,33 @@ class TestMRoundExport:
             layer.values(), stored.repeat(32, axis=1) * np.array(codes).reshape(8, 64)
         )
         (report,) = compare(root, root)
+        assert report.width == bits
+        assert report.summary.identical_scale == report.summary.groups == 16
+        assert report.differing == 0
+
+    @pytest.mark.parametrize("bits", [2, 3, 4, 8])
+    def test_reads_the_shards_mround_wrote(self, tmp_path: Path, bits: int) -> None:
+        # 256 bytes of float32 norm, then the layer's 64 * bits bytes of words
+        # fill the first shard, and its scales and biases start the second.
+        mx = pytest.importorskip("mlx.core", reason="MRound's exporter is MLX's")
+        quantizer = pytest.importorskip("mround.core.quantizer")
+        mlx_export = pytest.importorskip("mround.formats.mlx_export")
+        schemes = pytest.importorskip("mround.schemes")
+
+        scheme = schemes.QuantScheme(bits=bits, group_size=32, symmetry=schemes.Symmetry.SYMMETRIC)
+        mx.random.seed(bits)
+        weight = mx.random.normal((8, 64))
+        codes, scale, zero_point = quantizer.quantize_codes(weight, None, scheme)
+        path = "model.layers.0.mlp.up_proj"
+        config = {"model_type": "qwen2", "hidden_size": 64, "num_hidden_layers": 1}
+        layer = {path: mlx_export.QuantizedLayer(codes, scale, zero_point, scheme)}
+        norm = {"model.layers.0.input_layernorm.weight": mx.ones((64,))}
+        for label, limit in (("one", mlx_export.SHARD_BYTES), ("shards", 256 + 64 * bits)):
+            mlx_export.export_mlx(tmp_path / label, norm, layer, config, shard_bytes=limit)
+        entries = read_checkpoint(tmp_path / "shards")
+        assert entries[f"{path}.weight"].file.name == "model-00001-of-00002.safetensors"
+        assert entries[f"{path}.scales"].file.name == "model-00002-of-00002.safetensors"
+        (report,) = compare(tmp_path / "one", tmp_path / "shards")
         assert report.width == bits
         assert report.summary.identical_scale == report.summary.groups == 16
         assert report.differing == 0

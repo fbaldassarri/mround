@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
@@ -44,10 +45,12 @@ if TYPE_CHECKING:
 __all__ = [
     "MLX_GROUP_SIZES",
     "MLX_SUPPORTED_BITS",
+    "SHARD_BYTES",
     "QuantizedLayer",
     "export_mlx",
     "narrow_codes",
     "require_mlx_representable",
+    "shard_names",
     "to_affine",
 ]
 
@@ -65,6 +68,16 @@ MLX_GROUP_SIZES: frozenset[int] = frozenset({32, 64, 128})
 RESERVED_CONFIG_KEYS: frozenset[str] = frozenset({"group_size", "bits", "mode"})
 
 GROUPED_NDIM = 3
+
+# The most a weight file holds before the next one starts: mlx-lm's limit,
+# five gigabytes counted in binary (its `max_file_size_gb << 30`), so that a
+# checkpoint large enough to be split is split where mlx-lm would split one of
+# its own, and the Hub's tooling sees the files it expects. ROAD-TO-1.0.md X2.
+SHARD_BYTES = 5 << 30
+
+# Every name a weight file of this export can have, the single file and the
+# shards, so that one written earlier into the same directory is recognized.
+_WEIGHT_FILE = re.compile(r"model(-\d{5}-of-\d{5})?\.safetensors")
 
 _DTYPES = {
     "bfloat16": mx.bfloat16,
@@ -222,6 +235,37 @@ def _tensors_for_layer(path: str, layer: QuantizedLayer, dtype: mx.Dtype) -> dic
     }
 
 
+def _shards(tensors: Mapping[str, mx.array], limit: int) -> list[dict[str, mx.array]]:
+    """Consecutive runs of ``tensors``, in order, each at most ``limit`` bytes.
+
+    A run closes when the next tensor would take it past the limit, so a shard
+    exceeds it only when one tensor does on its own, which then fills a shard.
+    """
+    shards: list[dict[str, mx.array]] = [{}]
+    held = 0
+    for name, tensor in tensors.items():
+        if shards[-1] and held + tensor.nbytes > limit:
+            shards.append({})
+            held = 0
+        shards[-1][name] = tensor
+        held += tensor.nbytes
+    return shards
+
+
+def shard_names(count: int) -> list[str]:
+    """The weight files of a checkpoint in ``count`` shards, as mlx-lm names them.
+
+    One file is ``model.safetensors``; more are numbered from one, five digits
+    each, ``model-00001-of-00002.safetensors`` and on.
+    """
+    if count < 1:
+        msg = f"a checkpoint has at least one weight file, not {count}"
+        raise ExportError(msg)
+    if count == 1:
+        return ["model.safetensors"]
+    return [f"model-{index:05d}-of-{count:05d}.safetensors" for index in range(1, count + 1)]
+
+
 def _quantization_block(quantized: Mapping[str, QuantizedLayer]) -> dict[str, Any]:
     """The config.json quantization block, with per-layer overrides.
 
@@ -271,6 +315,7 @@ def export_mlx(
     *,
     dtype: str = "bfloat16",
     extra_files: Mapping[str, str] | None = None,
+    shard_bytes: int = SHARD_BYTES,
 ) -> None:
     """Write a checkpoint that ``mlx-lm`` loads without modification.
 
@@ -278,9 +323,14 @@ def export_mlx(
     that mixed-precision models load correctly. A checkpoint that quietly
     assumes a uniform scheme would load and then generate nonsense.
 
-    Sharding is not implemented. mlx-lm splits at 5 GB per file; this writes one
-    file whatever the size, which loads the same way but is a deviation from
-    that convention whose effect on hub tooling is untested.
+    A checkpoint of more than :data:`SHARD_BYTES` is written in shards, as
+    mlx-lm writes one: consecutive runs of tensors, each at most five binary
+    gigabytes, in ``model-00001-of-0000N.safetensors`` and on, with
+    ``model.safetensors.index.json`` naming the file every tensor is in. One
+    under the limit stays a single ``model.safetensors``. A weight file an
+    earlier export left in ``output_dir`` under either form of name is removed
+    once the new ones are written, so that a smaller checkpoint written over a
+    larger one leaves no shard of the old one for a loader to read.
 
     Args:
         output_dir: Destination, created if absent.
@@ -293,6 +343,8 @@ def export_mlx(
         dtype: The model's floating dtype, shared by scales and biases.
         extra_files: Filename to text content, written alongside. Tokenizer
             files go here, so the result is self-contained.
+        shard_bytes: The most a weight file holds, :data:`SHARD_BYTES` unless
+            a test asks for less.
 
     Raises:
         ExportError: If the destination cannot be written, or a layer's tensors
@@ -314,7 +366,13 @@ def export_mlx(
         if collision in dense_weights:
             msg = f"{collision} appears as both a dense and a quantized tensor"
             raise ExportError(msg)
-        tensors.update(_tensors_for_layer(path, layer, target))
+        packed = _tensors_for_layer(path, layer, target)
+        # Packed here, a layer at a time. Left lazy, the save below evaluated
+        # every layer's widened codes at once, about four bytes a weight above
+        # the codes themselves: 26.9 GB on a 7B model, which took its export
+        # to 35.95 GB, past the 32 GB Mac it was tuned on (log0170).
+        mx.eval(*packed.values())
+        tensors.update(packed)
 
     merged = dict(config)
     block = _quantization_block(quantized)
@@ -323,10 +381,18 @@ def export_mlx(
     # compatibility with tooling that reads the Hugging Face convention.
     merged["quantization_config"] = block
 
+    shards = _shards(tensors, shard_bytes)
+    names = shard_names(len(shards))
+    weight_map = {
+        tensor: file for shard, file in zip(shards, names, strict=True) for tensor in shard
+    }
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
-        weights_file = output_dir / "model.safetensors"
-        mx.save_safetensors(str(weights_file), tensors, metadata={"format": "mlx"})
+        for shard, file in zip(shards, names, strict=True):
+            mx.save_safetensors(str(output_dir / file), shard, metadata={"format": "mlx"})
+        for stale in output_dir.iterdir():
+            if _WEIGHT_FILE.fullmatch(stale.name) and stale.name not in names:
+                stale.unlink()
         (output_dir / "config.json").write_text(json.dumps(merged, indent=2) + "\n")
         # The two metadata fields follow mlx-lm's own writer: total_size is
         # the byte count of every stored tensor, and total_parameters counts
@@ -349,7 +415,7 @@ def export_mlx(
                 "total_size": sum(t.nbytes for t in tensors.values()),
                 "total_parameters": total_parameters,
             },
-            "weight_map": dict.fromkeys(sorted(tensors), "model.safetensors"),
+            "weight_map": {name: weight_map[name] for name in sorted(weight_map)},
         }
         (output_dir / "model.safetensors.index.json").write_text(json.dumps(index, indent=2) + "\n")
         for name, content in (extra_files or {}).items():

@@ -1,6 +1,6 @@
 # MRound Technical Documentation
 
-**Version: 0.1.0a4. Last updated: 2026-10-17.**
+**Version: 0.1.0a5. Last updated: 2026-10-18.**
 
 This document specifies what MRound does and how it is built. It is the
 authoritative technical reference; where it disagrees with a comment in the
@@ -248,10 +248,10 @@ transfer logic is not optimized, it is deleted. What replaces it is a single
 hard ceiling shared with everything else on the machine, which makes the memory
 discipline within a block more important, not less.
 
-**The memory ceiling is high, and this is the project's central opportunity.** A
-128 GB Mac has more memory available to a quantization run than most single
-discrete GPUs. Because quantization is block-wise, the working set beyond the
-weights is governed by the largest block plus cached activations. Since
+**The memory ceiling is high, and this is the project's central opportunity.**
+A 128 GB Mac has more memory available to a quantization run than most single
+discrete GPUs. Because quantization goes block by block, the working set beyond
+the weights is governed by the largest block plus cached activations. Since
 2026-10-10 the weights are not the whole model either: a quantization run loads
 the model lazily, the block loop reads each block's weights when it reaches the
 block and releases its quantized layers once the quantized stream has passed
@@ -264,27 +264,28 @@ activations rather than the whole batch's while the step stays the batch's
 (section 5.5); on Metal that moves the checkpoint as far as a change of seed
 and costs about twice the time a block at eight pieces (ledger row 122), so it
 is for a model whose step does not fit whole. A mixed precision run's scoring
-pass runs the whole model backward. Since 2026-10-11 it holds one float32 copy of the block weights, the
-one the backward runs through, where it held one per candidate width plus one:
-each width keeps its searched grid and its perturbation is rebuilt when the
-layer's gradient arrives, and every block runs under gradient checkpointing, so
-the backward holds one block's activations (MEMORY.md D-036 and M1c). The
-whole model is still read for that pass. The scale search takes a layer a slice
-of rows at a time (section 5.10), the losses before and after a block's tuning
-are measured one batch at a time, and a mixed run loads the model lazily again
-after scoring, so its block loop holds what a uniform run's does. Every stage's
-peak is recorded in the run record, and since 2026-10-17 it is predicted
-before the run starts, from the model's configuration alone, by a rule fitted
-on those records and on a probe of synthetic blocks on Metal
-(`planner/memory.py`, `scripts/probe_memory.py`): a run predicted past 85
-percent of the Mac's memory is refused before anything is loaded, with the
-fewest pieces that would fit. On
-Qwen2.5-1.5B-Instruct at 2 bits the peak fell from 27.27 GB to 19.34 GB with
-the checkpoint unchanged to the byte (ledger rows 92 and 121). Whether a Mac
-can
-quantize models that require multi-GPU setups elsewhere is the project's
-headline claim, and it will be established by measurement in Phase 5, not
-asserted.
+pass runs the whole model backward. Since 2026-10-11 it holds one float32 copy
+of the block weights, the one the backward runs through, where it held one per
+candidate width plus one: each width keeps its searched grid and its
+perturbation is rebuilt when the layer's gradient arrives, and every block runs
+under gradient checkpointing, so the backward holds one block's activations
+(MEMORY.md D-036 and M1c). The whole model is still read for that pass. The
+scale search takes a layer a slice of rows at a time (section 5.10), the losses
+before and after a block's tuning are measured one batch at a time, and a mixed
+run loads the model lazily again after scoring, so its block loop holds what a
+uniform run's does. Every stage's peak is recorded in the run record, and since
+2026-10-17 it is predicted before the run starts, from the model's
+configuration alone, by a rule fitted on those records and on a probe of
+synthetic blocks on Metal (`planner/memory.py`, `scripts/probe_memory.py`): a
+run predicted past 85 percent of the Mac's memory is refused before anything is
+loaded, with the fewest pieces that would fit. Since 2026-10-18 the export
+packs one layer at a time; it had packed them all at once, which took the first
+full run of a 7B to 35.95 GB in its export, past a 32 GB Mac, where its block
+loop had peaked at 28.84 (MEMORY.md, log0170). On Qwen2.5-1.5B-Instruct at 2
+bits the peak fell from 27.27 GB to 19.34 GB with the checkpoint unchanged to
+the byte (ledger rows 92 and 121). Whether a Mac can quantize models that need
+several GPUs elsewhere is the project's headline claim, and it will be
+established by measurement in Phase 5, not asserted.
 
 **Compute is different in character.** The GPU is well suited to the elementwise
 and reduction work that dominates the tuning loop. The scale search in
@@ -983,6 +984,17 @@ range, and silently taking an absolute value would corrupt the weights.
 
 Per-layer bit widths and group sizes are recorded in the checkpoint
 configuration so that mixed-precision models load correctly.
+
+**The files.** The weights sit beside `config.json`, which carries the
+quantization block, and `model.safetensors.index.json`, which names the file
+each tensor is in. Up to five binary gigabytes (5,368,709,120 bytes, mlx-lm's
+limit) they are one `model.safetensors`. Past it they are split as mlx-lm splits
+its own: consecutive runs of tensors, each run at most the limit, in
+`model-00001-of-0000N.safetensors` and on; a tensor larger than the limit fills
+a file of its own. mlx-lm's loader reads every `model*.safetensors` in the
+directory and ignores the index, so an export into a directory that holds an
+earlier checkpoint removes, once its own files are written, the earlier weight
+files it did not overwrite, and nothing else.
 
 ### 6.3 GGUF
 

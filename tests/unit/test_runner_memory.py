@@ -318,3 +318,79 @@ class TestSearchInSlices:
         whole = peak()
         monkeypatch.setattr(scale_search, "_SLICE_BYTES", 128 * scale_search._CHUNK * 512 * 4)
         assert peak() < 0.3 * whole
+
+
+class _Outside(nn.Module):  # type: ignore[misc]
+    """The tensors outside a block stack: an embedding and an untied head."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(256, 128)
+        self.lm_head = nn.Linear(128, 256, bias=False)
+
+
+class TestAfterTheLoop:
+    """The remainder and the export, the two stages log0170 measured first."""
+
+    def _layers(self, count: int, rows: int, cols: int) -> dict[str, Any]:
+        scheme = QuantScheme(bits=2, group_size=64)
+        mx.random.seed(count)
+        layers = {}
+        for index in range(count):
+            codes = mlx_export.narrow_codes(
+                mx.random.randint(-2, 2, (rows, cols // 64, 64)).astype(mx.float32), scheme
+            )
+            scale = mx.random.uniform(0.01, 0.1, (rows, cols // 64, 1))
+            mx.eval(codes, scale)
+            layers[f"model.layers.{index}.mlp.up_proj"] = mlx_export.QuantizedLayer(
+                codes, scale, None, scheme
+            )
+        return layers
+
+    def test_the_export_packs_one_layer_at_a_time(self, tmp_path: Any) -> None:
+        # Twelve layers of a million weights each. Packed lazily and evaluated
+        # by the save, every layer's widened codes were live at once, about
+        # four and a half bytes a weight above the codes on this backend and
+        # 26.9 GB on a 7B model on Metal (log0170). A layer at a time, the
+        # export holds the packed checkpoint and the one layer being packed.
+        layers = self._layers(12, 512, 2048)
+        weights = 12 * 512 * 2048
+        base = mx.get_active_memory()
+        mx.reset_peak_memory()
+        mlx_export.export_mlx(tmp_path, {}, layers, {"model_type": "llama"})
+        held = mx.get_peak_memory() - base
+        packed = weights * (2 / 8 + 2 * 2 / 64)
+        assert held < packed + 12 * 512 * 2048
+        assert held < 1.5 * weights
+
+    def test_the_exported_file_holds_each_layer_as_packed_alone(self, tmp_path: Any) -> None:
+        layers = self._layers(3, 64, 256)
+        mlx_export.export_mlx(tmp_path, {}, layers, {"model_type": "llama"})
+        stored = mx.load(str(tmp_path / "model.safetensors"))
+        for path, layer in layers.items():
+            for name, tensor in mlx_export._tensors_for_layer(path, layer, mx.bfloat16).items():
+                assert _same_bits(stored[name], tensor), name
+
+    def test_a_dense_remainder_is_not_rounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Rounding a 7B model's embedding and head only to set them aside held
+        # 15.9 GB at once (log0170). Left dense, they are reported as such and
+        # nothing is computed for them.
+        from mround.core import quantizer  # noqa: PLC0415
+
+        model = _Outside()
+        bundle = type("Bundle", (), {"model": model})()
+        scheme = QuantScheme(bits=2, group_size=64)
+
+        def refuse(*_: Any, **__: Any) -> Any:
+            msg = "a dense remainder was rounded"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr(quantizer, "quantize_codes", refuse)
+        dense = list(api._round_to_nearest_layers(bundle, scheme, dense=True))
+        assert [path for path, _, _ in dense] == ["embed_tokens", "lm_head"]
+        assert all(layer is None for _, layer, _ in dense)
+        assert {reason for _, _, reason in dense} == {
+            "dense by request, to match a reference's coverage"
+        }
+        with pytest.raises(AssertionError, match="was rounded"):
+            list(api._round_to_nearest_layers(bundle, scheme))

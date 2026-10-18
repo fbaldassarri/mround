@@ -6,10 +6,11 @@
 model's configuration and the run's settings, so that a run that would swap is
 refused before it starts (ROAD-TO-1.0.md, M5). What it promises is the
 configurations it reproduces, so those are written out here as the Mac
-measured them, stage by stage at the last block: the five runs on the current
-tree (``result.memory.by_block_bytes`` in each run's ``mround_run.json``) and
-the eleven configurations of two synthetic blocks ``scripts/probe_memory.py``
-measured on Metal (log0169). The rule is held to each: every peak and every
+measured them, stage by stage at the last block: the six runs on the current
+tree (``result.memory.by_block_bytes`` in each run's ``mround_run.json``), the
+last of them the first full run of a 7B (log0170), and the eleven
+configurations of two synthetic blocks ``scripts/probe_memory.py`` measured on
+Metal (log0169). The rule is held to each: every peak and every
 step between 1.5 percent short and 9 percent over, since its step was fitted
 to err toward refusing, and a real run's peak within 1.2 percent; the passes
 without a gradient within 6 percent either way; the measurements within a
@@ -137,8 +138,9 @@ def _recorded(
     *,
     mixed: bool = False,
 ) -> Measured:
-    # A mixed run's widest candidate was 4 bits, which only the export reads.
-    run = RunShape(micro_batches=pieces, bits=4 if mixed else 2, mixed=mixed)
+    # A mixed run's widest candidate was 4 bits, which only the export reads,
+    # and every run recorded left the remainder dense (``denserem``).
+    run = RunShape(micro_batches=pieces, bits=4 if mixed else 2, mixed=mixed, dense_remainder=True)
     return Measured(f"{log} {directory}", _config_shape(model), run, last_block, peak, entrance)
 
 
@@ -268,6 +270,24 @@ MEASURED = [
             "advance": 20_888_258_954,
         },
         26_284_167_666,
+    ),
+    _recorded(
+        "log0170",
+        "parity-qwen2.5-7b-instruct-2bit-g64-denserem-mb4-tree1017",
+        "Qwen/Qwen2.5-7B-Instruct",
+        4,
+        6_728_187_912,
+        {
+            "targets": 20_640_762_250,
+            "search": 22_766_733_782,
+            "score": 23_573_275_166,
+            "tune": 28_842_578_418,
+            "commit": 20_061_151_650,
+            "advance": 20_888_390_026,
+        },
+        # The block loop's peak. The run's own was its export's, 35.95 GB, an
+        # export that packed every layer at once until 2026-10-18.
+        28_842_578_418,
     ),
     _probed(
         QWEN_7B,
@@ -509,33 +529,39 @@ class TestEveryMeasurement:
 
     @pytest.mark.parametrize("measured", RECORDS, ids=str)
     def test_after_the_loop_stays_under_the_loop(self, measured: Measured) -> None:
-        # Estimated by accounting, not yet measured: the claim the module makes
-        # about them is that they do not set the peak on these runs.
+        # Measured once, on log0170, before the export packed a layer at a
+        # time and a dense remainder went unrounded: the claim the module makes
+        # about them now is that they do not set the peak on these runs.
         prediction = predict_memory(measured.model, measured.run)
         loop = max(prediction.stages[stage] for stage in LOOP)
         assert prediction.stages["remainder"] < loop
         assert prediction.stages["export"] < loop
 
     @pytest.mark.parametrize(
-        ("probed", "recorded"),
+        ("probed", "recorded", "unlike"),
         [
-            ("log0169 2048x11008 8x2048 in 1", "log0156"),
-            ("log0169 3584x18944 8x2048 in 8", "log0155"),
+            ("log0169 2048x11008 8x2048 in 1", "log0156", ()),
+            ("log0169 3584x18944 8x2048 in 8", "log0155", ("score",)),
+            ("log0169 3584x18944 8x2048 in 4", "log0170", ("score", "commit")),
         ],
-        ids=["3B whole", "7B in eight pieces"],
+        ids=["3B whole", "7B in eight pieces", "7B in four pieces"],
     )
     def test_the_probe_holds_what_a_real_run_holds_above_the_accounting(
-        self, probed: str, recorded: str
+        self, probed: str, recorded: str, unlike: tuple[str, ...]
     ) -> None:
         # Two synthetic blocks against the last block of a real run, each with
         # what the accounting gives subtracted: the same working set, to the
-        # megabyte, in every stage but the 7B's measurements in pieces, where
-        # the run's sixteen batches held 0.24 GB more than the probe's two.
+        # megabyte, in every stage but two. The measurements in pieces held
+        # 0.06 to 0.24 GB more over a run's sixteen batches than over the
+        # probe's two; and a block that kept its tuning, as log0170's did,
+        # commits with four bytes a weight less than one reverted to nearest,
+        # as every block of a two step run is (0.96 GB at 7B, and 0.32 at 3B
+        # between log0157 and log0156).
         probe, run = _named(probed), _named(recorded)
         probe_floor = sum(predict_memory(probe.model, probe.run).parts.values())
         run_floor = sum(predict_memory(run.model, run.run).parts.values())
         for stage in LOOP:
-            if stage == "score" and probe.run.micro_batches > 1:
+            if stage in unlike:
                 continue
             above_probe = probe.last_block[stage] - probe_floor
             above_run = run.last_block[stage] - run_floor
@@ -747,16 +773,48 @@ class TestRunSettings:
             ), stage
 
     def test_the_stages_after_the_loop_are_accounting(self) -> None:
-        # Every block's codes, the tensors outside the blocks at the model's
-        # width, and four float32 copies of the embedding for its rounding;
-        # or the packed checkpoint at 2 bits with a scale and a bias a group.
+        # Every block's codes and the tensors outside the blocks at the model's
+        # width. Rounded, the remainder adds 7.4 float32 copies of the
+        # embedding, the search's slices over it and the head's codes once the
+        # head is done; the export adds the packed checkpoint at 2 bits with a
+        # scale and a bias a group, the codes and packing of the embedding and
+        # head, and eight bytes a weight of the layer being packed, here the
+        # embedding.
         shape = _shape("Qwen/Qwen2.5-7B-Instruct")
         stages = predict_memory(shape, RunShape(bits=2)).stages
+        embedding = shape.embedding_weights
+        codes = shape.layers * shape.block_weights * (1 + 4 / 64)
+        outside = 2 * embedding * 2
+        assert stages["remainder"] == round(
+            codes + outside + 7.4 * 4 * embedding + 1.46e9 + embedding * (1 + 4 / 64)
+        )
+        packed = shape.layers * shape.block_weights * (2 / 8 + 2 * 2 / 64)
+        rounded = 2 * embedding * (1 + 4 / 64 + 2 / 8 + 2 * 2 / 64)
+        assert stages["export"] == round(codes + outside + rounded + packed + 8 * embedding)
+
+    def test_a_dense_remainder_holds_nothing_of_its_own(self) -> None:
+        # Left at the model's width, nothing is rounded, and the export packs
+        # the block layers alone, the largest an MLP projection.
+        shape = _shape("Qwen/Qwen2.5-7B-Instruct")
+        stages = predict_memory(shape, RunShape(bits=2, dense_remainder=True)).stages
         codes = shape.layers * shape.block_weights * (1 + 4 / 64)
         outside = 2 * shape.embedding_weights * 2
-        assert stages["remainder"] == round(codes + outside + 16 * shape.embedding_weights)
+        assert stages["remainder"] == round(codes + outside)
         packed = shape.layers * shape.block_weights * (2 / 8 + 2 * 2 / 64)
-        assert stages["export"] == round(codes + outside + packed)
+        largest = shape.hidden * shape.intermediate
+        assert stages["export"] == round(codes + outside + packed + 8 * largest)
+
+    def test_the_rounding_log0170_set_aside_is_what_the_rule_gives_a_rounded_remainder(
+        self,
+    ) -> None:
+        # log0170 rounded its head and embedding before leaving them dense,
+        # and dropped each result, so its remainder, 25.02 GB, is a rounded
+        # remainder's without the head's codes kept. The rule errs high on it,
+        # as it does on the steps, and by no more than a tenth.
+        shape = _shape("Qwen/Qwen2.5-7B-Instruct")
+        rounded = predict_memory(shape, RunShape(bits=2, micro_batches=4)).stages["remainder"]
+        kept = shape.embedding_weights * (1 + 4 / 64)
+        assert 1.0 < (rounded - kept) / 25_022_058_920 < 1.1
 
     def test_a_zero_point_costs_four_bytes_a_group(self) -> None:
         shape = _shape("Qwen/Qwen2.5-3B-Instruct")

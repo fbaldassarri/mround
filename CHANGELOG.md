@@ -6,6 +6,80 @@ Notable changes to MRound, newest first. The format follows
 caveat that public interfaces may change between pre-release versions without a
 major bump. Each version is dated by its release tag.
 
+## 0.1.0a5
+
+The release that fixes what took the first full run of a 7 billion parameter
+model past a 32 GB Mac's memory once its block loop was done. That run,
+Qwen2.5-7B-Instruct at 2 bits in four pieces under 0.1.0a4, held its block loop
+to 28.84 GB, where the memory check had predicted 28.71, and then went past the
+Mac's memory writing its checkpoint. The export now packs one layer at a time
+and writes the same bytes, a remainder left dense is no longer rounded first,
+and the memory check predicts the two stages after the block loop from what they
+hold now. A checkpoint past five binary gigabytes, as a 7 billion parameter
+model at 4 bits is, is written in shards, as `mlx-lm` writes its own. The ledger
+is unchanged at 129 rows.
+
+### Added
+
+A checkpoint past five binary gigabytes is written in shards, as mlx-lm writes
+its own: consecutive runs of tensors of at most 5,368,709,120 bytes each, in
+`model-00001-of-0000N.safetensors` and on, with `model.safetensors.index.json`
+naming the file each tensor is in, where MRound wrote one `model.safetensors`
+whatever the size. A smaller checkpoint is one file, byte for byte as before.
+Because mlx-lm loads every `model*.safetensors` in a directory, an export over
+an earlier one removes the earlier weight files it does not overwrite. The first
+checkpoint to need it is a 7 billion parameter model at 4 bits with its head
+kept dense, about 5.8 GB.
+
+`scripts/compare_checkpoints.py` reads a checkpoint across its shards, each
+tensor from the file that holds it, and refuses a directory in which a tensor is
+in two files or the index disagrees with the files.
+
+### Fixed
+
+The export packs one layer at a time. It built every layer's packed codes
+lazily and evaluated them all as it saved, which held about four bytes a weight
+above the codes at once: the first full run of a 7B model, Qwen2.5-7B-Instruct
+at 2 bits in four pieces, peaked at 28.84 GB in its block loop and at 35.95 GB
+in its export, past the 32 GB Mac it ran on. Packed a layer at a time, the
+export holds the packed checkpoint beside the one layer being packed, and
+writes the same bytes.
+
+A run with `dense_remainder` no longer rounds the tensors outside the blocks
+before leaving them dense. It rounded each one and set the result aside, which
+held 15.9 GB at once for that 7B model's embedding and head and spent two scale
+searches over them.
+
+The memory check predicts both stages from what they hold now, rule
+`2026-10-18`: a remainder left dense holds the codes and the tensors and
+nothing more, a rounded one 7.4 float32 copies of the tensor being rounded and
+the scale search's slices over it, and the export the packed checkpoint beside
+eight bytes a weight of the layer being packed. `api.predict_memory` takes
+`dense_remainder`, as `api.quantize` does. On that 7B run the rule had
+predicted the block loop's peak to half a percent, 28.71 GB against 28.84, and
+the two stages after it at 17.83 and 11.15 GB, where they reached 25.02 and
+35.95.
+
+### Tests
+
+`tests/unit/test_runner_memory.py` holds the export to one layer's widened
+codes and to the bytes each layer packs to alone, and a dense remainder to
+rounding nothing; each test fails with its fix removed.
+`tests/unit/test_memory_rule.py` holds the rule to the 7B run as well, six runs
+and the probe's eleven configurations, and to that run's discarded rounding,
+and `tests/unit/test_memory_check.py` and `tests/unit/test_api_run_record.py`
+hold the dense remainder to staying dense and to reaching the prediction. 68 of
+69 mutations of the rule and 18 of 18 of its wiring fail them.
+
+`tests/unit/test_mlx_formats.py` holds the shards to mlx-lm's limit, names and
+index, a tensor past the limit to a shard of its own, and an export over earlier
+ones to leaving none of their weight files, and has mlx-lm's own loader read a
+tiny model from five shards as from one file, the first test in which mlx-lm
+loads an MRound checkpoint. `tests/unit/test_compare_checkpoints.py` reads
+sharded checkpoints, MRound's among them, and refuses the inconsistent ones.
+Thirteen mutations of the new code all fail them. The published suite collects
+1,364 tests where MLX is installed, against 1,329 at 0.1.0a4.
+
 ## 0.1.0a4
 
 The release that makes memory something a run predicts rather than discovers. A
