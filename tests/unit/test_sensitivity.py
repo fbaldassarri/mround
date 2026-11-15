@@ -20,12 +20,16 @@ from typing import ClassVar
 import numpy as np
 import pytest
 
+from mround.exceptions import SchemeError
 from mround.planner.allocator import allocate_bits
 from mround.planner.sensitivity import (
+    GRADIENT_SOURCES,
+    OWN_WIDTH_FROM_WEIGHTS,
     SENSITIVITY_BATCH_TOKENS,
     SENSITIVITY_SAMPLES,
     SENSITIVITY_SEQ_LEN,
     delta_loss,
+    gradient_source_for,
     groups_per_row,
     mixed_budget_bits,
     score_layer_options,
@@ -73,6 +77,44 @@ class TestDeltaLoss:
         # A change here is a deliberate departure, not a tidy-up.
         assert SENSITIVITY_SAMPLES == 128
         assert SENSITIVITY_SEQ_LEN == 1024
+
+
+class TestGradientSourceForSize:
+    """D-053: the default scoring gradients follow the size of what is scored."""
+
+    @pytest.mark.parametrize(
+        ("scored_weights", "expected"),
+        [
+            # The block layers each model's mixed runs score, by name: the
+            # three measured ones (Q-018 and Q-017) and the two the rule
+            # extrapolates to.
+            (106_168_320, "widest"),  # SmolLM2-135M-Instruct, measured
+            (357_826_560, "widest"),  # Qwen2.5-0.5B-Instruct, measured
+            (1_310_195_712, "widest"),  # Qwen2.5-1.5B-Instruct, not measured
+            (2_774_532_096, "own_width"),  # Qwen2.5-3B-Instruct, measured
+            (6_525_288_448, "own_width"),  # Qwen2.5-7B-Instruct, not measured
+        ],
+    )
+    def test_auto_takes_each_width_s_own_gradients_from_the_threshold_up(
+        self, scored_weights: int, expected: str
+    ) -> None:
+        assert gradient_source_for("auto", scored_weights) == expected
+
+    def test_the_threshold_itself_takes_each_width_s_own(self) -> None:
+        assert gradient_source_for("auto", OWN_WIDTH_FROM_WEIGHTS) == "own_width"
+        assert gradient_source_for("auto", OWN_WIDTH_FROM_WEIGHTS - 1) == "widest"
+
+    @pytest.mark.parametrize("named", ["widest", "own_width"])
+    def test_a_named_source_is_taken_as_given_at_any_size(self, named: str) -> None:
+        # A caller who names a source gets it, which is how the harness and the
+        # A/Bs measure the other one on purpose.
+        assert gradient_source_for(named, 1) == named
+        assert gradient_source_for(named, 10 * OWN_WIDTH_FROM_WEIGHTS) == named
+
+    def test_an_unknown_source_is_refused_with_the_three_it_may_be(self) -> None:
+        with pytest.raises(SchemeError, match="'auto', 'own_width', 'widest'"):
+            gradient_source_for("fp", 1)
+        assert GRADIENT_SOURCES == ("auto", "own_width", "widest")
 
 
 class TestScoringBatchSize:

@@ -186,8 +186,8 @@ def _parse() -> argparse.Namespace:
         default=None,
         help=(
             "target average code bits per weight over the block layers, which "
-            "engages mixed precision: a sensitivity scoring pass (one backward "
-            "at the widest candidate under the default --scoring-gradients), "
+            "engages mixed precision: a sensitivity scoring pass (where its "
+            "gradients are taken is --scoring-gradients), "
             "then exact allocation under the size budget the average "
             "implies. An integer average competes under exactly the uniform "
             "width's ceiling, so --avg-bits 3 against a --bits 3 run is the "
@@ -205,18 +205,19 @@ def _parse() -> argparse.Namespace:
             "measured decision (MEMORY.md D-035): a menu without the "
             "intermediate width forces extreme demotions and lost to uniform "
             "at the standard recipe. Under own_width each width costs one "
-            "scoring pass; under widest, the default, the menu shares one"
+            "scoring pass; under widest the menu shares one"
         ),
     )
     parser.add_argument(
         "--scoring-gradients",
-        choices=["own_width", "widest"],
-        default="widest",
+        choices=["auto", "own_width", "widest"],
+        default="auto",
         help=(
-            "where the sensitivity gradients come from. widest, the default, "
-            "won the A/B on both averages tested (MEMORY.md D-034); own_width "
-            "is the reference's procedure, kept as the reference-faithful "
-            "control. Read only with --avg-bits"
+            "where the sensitivity gradients come from. auto, the default, "
+            "takes own_width when the layers the plan scores hold at least "
+            "2.5 billion weights and widest below (MEMORY.md D-053): widest "
+            "won at 135 million and 0.5 billion parameters, own_width, the "
+            "reference's procedure, at 3 billion. Read only with --avg-bits"
         ),
     )
     parser.add_argument(
@@ -336,8 +337,8 @@ def _run_names(args: Any, widths: list[int]) -> tuple[str, str]:
     if args.avg_bits is not None:
         joined = "-".join(str(width) for width in widths)
         stem = f"{slug}-avg{args.avg_bits:g}bit-o{joined}-g{args.group_size}"
-        if args.scoring_gradients == "widest":
-            stem += "-widest"
+        if args.scoring_gradients in ("auto", "widest"):
+            stem += f"-{args.scoring_gradients}"
         if args.remainder_bits is not None:
             stem += f"-r{args.remainder_bits}"
         banner = (

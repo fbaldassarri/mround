@@ -20,13 +20,16 @@ scoring time to mirror. The search runs without importance, since no activation
 statistics exist before calibration ever flows, which is the same policy the
 remainder tensors already follow (D-030).
 
-A second divergence is measured rather than structural (MEMORY.md D-034): the
-API's default ``gradient_source`` is ``"widest"``, one backward at the widest
-candidate scoring every width's perturbation, because gradients taken through
-a network the lowest width has destroyed starve the late blocks, and the A/B
-showed it on both averages tested. This module's own default stays
-``"own_width"``, the reference-faithful primitive, so the reference procedure
-remains one call away and the oracle tests keep their meaning.
+A second divergence is measured rather than structural, and it depends on the
+model's size (MEMORY.md D-034 and D-053): ``"widest"``, one backward at the
+widest candidate scoring every width's perturbation, because on small models
+gradients taken through a network the lowest width has destroyed starve the
+late blocks, and the reference's own procedure from 2.5 billion scored weights
+up, where the widest width's gradients were measured to lose. The API resolves
+which one a run takes (:func:`mround.planner.sensitivity.gradient_source_for`);
+this module takes either as given, and its own default stays ``"own_width"``,
+the reference-faithful primitive, so the reference procedure remains one call
+away and the oracle tests keep their meaning.
 
 MLX has no per-tensor backward hooks, so where the reference grabs ``dL/dW_q``
 with a gradient hook on the quantize-dequantize output, this module makes the
@@ -60,14 +63,19 @@ from mlx import nn
 
 from mround.core.quantizer import fake_quantize
 from mround.core.scale_search import search_scales
-from mround.pipeline.blocks import checkpointed_blocks, discover_blocks, iter_quantizable_linears
+from mround.pipeline.blocks import (
+    BlockRef,
+    checkpointed_blocks,
+    discover_blocks,
+    iter_quantizable_linears,
+)
 from mround.pipeline.device import peak_memory
 from mround.schemes import DEFAULT_EPS_FP32, QuantScheme, ScaleInit
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
-__all__ = ["ScoringProgress", "SensitivityScores", "score_widths"]
+__all__ = ["ScoringProgress", "SensitivityScores", "eligible_block_layers", "score_widths"]
 
 
 @dataclasses.dataclass(slots=True)
@@ -98,8 +106,9 @@ class ScoringProgress:
 
     Attributes:
         stage: ``"perturbations"`` for the up-front quantize-dequantize and
-            difference construction, ``"backward"`` for one batch of the
-            gradient loop.
+            difference construction of ``widest``, ``"width"`` for the
+            quantized copy ``own_width`` builds before each width's
+            backwards, ``"backward"`` for one batch of the gradient loop.
         index: How many units of this stage are finished.
         total: How many there are. For the backward loop this counts batches
             once per gradient pass, so it is the batch count under ``widest``
@@ -113,6 +122,13 @@ class ScoringProgress:
             projection of the backward loop has to start its clock where the
             loop starts, or its first lines read several times too high and
             fall on every line after, which looks like a run speeding up.
+            Under ``own_width`` each width's copy is built between its
+            backwards, so this counts the backwards alone (log0288 read
+            102,194 seconds left at its first backward, against 3,474 to come).
+        preparations_left: Copies still to be built after this point, each
+            taking about ``preparation_seconds``; nonzero only under
+            ``own_width``.
+        preparation_seconds: The mean time a copy has taken so far.
     """
 
     stage: str
@@ -121,6 +137,8 @@ class ScoringProgress:
     seconds: float
     peak_memory_bytes: int
     stage_seconds: float = 0.0
+    preparations_left: int = 0
+    preparation_seconds: float = 0.0
 
     @property
     def projected_seconds(self) -> float:
@@ -131,8 +149,13 @@ class ScoringProgress:
 
     @property
     def remaining_seconds(self) -> float:
-        """What the projection says is still to come in this stage."""
-        return max(0.0, self.projected_seconds - self.stage_seconds)
+        """What the projection says is still to come in this stage.
+
+        The backwards left at the rate the finished ones ran, plus the copies
+        still to be built at the rate the built ones took.
+        """
+        left = max(0.0, self.projected_seconds - self.stage_seconds)
+        return left + self.preparations_left * self.preparation_seconds
 
     def describe(self) -> str:
         """One line for a progress log."""
@@ -145,6 +168,11 @@ class ScoringProgress:
             return (
                 f"  scoring: perturbations for {self.total} widths ready "
                 f"in {self.seconds:.1f}s{peak}"
+            )
+        if self.stage == "width":
+            return (
+                f"  scoring: quantized copy {self.index} of {self.total} ready "
+                f"at {self.seconds:.0f}s{peak}"
             )
         return (
             f"  scoring: backward {self.index}/{self.total} at {self.seconds:.0f}s, "
@@ -246,7 +274,7 @@ def _scores_from_own_width(
     schemes: dict[int, QuantScheme],
     eps: float,
     by_block: Sequence[Sequence[str]],
-    report: Callable[[str, int, int], None],
+    report: Callable[..., None],
     restore: Callable[[], None],
 ) -> dict[str, dict[int, float]]:
     """The reference's procedure: each width's backward at its own model.
@@ -262,8 +290,9 @@ def _scores_from_own_width(
     scores: dict[str, dict[int, float]] = {path: {} for path in paths}
     passes = len(batches) * len(schemes)
     done = 0
-    for width in sorted(schemes):
+    for built, width in enumerate(sorted(schemes), start=1):
         anchor = _anchor(originals, schemes[width], eps, _grids(originals, schemes[width]))
+        report("width", built, len(schemes))
 
         def own(path: str, weight32: mx.array, anchor: dict[str, mx.array] = anchor) -> mx.array:
             return anchor[path] - weight32
@@ -272,7 +301,7 @@ def _scores_from_own_width(
         for batch in batches:
             _accumulate(grad_fn(anchor, batch), by_block, originals, {width: own}, accumulated)
             done += 1
-            report("backward", done, passes)
+            report("backward", done, passes, len(schemes) - built)
         for path in paths:
             scores[path][width] = float(accumulated[width][path])
         # The model's layers and the closure hold this width's copy too, and
@@ -290,7 +319,7 @@ def _scores_from_widest(
     schemes: dict[int, QuantScheme],
     eps: float,
     by_block: Sequence[Sequence[str]],
-    report: Callable[[str, int, int], None],
+    report: Callable[..., None],
     restore: Callable[[], None],
 ) -> dict[str, dict[int, float]]:
     """One backward per batch at the widest candidate, every width scored on it.
@@ -336,6 +365,63 @@ def _scores_from_widest(
     }
 
 
+def eligible_block_layers(
+    model: nn.Module,
+    group_size: int,
+    *,
+    expected_blocks: int | None = None,
+) -> tuple[list[BlockRef], dict[str, nn.Module], list[tuple[str, str]], list[list[str]]]:
+    """The block layers a mixed run plans over, and the ones it cannot.
+
+    Exactly the layers the block loop tunes, keyed by the same full dotted
+    paths: every quantizable linear of every block whose input dimension
+    divides into whole groups. Shared by :func:`score_widths` and by a run
+    given its plan rather than scoring one (:func:`mround.api.quantize`'s
+    ``plan``), so that a plan is checked against the layers a scored one
+    would have covered, no more and no fewer. Reading a layer's shape does not
+    read its weights, so on a lazily loaded model this touches no data.
+
+    Args:
+        model: A loaded MLX model.
+        group_size: Elements per quantization group; ``-1`` is per channel.
+        expected_blocks: Block count from the model configuration, checked
+            against what discovery finds.
+
+    Returns:
+        The blocks discovered, the eligible layers by path, the skipped ones
+        with the reason, and the eligible paths grouped by block in model
+        order.
+
+    Raises:
+        ValueError: If no layer in any block can be quantized at this group
+            size.
+        ArchitectureError: If the block stack cannot be located.
+    """
+    blocks = discover_blocks(model, expected=expected_blocks)
+    eligible: dict[str, nn.Module] = {}
+    skipped: list[tuple[str, str]] = []
+    by_block: list[list[str]] = []
+    for block in blocks:
+        by_block.append([])
+        for name, linear in iter_quantizable_linears(block.module):
+            path = f"{block.name}.{name}"
+            if linear.weight.shape[-1] % group_size:
+                skipped.append(
+                    (
+                        path,
+                        f"last dimension {linear.weight.shape[-1]} is not a "
+                        f"multiple of {group_size}",
+                    )
+                )
+                continue
+            eligible[path] = linear
+            by_block[-1].append(path)
+    if not eligible:
+        msg = "no layer in any block can be quantized at this group size"
+        raise ValueError(msg)
+    return blocks, eligible, skipped, by_block
+
+
 def score_widths(
     model: nn.Module,
     batches: Sequence[mx.array],
@@ -374,23 +460,24 @@ def score_widths(
             perturbation come from. ``"own_width"`` is the reference's
             procedure: each width gets its own backward on the model quantized
             at that width. It is this function's default so that a bare call
-            measures the control; the entry points in :mod:`mround.api` pass
-            ``"widest"``, the measured default (MEMORY.md D-034). ``"widest"``
-            takes one backward per batch at the widest candidate and scores
-            every width's perturbation against it,
-            targeting the mechanism the first measured allocation exposed
-            (MEMORY.md D-033): gradients taken through a network the lowest
-            width has largely destroyed discriminate poorly and starve the
-            late blocks. At the widest width the two modes coincide exactly,
-            gradients and perturbations both, which is the invariant the tests
-            pin.
+            measures the reference's procedure; the entry points in
+            :mod:`mround.api` pass whichever D-053's size rule resolves, unless
+            their caller names one. ``"widest"`` takes one backward per batch
+            at the widest candidate and scores every width's perturbation
+            against it, targeting the mechanism the first measured allocation
+            exposed (MEMORY.md D-033): gradients taken through a network the
+            lowest width has largely destroyed discriminate poorly and starve
+            the late blocks. At the widest width the two modes coincide
+            exactly, gradients and perturbations both, which is the invariant
+            the tests pin.
         progress: Called with a :class:`ScoringProgress` after the up-front
-            perturbations (a stage only ``widest`` has) and after every
-            gradient pass. Scoring at the budget
-            the reference recommends for 2-bit schemes takes minutes, 323 to
-            388 seconds on Qwen2.5-0.5B (rows 39 to 47) and 1512 at the old
-            batch of 8 (row 38), and produces no other output, so a caller
-            with a console should pass something here.
+            perturbations (a stage only ``widest`` has), after each width's
+            quantized copy (a stage only ``own_width`` has) and after every
+            gradient pass. Scoring at the budget the reference recommends for
+            2-bit schemes takes minutes, 323 to 388 seconds on Qwen2.5-0.5B
+            (rows 39 to 47) and 1512 at the old batch of 8 (row 38), and
+            produces no other output, so a caller with a console should pass
+            something here.
 
     Returns:
         Scores, shapes, skipped layers, and wall clock.
@@ -408,28 +495,9 @@ def score_widths(
         raise ValueError(msg)
     started = time.perf_counter()
 
-    blocks = discover_blocks(model, expected=expected_blocks)
-    eligible: dict[str, nn.Module] = {}
-    skipped: list[tuple[str, str]] = []
-    by_block: list[list[str]] = []
-    for block in blocks:
-        by_block.append([])
-        for name, linear in iter_quantizable_linears(block.module):
-            path = f"{block.name}.{name}"
-            if linear.weight.shape[-1] % base_scheme.group_size:
-                skipped.append(
-                    (
-                        path,
-                        f"last dimension {linear.weight.shape[-1]} is not a "
-                        f"multiple of {base_scheme.group_size}",
-                    )
-                )
-                continue
-            eligible[path] = linear
-            by_block[-1].append(path)
-    if not eligible:
-        msg = "no layer in any block can be quantized at this group size"
-        raise ValueError(msg)
+    blocks, eligible, skipped, by_block = eligible_block_layers(
+        model, base_scheme.group_size, expected_blocks=expected_blocks
+    )
 
     originals = {path: layer.weight for path, layer in eligible.items()}
     shapes = {
@@ -456,22 +524,23 @@ def score_widths(
     # MEMORY.md D-036 and M1c.
     schemes = {int(width): dataclasses.replace(base_scheme, bits=int(width)) for width in widths}
 
-    current_stage = ""
-    stage_started = started
+    # Time is charged to what each report closes: everything since the last
+    # report went into the work this one announces. So the backward clock
+    # holds the backwards alone, even under ``own_width``, whose copies are
+    # built between them, and the copies' own clock gives the time one takes.
+    spent = {"backward": 0.0, "preparation": 0.0}
+    prepared = 0
     last_report = started
 
-    def report(stage: str, index: int, total: int) -> None:
-        nonlocal current_stage, stage_started, last_report
+    def report(stage: str, index: int, total: int, preparations_left: int = 0) -> None:
+        nonlocal last_report, prepared
         if progress is None:
             return
         now = time.perf_counter()
-        if stage != current_stage:
-            # A stage starts when the previous one last reported: the first
-            # backward report arrives only after a whole batch, so the loop's
-            # clock has to begin at the end of the perturbation stage rather
-            # than at its own first line.
-            current_stage = stage
-            stage_started = last_report
+        kind = "backward" if stage == "backward" else "preparation"
+        spent[kind] += now - last_report
+        if kind == "preparation":
+            prepared += 1
         last_report = now
         progress(
             ScoringProgress(
@@ -480,7 +549,9 @@ def score_widths(
                 total=total,
                 seconds=now - started,
                 peak_memory_bytes=peak_memory(),
-                stage_seconds=now - stage_started,
+                stage_seconds=spent[kind],
+                preparations_left=preparations_left,
+                preparation_seconds=spent["preparation"] / prepared if prepared else 0.0,
             )
         )
 

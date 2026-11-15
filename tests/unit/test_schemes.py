@@ -143,14 +143,39 @@ class TestWithBits:
 
 
 class TestLearningRate:
-    """DOCUMENTATION.md section 5.4."""
+    """DOCUMENTATION.md section 5.4 and MEMORY.md D-052: the reference's rule."""
 
-    @pytest.mark.parametrize(("bits", "constant"), [(8, 1.0), (4, 1.0), (3, 2.0), (2, 2.0)])
-    def test_derived_rate_scales_inversely_with_iterations(
-        self, bits: int, constant: float
+    @pytest.mark.parametrize(
+        ("bits", "iters", "constant"),
+        [
+            (8, 200, 1.0),
+            (4, 200, 1.0),
+            (3, 200, 1.0),
+            (2, 200, 1.0),
+            (3, 999, 1.0),
+            (2, 999, 1.0),
+            (8, 1000, 1.0),
+            (4, 1000, 1.0),
+            (3, 1000, 2.0),
+            (2, 1000, 2.0),
+            (2, 4000, 2.0),
+        ],
+    )
+    def test_derived_rate_is_the_references_rule(
+        self, bits: int, iters: int, constant: float
     ) -> None:
-        config = TuningConfig(iters=200)
-        assert config.resolved_lr(bits) == pytest.approx(constant / 200)
+        # The constant doubles below 4 bits only at a budget of 1000 steps or
+        # more, as the reference's does; below it every width starts at
+        # 1.0 / iters.
+        config = TuningConfig(iters=iters)
+        assert config.resolved_lr(bits) == pytest.approx(constant / iters)
+
+    def test_the_standard_budget_starts_a_two_bit_run_at_the_references_rate(self) -> None:
+        # What D-052 changed: 0.005 at the standard 200 steps, where until
+        # 2026-10-31 a 2 bit run started at 0.01. Exactly the float a rate of
+        # 0.005 given by hand is, so the two tune alike to the bit.
+        assert TuningConfig().resolved_lr(2) == float("0.005")
+        assert TuningConfig().resolved_lr(2) == TuningConfig(lr=0.005).resolved_lr(2)
 
     def test_explicit_rate_overrides_the_derivation(self) -> None:
         config = TuningConfig(iters=200, lr=0.01)
@@ -169,9 +194,14 @@ class TestLearningRate:
         # Exactly c/2 * (1 + 1/iters); the 0.5 is the limit, not the value.
         assert excursion == pytest.approx(0.5 * (1 + 1 / iters), rel=1e-9)
 
-    def test_low_bit_widths_get_twice_the_excursion(self) -> None:
-        config = TuningConfig(iters=200)
+    def test_low_bit_widths_get_twice_the_excursion_from_1000_steps(self) -> None:
+        config = TuningConfig(iters=1000)
         assert config.resolved_lr(2) == pytest.approx(2 * config.resolved_lr(4))
+
+    @pytest.mark.parametrize("iters", [50, 200, 999])
+    def test_below_1000_steps_every_width_gets_the_same_excursion(self, iters: int) -> None:
+        config = TuningConfig(iters=iters)
+        assert config.resolved_lr(2) == config.resolved_lr(4)
 
     def test_minmax_rate_defaults_to_the_main_rate(self) -> None:
         config = TuningConfig(iters=200)

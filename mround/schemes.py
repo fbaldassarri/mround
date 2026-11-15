@@ -24,6 +24,7 @@ from mround.exceptions import SchemeError
 __all__ = [
     "DEFAULT_EPS_FP32",
     "DEFAULT_EPS_LOW_PRECISION",
+    "LONG_BUDGET_ITERS",
     "LOW_BIT_THRESHOLD",
     "SUPPORTED_BITS",
     "QuantScheme",
@@ -38,10 +39,17 @@ __all__ = [
 SUPPORTED_BITS: frozenset[int] = frozenset({2, 3, 4, 5, 6, 7, 8})
 
 # Below this width, quantization behaves differently enough to change defaults:
-# the learning rate constant doubles, outlier suppression switches on, and
-# api.default_scale_init picks the searched scale on symmetric schemes. Named
-# because it appears in more than one place and the three uses must agree.
+# outlier suppression switches on, api.default_scale_init picks the searched
+# scale on symmetric schemes, and at a budget of LONG_BUDGET_ITERS steps or more
+# the learning rate constant doubles. Named because it appears in more than one
+# place and the three uses must agree.
 LOW_BIT_THRESHOLD: int = 4
+
+# The step budget from which a width below LOW_BIT_THRESHOLD starts at twice the
+# rate, as the reference's own rule does (its SignRound configuration, the same
+# rule from 0.14.2 to 0.16.1). Below it every width starts at ``1.0 / iters``.
+# MEMORY.md D-052.
+LONG_BUDGET_ITERS: int = 1000
 
 # Scale epsilon, guarding against all-zero groups. DOCUMENTATION.md section 5.2.
 DEFAULT_EPS_FP32: float = 1e-8
@@ -299,16 +307,19 @@ class TuningConfig:
     def resolved_lr(self, bits: int) -> float:
         """Learning rate for ``bits``, honoring an explicit override.
 
-        The derived rate is ``c / iters`` with ``c = 2.0`` below 4 bits and
-        ``1.0`` at or above. Since every step moves a parameter with a nonzero
-        gradient by exactly the current rate and the rate decays linearly to zero,
-        total excursion is about ``c / 2``, which for 4 bits and above is exactly
-        the half code bound on the rounding perturbation. DOCUMENTATION.md
-        section 5.4.
+        The derived rate is the reference's: ``c / iters`` with ``c = 2.0``
+        below 4 bits at a budget of 1000 steps or more, and ``1.0`` otherwise,
+        so the standard 200 steps start every width at ``0.005``. Since every
+        step moves a parameter with a nonzero gradient by exactly the current
+        rate and the rate decays linearly to zero, total excursion is about
+        ``c / 2``, which for ``c = 1.0`` is exactly the half code bound on the
+        rounding perturbation. Until MEMORY.md D-052 the constant doubled below
+        4 bits at every budget. DOCUMENTATION.md section 5.4.
         """
         if self.lr is not None:
             return self.lr
-        return (2.0 if bits < LOW_BIT_THRESHOLD else 1.0) / self.iters
+        doubled = bits < LOW_BIT_THRESHOLD and self.iters >= LONG_BUDGET_ITERS
+        return (2.0 if doubled else 1.0) / self.iters
 
     def resolved_minmax_lr(self, bits: int) -> float:
         """Clipping-coefficient learning rate, defaulting to the main rate."""

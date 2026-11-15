@@ -18,6 +18,9 @@ pytest.importorskip("mlx.core", reason="the runner is the MLX layer")
 from mround.pipeline.runner import block_recipe
 
 CONFIG = TuningConfig(iters=200)
+# A budget at which the rate depends on the width: below 4 bits the constant
+# doubles only from 1000 steps on (D-052).
+LONG = TuningConfig(iters=1000)
 MIXED = {"attn": 2, "mlp": 3, "head": 4}
 
 
@@ -32,14 +35,23 @@ class TestBlockRecipe:
         assert all(rate == pytest.approx(1.0 / 200) for rate in rates.values())
 
     def test_per_layer_gives_each_width_its_own_rate(self) -> None:
-        suppress, rates = block_recipe(CONFIG, 4, MIXED, per_layer=True)
-        assert rates["attn"] == pytest.approx(2.0 / 200)
-        assert rates["mlp"] == pytest.approx(2.0 / 200)
-        assert rates["head"] == pytest.approx(1.0 / 200)
+        suppress, rates = block_recipe(LONG, 4, MIXED, per_layer=True)
+        assert rates["attn"] == pytest.approx(2.0 / 1000)
+        assert rates["mlp"] == pytest.approx(2.0 / 1000)
+        assert rates["head"] == pytest.approx(1.0 / 1000)
         # The loss is one objective over the whole block, so the outlier rule
         # cannot be per layer. It follows the narrowest width present, which is
         # what produces the errors suppression exists to mask.
         assert suppress is True
+
+    def test_at_the_standard_budget_the_readings_part_only_on_the_outlier_rule(self) -> None:
+        # Since D-052 every width starts the standard 200 steps at 1.0/iters,
+        # so under a mixed plan the per layer reading moves the outlier rule
+        # and no rate.
+        off = block_recipe(CONFIG, 4, MIXED, per_layer=False)
+        on = block_recipe(CONFIG, 4, MIXED, per_layer=True)
+        assert off[1] == on[1]
+        assert (off[0], on[0]) == (False, True)
 
     def test_the_base_width_still_decides_a_block_with_no_tunable_layers(self) -> None:
         suppress, rates = block_recipe(CONFIG, 2, {}, per_layer=True)

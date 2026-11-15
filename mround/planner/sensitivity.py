@@ -29,12 +29,14 @@ signature changed from the stub it replaced, which imagined the planner
 receiving whole gradient dictionaries.
 
 Where the gradients come from is the pipeline's business, specified in
-DOCUMENTATION.md section 1.5: by default one causal-LM backward per batch at
-the widest candidate width, scoring every width's perturbation against it
-(MEMORY.md D-034), with the reference implementation's procedure, one backward
-per width on the model round-to-nearest quantized at that width, kept as the
-``own_width`` control. Scores from different calibration passes are not
-comparable, and nothing here can detect that mistake.
+DOCUMENTATION.md section 1.5: either one causal-LM backward per batch at the
+widest candidate width, scoring every width's perturbation against it
+(``widest``, MEMORY.md D-034), or the reference implementation's procedure, one
+backward per width on the model round-to-nearest quantized at that width
+(``own_width``). Which one a run takes by default is decided here, by the size
+of what it scores (:func:`gradient_source_for`, D-053). Scores from different
+calibration passes are not comparable, and nothing here can detect that
+mistake.
 
 Specification: DOCUMENTATION.md section 1.5.
 """
@@ -45,6 +47,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from mround.exceptions import SchemeError
 from mround.planner.allocator import LayerOption
 
 if TYPE_CHECKING:
@@ -55,10 +58,13 @@ if TYPE_CHECKING:
     from mround.schemes import QuantScheme
 
 __all__ = [
+    "GRADIENT_SOURCES",
+    "OWN_WIDTH_FROM_WEIGHTS",
     "SENSITIVITY_BATCH_TOKENS",
     "SENSITIVITY_SAMPLES",
     "SENSITIVITY_SEQ_LEN",
     "delta_loss",
+    "gradient_source_for",
     "groups_per_row",
     "mixed_budget_bits",
     "score_layer_options",
@@ -102,6 +108,52 @@ SENSITIVITY_SEQ_LEN: int = 1024
 # 1024 printed nothing for so long it looked stuck (log0059), then completed
 # (log0060, ledger row 38) with its scoring pass at 52.08 GB on a 32 GB machine.
 SENSITIVITY_BATCH_TOKENS: int = 2048
+
+# Where a mixed run's scoring gradients are taken when nobody says, by the
+# size of what it scores: from this many weights in the scored layers up, at
+# each width's own quantized point, the reference's procedure, and below it at
+# the widest width (MEMORY.md D-053, from Q-018). At mixed 2.5 on the means of
+# three seeds, every seed alike, each width's own gradients scored 18.1
+# percent worse than the widest width's on SmolLM2-135M-Instruct, whose scored
+# layers hold 106 million weights, and 10.9 worse on Qwen2.5-0.5B-Instruct
+# (358 million), and 5.29 better on Qwen2.5-3B-Instruct (2.77 billion): ledger
+# rows 207 to 224, and 181 to 186 against 201 to 206. The threshold sits just
+# below the one size measured on the reference's side of the crossover, so the
+# default changes only where a measurement says it should;
+# Qwen2.5-1.5B-Instruct, 1.31 billion, stays on the widest gradients until it
+# is measured, and Qwen2.5-7B-Instruct, 6.53 billion, takes its own.
+OWN_WIDTH_FROM_WEIGHTS: int = 2_500_000_000
+
+# What a caller may ask for: ``"auto"`` applies the rule above, the other two
+# are taken as given.
+GRADIENT_SOURCES: tuple[str, ...] = ("auto", "own_width", "widest")
+
+
+def gradient_source_for(requested: str, scored_weights: int) -> str:
+    """The scoring gradients a mixed run takes: the ones asked for, or by size.
+
+    Args:
+        requested: ``"auto"``, the default of the entry points in
+            :mod:`mround.api`, which applies D-053's rule; ``"widest"`` or
+            ``"own_width"`` are taken as given.
+        scored_weights: Weights in the layers the run scores, the block layers
+            its plan covers.
+
+    Returns:
+        ``"own_width"`` or ``"widest"``.
+
+    Raises:
+        SchemeError: If ``requested`` is none of :data:`GRADIENT_SOURCES`.
+    """
+    if requested not in GRADIENT_SOURCES:
+        msg = (
+            "sensitivity_gradients must be one of "
+            f"{', '.join(repr(source) for source in GRADIENT_SOURCES)}, got {requested!r}"
+        )
+        raise SchemeError(msg)
+    if requested != "auto":
+        return requested
+    return "own_width" if int(scored_weights) >= OWN_WIDTH_FROM_WEIGHTS else "widest"
 
 
 def scoring_batch_size(
@@ -153,9 +205,10 @@ def delta_loss(
             candidate width.
         gradient: Loss gradient with respect to the quantize-dequantized
             weight, from a calibration backward pass: taken at the widest
-            candidate width under the API's default,
-            ``sensitivity_gradients="widest"``, and at this candidate's own
-            width under ``"own_width"`` (DOCUMENTATION.md section 1.5).
+            candidate width under ``sensitivity_gradients="widest"`` and at
+            this candidate's own width under ``"own_width"``, the API's
+            default, ``"auto"``, choosing between them by the size of what is
+            scored (DOCUMENTATION.md section 1.5).
 
     Returns:
         The scalar score. Comparable across layers only when the gradients come

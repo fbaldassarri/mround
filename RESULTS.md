@@ -21,24 +21,30 @@ AutoRound is the reference implementation of the method MRound implements. It
 is a serious piece of work by the people who published the method, and beating
 it is the only comparison that means anything.
 
-One setting is matched in three tables only, and it is the reference's own
+One setting is matched in six tables only, and it is the reference's own
 algorithm. AutoRound keeps its implementation of SignRound v2's tuning, a
 searched initial scale and, below 4 bits, the outlier suppressed loss, behind an
 option, `enable_alg_ext`, that is off by default, and its documentation says to
-turn it on to reproduce the SignRound v2 results. Three tables have been run
-both ways. At 2 bits on Qwen2.5-0.5B-Instruct, rows 105 to 107 with the option
-on beside rows 88, 33 and 89 with it off: MRound is 9.25 percent ahead with it
-on and 30.63 with it off (Uniform 2 bits, below, with what that pair leaves
-open). At 2 bits on Qwen2.5-3B-Instruct, rows 127 to 129 beside rows 124 to
-126: 1.25 percent ahead with it on, behind on one seed of three, so the two are
-level, and 13.51 with it off (Uniform 2 bits, below). At mixed 2.5 on
-Qwen2.5-0.5B-Instruct, rows 108 to 110 beside rows 43, 45 and 46: 12.88 percent
-ahead with it on and 20.68 with it off (Mixed precision, below). Every other
-reference arm in this document ran with it off. The mixed precision arms use
-the reference's own allocator for that method, AutoScheme, with the option and
-without it. So outside those three tables every comparison below sets MRound
-against the reference's default tuning, how far the option would move the
-reference there has not been measured yet, and no table, those three included,
+turn it on to reproduce the SignRound v2 results. Six tables have been run both
+ways. At 2 bits on Qwen2.5 at 0.5, 1.5, 3 and 7 billion parameters, with MRound
+at its current learning rate (rows 151 to 174): MRound is 9.10, 6.38, 3.43 and
+2.05 percent ahead with the option on and 30.52, 17.21, 15.42 and 1.96 with it
+off, ahead on every seed of all eight (Uniform 2 bits, below, with what the
+pairs leave open). At mixed 2.5 on Qwen2.5-0.5B-Instruct, rows 108 to 110 beside
+rows 43, 45 and 46: 12.88 percent ahead with it on and 20.68 with it off (Mixed
+precision, below). At mixed 2.5 on Qwen2.5-3B-Instruct, MRound as it ships, its
+own allocation scored with a gradient at each width's own quantized point as the
+reference scores (rows 201 to 206): 2.02 percent ahead with it on and 6.71 with
+it off, on every seed. Before its default took those gradients at that size,
+MRound took them at the widest width and was 3.46 percent behind with the option
+on and 1.50 ahead with it off (rows 181 to 186), the one table where it missed
+the bar; tuned at the reference's own allocation it was 0.75 and 5.51 percent
+ahead (rows 195 to 200), so the gap was the gradient its allocator scored with.
+Every other reference arm in this document ran with it off. The mixed precision
+arms use the reference's own allocator for that method, AutoScheme, with the
+option and without it. So outside those six tables every comparison below sets
+MRound against the reference's default tuning, how far the option would move the
+reference there has not been measured yet, and no table, those six included,
 sets MRound against the configuration the reference's documentation recommends
 at 2 bits (What these numbers do not show).
 
@@ -58,32 +64,33 @@ the rows on either side of that boundary prove it: they report the same model's
 original perplexity as the same seventeen significant figures, which two
 different token counts could not produce.
 
-**Zero shot task accuracy** has been measured on five tables so far, all on
-Qwen2.5-0.5B-Instruct and all below: the 4 bit one with its group size pair,
-and the 2 bit and mixed 2.5 ones against each of the reference's two tunings.
+**Zero shot task accuracy** has been measured on seven tables so far, all on
+Qwen2.5-0.5B-Instruct and all below: the 4 bit one with its group size pair, the
+mixed 2.5 ones against each of the reference's two tunings, and the 2 bit ones
+against each, on MRound's current checkpoints and on those of its earlier rate.
 Against its default tuning the suite shows the perplexity lead clearly at 2
 bits, equivocally at mixed 2.5, and not at 4 bits, where the perplexity itself
-calls a tie; against its own SignRound v2 tuning it puts MRound 0.49 points
-ahead at 2 bits and 0.10 at mixed 2.5. The
-suite is the reference implementation's
-own default less wikitext: twelve tasks through `lm_eval` 0.4.12's task
-definitions, full sets, zero shot, with `acc` the headline on every task. One
-evaluator, MRound's, scores the original and both checkpoints in one process,
-each after reproducing its row's perplexity to a millionth. It was checked
-against `lm_eval`'s own evaluator on the same documents before any number was
-recorded (`scripts/check_zeroshot.py`, whose output is not a ledger row): run
-on the Mac's CPU against `lm_eval` in float64, every request
-agreed to 2.2e-4 nats and every right or wrong call was identical (twenty
-documents a task on SmolLM2-135M-Instruct, five on Qwen2.5-0.5B-Instruct).
-The recorded scores ran on the Apple GPU, as every perplexity here does, where
-MLX's float32 matrix product takes its inputs at about float16's precision.
-The same check run there moved each request by about a hundredth of a nat and
-changed two of its 1,800 calls, both between answers within two thousandths of
-a nat of each other; at that rate the noise moves a task's accuracy by much
-less than the task's standard error, and it is stated here rather than
-removed. It is not a draw between runs: the original model, scored again
-beside each of the eight comparisons, gave the same figures to the last digit
-every time.
+calls a tie; against its own SignRound v2 tuning it puts MRound 0.13 points
+ahead at 2 bits on the current checkpoints, behind on two seeds of three, where
+those of the earlier rate were 0.49 ahead on every seed, and 0.10 ahead at mixed
+2.5. The suite is the reference implementation's own default less wikitext:
+twelve tasks through `lm_eval` 0.4.12's task definitions, full sets, zero shot,
+with `acc` the headline on every task. One evaluator, MRound's, scores the
+original and both checkpoints in one process, each after reproducing its row's
+perplexity to a millionth. It was checked against `lm_eval`'s own evaluator on
+the same documents before any number was recorded (`scripts/check_zeroshot.py`,
+whose output is not a ledger row): run on the Mac's CPU against `lm_eval` in
+float64, every request agreed to 2.2e-4 nats and every right or wrong call was
+identical (twenty documents a task on SmolLM2-135M-Instruct, five on
+Qwen2.5-0.5B-Instruct). The recorded scores ran on the Apple GPU, as every
+perplexity here does, where MLX's float32 matrix product takes its inputs at
+about float16's precision. The same check run there moved each request by about
+a hundredth of a nat and changed two of its 1,800 calls, both between answers
+within two thousandths of a nat of each other; at that rate the noise moves a
+task's accuracy by much less than the task's standard error, and it is stated
+here rather than removed. It is not a draw between runs: the original model,
+scored again beside each of the twenty comparisons, gave the same figures to the
+last digit every time.
 
 **Both sides quantize the same tensors.** The reference leaves the language
 model head at full precision. On a model that ties its embedding to its head,
@@ -336,19 +343,50 @@ three seeds on one named setup where the claim depends on it.
 | SmolLM2-135M-Instruct | 17.5077 | 22.1758 | 18.9400 | **-14.59 percent** | +3.00 percent | row 54 |
 
 At 4 bits on the larger model the margin is the size of the reference's own
-spread, and its sign depends on what is held equal. MRound is 1.27 percent
-ahead at the same group size and 0.50 percent behind at the same bytes (the
-group size table below), while the reference's own four productions of this
-configuration at this seed, on two CPUs and one GPU under two releases, span
-1.17 percent (15.0777 to 15.2537, rows 30, 85, 95 and 83). At the same group
-size MRound's checkpoint is ahead of all four of them, by 0.34 to 1.49
-percent; at the same bytes all four are ahead of MRound's, by 0.28 to 1.45
-percent. This row is a tie, not a win. It faces auto-round 0.15.0 on
-the Linux machine's CPU and MRound's current tree, as the 2 bit tables do;
-until 2026-09-28 it was row 30, 15.0777 against 15.0807, the reference under
-0.14.2 on the Mac's CPU against an older MRound tree, which stays in the
-ledger as the comparison. On the smaller model, where 4 bits is a harder ask
-relative to the model's capacity, MRound is ahead by 14.59 percent.
+spread, and its sign depends on what is held equal. MRound is 1.27 percent ahead
+at the same group size and 0.50 percent behind at the same bytes (the group size
+table below), while the reference's own four productions of this configuration
+at this seed, on two CPUs and one GPU under two releases, span 1.17 percent
+(15.0777 to 15.2537, rows 30, 85, 95 and 83). At the same group size MRound's
+checkpoint is ahead of all four of them, by 0.34 to 1.49 percent; at the same
+bytes all four are ahead of MRound's, by 0.28 to 1.45 percent. This row is a
+tie, not a win. It faces auto-round 0.15.0 on the Linux machine's CPU and
+MRound's current tree, as the 2 bit tables do; until 2026-09-28 it was row 30,
+15.0777 against 15.0807, the reference under 0.14.2 on the Mac's CPU against an
+older MRound tree, which stays in the ledger as the comparison. On 2026-11-12
+MRound's current tree wrote row 95's checkpoint again to the byte, and the same
+comparison gave the same three figures (row 233), so the row stands for the tree
+as it is. On the smaller model, where 4 bits is a harder ask relative to the
+model's capacity, MRound is ahead by 14.59 percent.
+
+**Above half a billion parameters, against round-to-nearest only.** No reference
+arm exists at 4 bits above half a billion parameters, so Qwen2.5-1.5B-Instruct,
+Qwen2.5-3B-Instruct and Qwen2.5-7B-Instruct were set against round-to-nearest at
+the same width, group size and coverage, which rounds the same tensors with
+nothing learned, all three arms scored by the evaluator of the tables here (seed
+42, the tensors outside the block stack dense, the 7B with every step in four
+pieces). Row 95's checkpoint went through the same comparison:
+
+| model | original | round-to-nearest | MRound | MRound against it | its loss taken back | ledger |
+|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct | 14.3248 | 17.0562 | 15.0260 | -11.90 percent | 74.3 percent | rows 230 and 234 |
+| Qwen2.5-1.5B-Instruct | 9.6651 | 10.7108 | 10.1055 | -5.65 percent | 57.9 percent | row 235 |
+| Qwen2.5-3B-Instruct | 8.5719 | 9.5814 | 8.8948 | -7.17 percent | 68.0 percent | row 236 |
+| Qwen2.5-7B-Instruct | 7.3308 | 7.6402 | 7.5829 | -0.75 percent | 18.5 percent | row 232 |
+
+Each pair of checkpoints holds the same bytes. The last column is the share of
+round-to-nearest's loss over the original that MRound takes back. MRound's own
+loss over the original falls steadily with size, 4.89, 4.56, 3.77 and 3.44
+percent; round-to-nearest's does not, 19.07, 10.82, 11.78 and 4.22, and the
+share follows it rather than the size, so the small share at 7 billion reads as
+a model that leaves 4 bits less to take back. Every MRound checkpoint started
+from searched scales, as every MRound arm here does, so each gap holds the scale
+search as well as the tuning. This states no bar, which is the reference's own
+result, and no arm of the reference exists at these sizes and this width:
+whether it takes back more is open. The runs took 4,465, 10,410, 21,643 and
+57,008 s on a 32 GB Mac, the 0.5B run 24 percent longer than the same checkpoint
+took in September, which says how much the machine itself varies, and peaked at
+11.49, 14.25, 20.07 and 28.84 GB (rows 233 to 236 and 232).
 
 **Group size.** Every other row in this document is at group size 64. The
 reference's own default is 128, so both sides were run at both on
@@ -425,9 +463,122 @@ task between two checkpoints is not confined to low widths.
 
 ## Uniform 2 bits
 
-Three seeds on Qwen2.5-0.5B-Instruct (original 14.3248), changing only the
-calibration draw, the reference at auto-round 0.15.0 and at its default tuning
-on every row:
+**At the reference's learning rate, on one tree.** Below 4 bits MRound follows
+the reference's learning rate rule since 0.1.0a6 ([CHANGELOG.md](CHANGELOG.md)):
+at the standard 200 steps a 2 bit run starts at `1.0 / iters`, where MRound
+started at `2.0 / iters`. Every 2 bit table was measured again at it, four sizes
+of Qwen2.5 at three seeds each, each MRound checkpoint scored against the
+reference's arms of its own seed under both of the reference's tunings
+(auto-round 0.15.0; at 0.5 billion parameters on the Linux machine's CPU in
+float32, above it on its integrated GPU under bfloat16 autocast, uncompiled).
+MRound leaves the tensors outside the block stack dense, and runs each step of
+the 7 billion parameter model in four pieces, which draws another checkpoint, as
+a change of seed does:
+
+| model | seed | MRound | the reference's SignRound v2 | MRound against it | the reference's default | MRound against it | ledger |
+|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct | 42 | 41.1546 | 47.7076 | -13.74 percent | 57.0002 | -27.80 percent | rows 159, 160 |
+| | 43 | 37.3463 | 40.2103 | -7.12 percent | 49.3534 | -24.33 percent | rows 161, 162 |
+| | 44 | 39.2488 | 41.6129 | -5.68 percent | 63.1077 | -37.81 percent | rows 163, 164 |
+| | **mean** | **39.2499** | 43.1769 | **-9.10 percent** | 56.4871 | **-30.52 percent** | |
+| Qwen2.5-1.5B-Instruct | 42 | 20.8777 | 21.9922 | -5.07 percent | 24.1720 | -13.63 percent | rows 165, 166 |
+| | 43 | 20.3012 | 21.6616 | -6.28 percent | 23.6660 | -14.22 percent | rows 167, 168 |
+| | 44 | 20.0450 | 21.7452 | -7.82 percent | 26.1110 | -23.23 percent | rows 169, 170 |
+| | **mean** | **20.4080** | 21.7997 | **-6.38 percent** | 24.6497 | **-17.21 percent** | |
+| Qwen2.5-3B-Instruct | 42 | 17.2495 | 17.4454 | -1.12 percent | 20.1332 | -14.32 percent | rows 151, 152 |
+| | 43 | 16.2552 | 17.6121 | -7.70 percent | 19.8525 | -18.12 percent | rows 155, 156 |
+| | 44 | 16.9670 | 17.2059 | -1.39 percent | 19.6877 | -13.82 percent | rows 157, 158 |
+| | **mean** | **16.8239** | 17.4211 | **-3.43 percent** | 19.8912 | **-15.42 percent** | |
+| Qwen2.5-7B-Instruct | 42 | 13.5454 | 13.9075 | -2.60 percent | 13.7508 | -1.49 percent | rows 173, 174 |
+| | 43 | 12.7227 | 13.0874 | -2.79 percent | 12.9913 | -2.07 percent | rows 153, 154 |
+| | 44 | 12.9915 | 13.0846 | -0.71 percent | 13.3012 | -2.33 percent | rows 171, 172 |
+| | **mean** | **13.0865** | 13.3598 | **-2.05 percent** | 13.3478 | **-1.96 percent** | |
+
+The originals score 14.3248, 9.6651, 8.5719 and 7.3308, and MRound's checkpoints
+are 3.02, 4.91, 6.19 and 5.08 percent larger than the reference's packed at the
+same width. The 3 billion parameter arms and the 7 billion one at seed 43 ran
+before the change, with the rate given by hand; the tree that made the change
+writes at its default the same checkpoint it writes with that rate given by
+hand, to the byte (checked at 0.5 billion parameters, seed 42), so they are its
+own. Round-to-nearest at 2 bits, the same tensors rounded with nothing learned,
+scores 3,306.8675 at 7 billion parameters (row 231, set there against the seed
+42 checkpoint of MRound's earlier rate, 14.8169), so at this width the scale
+search and the tuning together take back nearly all that rounding loses, as at
+the smaller sizes.
+
+MRound is ahead on every seed of every size against both tunings, 24
+comparisons. Against the reference's own SignRound v2 tuning the lead shrinks as
+the model grows, 9.10, 6.38, 3.43 and 2.05 percent, and only at 1.5 billion are
+the ranges apart, MRound's worst draw 3.62 percent ahead of the reference's
+best; at 0.5, 3 and 7 billion MRound's worst draw is 2.35, 0.25 and 3.52 percent
+behind the reference's best, so those three support the paired statement,
+MRound ahead on each of three calibration draws against the reference running
+the same method, and not a separation. Against the default tuning the ranges
+are apart from 0.5 to 3 billion and overlap at 7 billion, where the reference's
+two tunings are level, 13.3598 and 13.3478, and MRound is about 2 percent ahead
+of both. The means are ratios of the means; averaging the per seed ratios moves
+none by more than 0.54 points. In the checkpoint distance the scoring runs print
+(their own output, not a ledger figure), MRound's weights sit 0.297 to 0.312
+from the reference's SignRound v2 weights of the same seed at every size, as far
+as the reference's own checkpoints sit from each other when only the seed or the
+release changes, 0.30 to 0.34.
+
+**Zero shot tasks on these checkpoints**, the three seeds of the 0.5 billion
+parameter table, each MRound checkpoint against both of the reference's arms of
+its seed (rows 175 to 180, scored on the Apple GPU as described above), accuracy
+in percent, the reference and MRound as the mean of the three seeds and each per
+seed column the range of the difference across them:
+
+| task | original | MRound | the reference's default | MRound against it | per seed | the reference's SignRound v2 | MRound against it | per seed |
+|---|---|---|---|---|---|---|---|---|
+| mean of the twelve | 48.42 | 38.67 | 36.97 | +1.70 points | +1.37 to +1.87 | 38.53 | +0.13 points | -0.72 to +1.22 |
+| LAMBADA | 50.09 | 23.18 | 15.25 | +7.94 | +7.20 to +9.08 | 23.00 | +0.19 | -1.05 to +0.95 |
+| BoolQ | 67.89 | 61.60 | 57.35 | +4.25 | +4.10 to +4.40 | 60.47 | +1.13 | -0.98 to +4.62 |
+| ARC Easy | 65.57 | 50.06 | 45.99 | +4.07 | +3.41 to +4.88 | 49.69 | +0.36 | -0.84 to +2.31 |
+| OpenBookQA | 24.00 | 17.67 | 15.07 | +2.60 | +1.80 to +3.40 | 17.87 | -0.20 | -1.00 to +0.20 |
+| PIQA | 70.40 | 61.68 | 60.08 | +1.60 | +1.36 to +1.80 | 60.74 | +0.94 | +0.44 to +1.31 |
+| HellaSwag | 40.59 | 31.35 | 30.27 | +1.07 | +0.72 to +1.45 | 31.09 | +0.26 | +0.21 to +0.29 |
+| ARC Challenge | 30.80 | 21.73 | 20.73 | +1.00 | -0.09 to +2.39 | 20.62 | +1.11 | +0.09 to +2.82 |
+| MMLU | 45.84 | 23.37 | 22.97 | +0.40 | +0.10 to +0.98 | 23.41 | -0.05 | -1.03 to +0.95 |
+| TruthfulQA MC1 | 26.81 | 26.89 | 26.89 | 0.00 | -0.37 to +0.49 | 25.74 | +1.14 | +0.61 to +1.47 |
+| TruthfulQA MC2 | 41.82 | 44.03 | 44.34 | -0.31 | -1.76 to +1.73 | 42.97 | +1.06 | -0.01 to +1.82 |
+| Winogrande | 55.80 | 50.99 | 52.04 | -1.05 | -1.74 to -0.55 | 52.07 | -1.08 | -2.76 to +0.71 |
+| RTE | 61.37 | 51.50 | 52.71 | -1.20 | -3.25 to 0.00 | 54.75 | -3.25 | -7.94 to +0.72 |
+
+Against the default tuning the perplexity margin shows on the tasks: MRound's
+mean accuracy is ahead on every seed, by 1.37 to 1.87 points (38.18, 38.96 and
+38.87 against 36.81, 37.11 and 37.00), and it leads on eight, eight and nine of
+the twelve tasks. Against the reference's own SignRound v2 tuning the suite
+calls a tie: 0.13 points on the mean, MRound behind on seeds 42 and 44, by 0.72
+and 0.09 points, and ahead on seed 43 by 1.22 (against 38.90, 37.74 and 38.96),
+leading on five, eleven and seven tasks; RTE, 277 documents with a standard
+error of three points, makes 0.66 of seed 42's 0.72. At every seed MRound leads
+both tunings on PIQA, on HellaSwag and on `acc_norm` over its five tasks (39.32
+to 39.52 against 37.08 to 37.95 and 38.52 to 39.15), and the SignRound v2 tuning
+on ARC Challenge and TruthfulQA MC1 as well; Winogrande favors the reference.
+LAMBADA's own perplexity, 113 to 124 for MRound, is better than the default
+tuning's at every seed (275 to 352) and than the SignRound v2 tuning's on two
+seeds of three (99 to 146; 11.73 for the original). The reference's arms are
+those the earlier rate's tables below were scored against, and their figures
+came out the same to the last digit. MRound's checkpoints of the earlier rate
+scored 39.02 against them, 0.36 points more than these, about half of it on RTE,
+where on wikitext2 the two sets are level (0.17 percent apart): at the earlier
+rate the suite put MRound 2.05 and 0.49 points ahead of the two tunings, both on
+every seed.
+
+At its earlier rate MRound was 9.25, 0.78 and 1.25 percent ahead of the
+SignRound v2 tuning on the means and 5.87 behind (rows 105 to 107, 131 to 133,
+127 to 129, and 134, 137 and 139), and 30.63, 12.25 and 13.51 ahead of the
+default tuning and 5.96 behind (rows 88, 33 and 89, 92 to 94, 124 to 126, and
+135, 138 and 140). The change moved the 1.5 billion table by 5.65 percent, the 3
+billion by 2.20 and the 7 billion by 7.47, and left the 0.5 billion level, 0.17
+percent, against checkpoints from earlier trees as well as an earlier rate. The
+tables that follow were tuned at that rate and stay as its record: each stands
+as measured, and none is the current default's.
+
+**At MRound's earlier rate.** Three seeds on Qwen2.5-0.5B-Instruct (original
+14.3248), changing only the calibration draw, the reference at auto-round 0.15.0
+and at its default tuning on every row:
 
 | seed | reference | MRound | MRound against it | ledger |
 |---|---|---|---|---|
@@ -467,29 +618,27 @@ is the same three checkpoints:
 
 MRound is ahead on every seed, and by much less. With the option on the
 reference scores 16.30, 18.53 and 34.06 percent below its default arm of the
-same seed, 23.56 percent on the mean, which closes 77 percent of the gap in
-mean perplexity. Each of those is one draw against another (the change of
-system between them moved neither arm at seed 42, below), and at this width a
-default arm has
-moved by 25 percent under a change of release alone (rows 37 and 89), so each
-depends on the default draw it is taken against: against the default arms of
-the same seeds under 0.14.2 (rows 31, 34 and 37) the same three arms are
+same seed, 23.56 percent on the mean, which closes 77 percent of the gap in mean
+perplexity. Each of those is one draw against another (the change of system
+between them moved neither arm at seed 42, below), and at this width a default
+arm has moved by 25 percent under a change of release alone (rows 37 and 89), so
+each depends on the default draw it is taken against: against the default arms
+of the same seeds under 0.14.2 (rows 31, 34 and 37) the same three arms are
 18.23, 18.71 and 17.34 percent lower, and the gap closed is 70 percent. Read
-together they say that
-most of the margin in the first table of this section sat between the
-reference's two tunings and not between the two implementations. The two
-ranges overlap here, as they do in no other three seed perplexity table in
-this document: MRound's worst draw is 2.54 percent behind the reference's
-best. The mean of the per seed ratios is 9.02 percent and they run from 5.43
-to 13.57; a 95 percent Student interval on those three points, quoted to show
-how little three points constrain, runs from 19.3 percent ahead to 1.3 behind.
-So this table supports a paired statement, that MRound's checkpoint scored
-better on each of three calibration draws against the reference running the
-same method, and not the stronger one the first table supports. Size is the
-same +3.02 percent. With the option on the reference's three draws span 17.36
-percent of their mean, against 24.35 for the default arms under this release
-and 16.84 for the default arms of the same seeds under 0.14.2, so three draws
-do not show the option steadying it.
+together they say that most of the margin in the earlier rate's first table sat
+between the reference's two tunings and not between the two implementations. The
+two ranges overlap here, as they did in no other three seed perplexity table in
+this document when it was measured: MRound's worst draw is 2.54 percent behind
+the reference's best. The mean of the per seed ratios is 9.02 percent and they
+run from 5.43 to 13.57; a 95 percent Student interval on those three points,
+quoted to show how little three points constrain, runs from 19.3 percent ahead
+to 1.3 behind. So this table supports a paired statement, that MRound's
+checkpoint scored better on each of three calibration draws against the
+reference running the same method, and not the stronger one that table supports.
+Size is the same +3.02 percent. With the option on the reference's three draws
+span 17.36 percent of their mean, against 24.35 for the default arms under this
+release and 16.84 for the default arms of the same seeds under 0.14.2, so three
+draws do not show the option steadying it.
 
 One thing this table does not settle. The reference's documentation recommends
 the option together with its stronger recipe at 2 bits, and no arm on either
@@ -517,11 +666,11 @@ carries a couple of percent either way. Part of that price is the release's and
 not the method's: under auto-round 0.15.0 and 0.16.0 alike the option's tuning
 runs its block forward uncompiled where the default tuning compiles it.
 
-**Zero shot tasks** on the three pairs of checkpoints of the first table, the
-reference at its default tuning (rows 98 to 100, scored on the Apple GPU as
-described above), accuracy in percent, the
-reference and MRound as the mean of the three seeds and the last column the
-range of the difference across them:
+**Zero shot tasks** on the three pairs of checkpoints of the earlier rate's
+first table, the reference at its default tuning (rows 98 to 100, scored on the
+Apple GPU as described above), accuracy in percent, the reference and MRound as
+the mean of the three seeds and the last column the range of the difference
+across them:
 
 | task | original | reference | MRound | MRound against it | per seed |
 |---|---|---|---|---|---|
@@ -539,30 +688,28 @@ range of the difference across them:
 | Winogrande | 55.80 | 52.04 | 52.09 | +0.05 | -0.79 to +1.42 |
 | TruthfulQA MC1 | 26.81 | 26.89 | 25.62 | -1.26 | -2.94 to +0.86 |
 
-The first table's perplexity margin shows on the tasks. MRound's mean accuracy
-is ahead on every seed, by 1.94 to 2.22 points (39.03, 39.05 and 38.99 against
+That table's perplexity margin shows on the tasks. MRound's mean accuracy is
+ahead on every seed, by 1.94 to 2.22 points (39.03, 39.05 and 38.99 against
 36.81, 37.11 and 37.00), the two ranges separated by 1.88 points, and it leads
 on nine or ten of the twelve tasks at each seed. Much of the suite is at its
-floor
-at this width, though, and the reading has to say which tasks still
+floor at this width, though, and the reading has to say which tasks still
 discriminate. MMLU sits at 23 percent for both against a quarter for a guess,
 ARC Challenge and OpenBookQA are below a quarter, and Winogrande is about two
 points above a half. The reference scores exactly RTE's majority class share,
 52.71 percent, on all three seeds, which is what answering one way throughout
 gives. BoolQ's 62.17 percent is its share of yes answers, which MRound's seeds
-sit at (one of them a single document above it) and the reference's fall
-below, so neither does better than answering yes by more than one document in
-3,270. TruthfulQA runs against quality altogether here, the reference's MC2
-above the original's. Where both stay clear of their floor, on LAMBADA, ARC
-Easy, HellaSwag and PIQA, MRound leads on all four on average and on the first
-three at every seed, LAMBADA by 7.8 to 9.7 points. The spread that dominates
-the first perplexity table is not in the suite: the reference's three
-perplexities
-span 24 percent of their mean and its three task means 0.30 points, and its
-worst seed by perplexity is in the middle on the tasks. `acc_norm` over its
-five tasks agrees (39.20 to 39.46 for MRound against 37.08 to 37.95), and so
-does LAMBADA's own perplexity, 78 to 116 for MRound against 275 to 352 (11.73
-for the original).
+sit at (one of them a single document above it) and the reference's fall below,
+so neither does better than answering yes by more than one document in 3,270.
+TruthfulQA runs against quality altogether here, the reference's MC2 above the
+original's. Where both stay clear of their floor, on LAMBADA, ARC Easy,
+HellaSwag and PIQA, MRound leads on all four on average and on the first three
+at every seed, LAMBADA by 7.8 to 9.7 points. The spread that dominates that
+perplexity table is not in the suite: the reference's three perplexities span 24
+percent of their mean and its three task means 0.30 points, and its worst seed
+by perplexity is in the middle on the tasks. `acc_norm` over its five tasks
+agrees (39.20 to 39.46 for MRound against 37.08 to 37.95), and so does LAMBADA's
+own perplexity, 78 to 116 for MRound against 275 to 352 (11.73 for the
+original).
 
 **Zero shot tasks against the reference's own SignRound v2 tuning**, on the
 three pairs of the table with the option on (rows 111 to 113, scored as above),
@@ -685,24 +832,54 @@ One more model at the same scheme, one seed:
 
 Note the absolute numbers. At 2 bits both implementations produce models far
 worse than the original, and the interesting claim is the gap between them, not
-that either result is good. Against the reference's default tuning the margin
-narrowed as the model grew to 1.5 billion parameters, 32.79 percent at 135
-million, 30.63 at 0.5 billion and 12.25 at 1.5 billion, and then stopped
-narrowing: it is 13.51 percent at 3 billion, inside the range of the 1.5
-billion table's per seed margins, the last three sizes on three seeds each.
-MRound's penalty over the original is 51 to 65 percent of the reference's at
-0.5 billion, 77 to 84 percent at 1.5 billion and 73 to 81 percent at 3 billion.
-Against the reference's own SignRound v2 tuning, the method MRound implements,
-the margin is 9.25 percent at 0.5 billion and 1.25 at 3 billion, where the two
-are level, and MRound's penalty is 81 to 92 percent of the reference's at the
-smaller size and 92 to 106 at the larger: against that tuning the lead shrinks
-as the model grows, to nothing at 3 billion, on the two sizes measured, 1.5
-billion having no such arms. Most of each margin against the default tuning is
-the difference between the reference's two tunings, 77 percent of
-the gap in mean perplexity at 0.5 billion and 92 at 3 billion, and the curve
-against the default says little about the two implementations. The caveat on
-every number in this document stands either way: they come from models of
-three billion parameters or fewer.
+that either result is good. At MRound's earlier rate, against the reference's
+default tuning the margin narrowed as the model grew to 1.5 billion parameters,
+32.79 percent at 135 million, 30.63 at 0.5 billion and 12.25 at 1.5 billion, and
+then stopped narrowing: it is 13.51 percent at 3 billion, inside the range of
+the 1.5 billion table's per seed margins, the last three sizes on three seeds
+each. MRound's penalty over the original is 51 to 65 percent of the reference's
+at 0.5 billion, 77 to 84 percent at 1.5 billion and 73 to 81 percent at 3
+billion. Against the reference's own SignRound v2 tuning, the method MRound
+implements, the margin was 9.25 percent at 0.5 billion and 1.25 at 3 billion,
+where the two were level, and MRound's penalty is 81 to 92 percent of the
+reference's at the smaller size and 92 to 106 at the larger: against that tuning
+the lead shrank as the model grew, to nothing at 3 billion, on the two sizes
+these tables measure. Most of each margin against the default tuning is the
+difference between the reference's two tunings, 77 percent of the gap in mean
+perplexity at 0.5 billion and 92 at 3 billion, and the curve against the default
+says little about the two implementations. At the current rate (the table at the
+head of this section) the margins against the default tuning are 30.52, 17.21,
+15.42 and 1.96 percent from 0.5 to 7 billion, and against the SignRound v2
+tuning 9.10, 6.38, 3.43 and 2.05: the lead still shrinks with size against the
+method MRound implements, and holds on every seed to 7 billion. The caveat on
+every number in this document stands either way: they come from models of seven
+billion parameters or fewer, the largest at 2 bits only.
+
+## Uniform 8 and 3 bits, against round-to-nearest only
+
+No reference arm exists at either width, so Qwen2.5-0.5B-Instruct at 8 and 3
+bits was set against round-to-nearest at the same width, group size 64 and
+coverage, as the larger models at 4 bits are above, every arm scored by the
+evaluator of the tables here (seed 42, the tensors outside the block stack
+dense). Its 4 bit checkpoint went through the same comparison:
+
+| width | original | round-to-nearest | MRound | MRound against it | its loss taken back | ledger |
+|---|---|---|---|---|---|---|
+| 8 bits | 14.3248 | 14.3224 | 14.3246 | +0.02 percent | none to take back | row 237 |
+| 4 bits | 14.3248 | 17.0562 | 15.0260 | -11.90 percent | 74.3 percent | row 234 |
+| 3 bits | 14.3248 | 41.5136 | 18.1285 | -56.33 percent | 86.0 percent | row 238 |
+
+Each pair of checkpoints holds the same bytes. At 8 bits there is nothing to
+take back: round-to-nearest lands 0.02 percent below the original and MRound
+0.001 percent below it, and the 0.0022 between them says nothing about either;
+learned rounding moved the weights little and changed nothing measurable, after
+an hour's work (4,554 s) where round-to-nearest took 8 s. At 3 bits
+round-to-nearest loses 190 percent of the original's perplexity and MRound 26.6,
+taking back 86.0 percent of the loss, more than at 4 bits: the narrower the
+width, the more there is to take back. Both MRound checkpoints started from
+searched scales, so each gap holds the scale search as well as the tuning. This
+states no bar, which is the reference's own result, and no arm of the reference
+exists at these widths. The zero shot task suite on both rows is next.
 
 ## Mixed precision at an average of 2.5 bits
 
@@ -788,6 +965,123 @@ read from cache, and block loops 13.0 to 15.6 percent longer with the option
 on, read across the change of system, where at 2 bits that reading gave 15 to
 17 percent and one system 13.2. SmolLM2-135M-Instruct's table has no such arms.
 
+**Qwen2.5-3B-Instruct, against both of the reference's tunings**, original
+8.5719. The reference's six arms ran on the Linux machine's integrated GPU in
+bfloat16 autocast under auto-round 0.15.0, three with `enable_alg_ext` and three
+without, each with the reference's own allocator, AutoScheme, which gave all six
+one allocation, layer for layer: 135 layers at 2 bits, 31 at 3 and 86 at 4.
+MRound with its own allocation as it planned it until the change below, with the
+widest width's gradients (rows 181 to 186):
+
+| seed | reference, default | reference, SignRound v2 | MRound | against the default | against SignRound v2 | ledger |
+|---|---|---|---|---|---|---|
+| 42 | 12.1190 | 11.4254 | 12.1590 | +0.33 percent | +6.42 percent | rows 182, 181 |
+| 43 | 11.8836 | 11.3671 | 11.2585 | -5.26 percent | -0.96 percent | rows 184, 183 |
+| 44 | 11.9185 | 11.4064 | 11.9642 | +0.38 percent | +4.89 percent | rows 186, 185 |
+| **mean** | **11.9737** | **11.3996** | **11.7939** | **-1.50 percent** | **+3.46 percent** | |
+
+This was the one table where MRound missed the bar: 3.46 percent behind the
+reference's own SignRound v2 tuning on the mean and on two seeds of three, and
+level with its default, ahead on the mean and behind on two seeds of three,
+where at uniform 2 bits on the same model and seeds it is 3.43 percent ahead of
+that tuning on every seed. The gap was MRound's allocation, not its tuning.
+Tuned at the reference's own allocation, read back out of each arm's export,
+which MRound's checkpoints then hold in all 252 layers, and with everything else
+as above (rows 195 to 200):
+
+| seed | reference, default | reference, SignRound v2 | MRound at the reference's allocation | against the default | against SignRound v2 | ledger |
+|---|---|---|---|---|---|---|
+| 42 | 12.1190 | 11.4254 | 11.4829 | -5.25 percent | +0.50 percent | rows 196, 195 |
+| 43 | 11.8836 | 11.3671 | 11.2437 | -5.39 percent | -1.09 percent | rows 198, 197 |
+| 44 | 11.9185 | 11.4064 | 11.2144 | -5.91 percent | -1.68 percent | rows 200, 199 |
+| **mean** | **11.9737** | **11.3996** | **11.3137** | **-5.51 percent** | **-0.75 percent** | |
+
+MRound is then ahead of the SignRound v2 tuning on the mean and on two seeds of
+three, the ranges overlapping, and ahead of the default on every seed with the
+ranges apart, its worst draw 3.37 percent below the default's best. The
+reference's allocation is worth 4.07 percent to MRound on the mean, and it
+steadies it: the three draws span 2.37 percent of their mean, where those of
+MRound's own allocation span 7.64. The two allocations spend one budget at
+opposite ends of the stack. The second block holds 3.41 bits a weight in the
+reference's and 2.14 to 2.19 in MRound's, blocks 8 to 22 hold 2.12 against 2.67
+to 2.79, and blocks 23 to 35 hold 2.94 against 2.31 to 2.43. At the second
+block, where the reference keeps two of the three MLP projections at 4 bits and
+MRound gives them 2, MRound's error on the original model's input is six times
+the reference's at its own allocation and level with it at the reference's (a
+block probe on four windows at seed 42, which is not a ledger row). One other
+departure of MRound's was tested and ruled out: tuned with the outlier
+suppressed loss in every block that holds a layer below 4 bits, as the
+reference's SignRound v2 is, MRound scored 0.43 to 2.23 percent worse on every
+seed (rows 187 to 192). Size is +5.51 percent against the reference packed at
+its widths, at either allocation. What MRound's allocator got wrong at this size
+was the gradient its scores were taken from.
+
+**MRound's own allocation, scored as the reference scores: MRound as it ships.**
+Until this table MRound's allocator scored each layer with a gradient taken once
+per batch at the widest width and reused for the narrower ones, a divergence
+from the reference chosen on one small model at a quicker recipe
+(DOCUMENTATION.md, 1.5 What v2 adds); the reference takes the gradient at each
+width's own quantized point, `quantize`'s `sensitivity_gradients="own_width"`,
+which MRound's default now takes at this size (below). With that one change from
+the first table (rows 201 to 206):
+
+| seed | reference, default | reference, SignRound v2 | MRound, `own_width` | against the default | against SignRound v2 | ledger |
+|---|---|---|---|---|---|---|
+| 42 | 12.1190 | 11.4254 | 11.4003 | -5.93 percent | -0.22 percent | rows 202, 201 |
+| 43 | 11.8836 | 11.3671 | 11.0107 | -7.35 percent | -3.14 percent | rows 204, 203 |
+| 44 | 11.9185 | 11.4064 | 11.0985 | -6.88 percent | -2.70 percent | rows 206, 205 |
+| **mean** | **11.9737** | **11.3996** | **11.1699** | **-6.71 percent** | **-2.02 percent** | |
+
+MRound is then ahead of both tunings on every seed, its worst draw 0.29 percent
+above the SignRound v2 tuning's best and 4.07 percent below the default's best,
+and it is 1.27 percent better on the mean than tuned at the reference's own
+allocation, better on every seed. Its plan is one plan at all three seeds, 128
+layers at 2 bits, 52 at 3 and 72 at 4, agreeing with AutoScheme's on 226 of 252
+layers, where the default gradients gave each seed a plan of its own, agreeing
+on 135 to 146. It spends the budget where AutoScheme does, 3.01 bits a weight at
+the second block, 2.18 in blocks 8 to 22 and 2.89 in blocks 23 to 35, and at the
+second block its error on the original model's input is level with the
+reference's (the block probe at seed 42). The three draws span 3.49 percent of
+their mean. Size is +5.51 percent, as at either other allocation. This table is
+what MRound produces at 3B as it ships, and the first is what it produced before
+the change, which the next paragraph says is made by size.
+
+**Which gradients MRound scores with, by size.** The widest width's gradients
+were chosen on a 135 million parameter model, at a quicker recipe and one seed,
+so before the default changed both sources were run on the two smaller models
+above, three seeds each on one tree, every checkpoint scored against the
+reference arms of those tables (rows 207 to 224):
+
+| model | `own_width` | widest | `own_width` against widest | per seed | ledger |
+|---|---|---|---|---|---|
+| SmolLM2-135M-Instruct | 35.8926 | 30.3866 | +18.12 percent | +16.50 to +20.91 | rows 207 to 212 |
+| Qwen2.5-0.5B-Instruct | 25.0236 | 22.5618 | +10.91 percent | +7.71 to +12.71 | rows 213 to 224 |
+
+There the widest gradients are better on every seed, where on
+Qwen2.5-3B-Instruct `own_width` is 5.29 percent better on the mean and on every
+seed (11.1699 against 11.7939). So MRound's default takes them by size: a
+gradient at each width's own quantized point from 2.5 billion weights in the
+scored layers up, which Qwen2.5-3B-Instruct's 2.77 billion are, and at the
+widest width below, which keeps both tables above as MRound produces them
+(DOCUMENTATION.md, 1.5). The rule is measured at its two ends and not between
+them: no model between the 0.36 billion scored weights of Qwen2.5-0.5B-Instruct
+and those 2.77 billion has been run both ways, and Qwen2.5-7B-Instruct, which
+the rule gives its own width's gradients, has no mixed table. With either source
+MRound leads the reference's default arms on every seed of both models; on
+Qwen2.5-0.5B-Instruct `own_width` leads the arms with the option on by 2.55
+percent on the mean, behind on seed 44 by 0.08, where the widest gradients lead
+them by 12.13 on every seed.
+
+The widest runs repeat the published tables' configuration on the current tree.
+On SmolLM2-135M-Instruct they reproduce rows 49 to 51 exactly. On
+Qwen2.5-0.5B-Instruct they score 23.4063, 21.6517 and 22.6273, which is 1.78,
+0.06 and 0.67 percent above rows 43, 45 and 46 and 0.85 on the mean, with
+allocations of the same counts at every seed; the cause has not been isolated.
+Against those runs MRound leads the reference's default arms by 20.00 percent on
+the mean where the table above reads 20.68, and the arms with the option on by
+12.13 where it reads 12.88, its worst draw still ahead of the reference's best
+in both.
+
 **Zero shot tasks** on the first Qwen2.5-0.5B-Instruct table's three pairs of
 checkpoints, the reference at its default tuning (rows 101 to 103, scored on
 the Apple GPU as described above), in the form of the 2 bit one:
@@ -872,11 +1166,21 @@ ARC Challenge, by one question in 1,172 on each. So against its own tuning at
 mixed 2.5 the reference matches MRound on the twelve task mean, while MRound
 keeps the measures nearest to perplexity.
 
-One structural difference is worth reporting because it is stable across both
-architectures. Given the same three candidate widths and the same budget, the
-reference never allocated a single layer at the widest option, spending the
-budget as a near binary choice between 2 and 3 bits, while MRound used all
-three. That is a property of the two allocators rather than of one model.
+One structural difference was reported here as one between the two allocators,
+and it is one between their gradients. Given the same three candidate widths and
+the same budget, the reference never allocated a single layer at the widest
+option on either smaller model, spending the budget as a near binary choice
+between 2 and 3 bits, while MRound with the widest gradients used all three.
+Scored with the reference's gradients, MRound's allocator leaves the widest
+option almost unused too, one layer at 4 bits at most, and agrees with the
+reference's allocation on 183 to 187 of SmolLM2-135M-Instruct's 210 layers and
+153 to 155 of Qwen2.5-0.5B-Instruct's 168, where with the widest gradients it
+agrees on 160 to 164 and 91 to 94 (rows 207 to 224). At Qwen2.5-3B-Instruct
+AutoScheme used all three widths, 86 layers at 4 bits, and MRound's allocator
+given the reference's gradients agrees with it on 226 of 252 layers. With the
+same gradients the two allocators nearly agree at every size measured; the plan
+nearest the reference's is the better one at three billion parameters and the
+worse one below.
 
 ## The reference at its stronger recipe
 
@@ -890,16 +1194,17 @@ mixed 2.5, Qwen2.5-0.5B-Instruct:
 | 200 steps, 128 samples | 28.4685 | 22.9964 | -19.22 percent | row 43 |
 | 1,000 steps, 512 samples | 25.8199 | 22.3231 | -13.54 percent | row 48 |
 
-The longer schedule helps the reference three times as much as it helps MRound,
-so the margin narrows from 19.22 to 13.54 percent. It does not close. MRound at
-its default still beats the reference at that recipe, by 10.94 percent. Neither
-run turned on the reference's `enable_alg_ext` (see The bar), which its
-documentation pairs with this recipe for 2 bit weights, so this is the
-reference's stronger recipe and not yet its best configuration. Each of the
-two has now been run alone at this seed: the recipe took the reference from
-28.4685 to 25.8199, 9.30 percent, and the option at the default recipe to
-26.3575, 7.42 percent (row 108, under Mixed precision). The two together have
-not been run.
+The longer schedule helps the reference about three times as much as it helps
+MRound in relative terms, 9.30 percent against 2.93, and about four times as
+much in absolute perplexity, 2.65 points against 0.67, so the margin narrows
+from 19.22 to 13.54 percent. It does not close. MRound at its default still
+beats the reference at that recipe, by 10.94 percent. Neither run turned on the
+reference's `enable_alg_ext` (see The bar), which its documentation pairs with
+this recipe for 2 bit weights, so this is the reference's stronger recipe and
+not yet its best configuration. Each of the two has now been run alone at this
+seed: the recipe took the reference from 28.4685 to 25.8199, 9.30 percent, and
+the option at the default recipe to 26.3575, 7.42 percent (row 108, under Mixed
+precision). The two together have not been run.
 
 ## Which release of the reference
 
@@ -937,8 +1242,22 @@ setuptools, and both came out the 0.15.0 checkpoints to the bit, all
 comparisons take in nothing that computes a number at these settings: the scale
 and rounding code, the optimizer and the calibration path are the same files.
 So the tables here are tables of 0.16.0 as well at the point measured, and are
-expected to be at the others, where no 0.16.0 arm has been run. auto-round
-0.16.1, published since, has not been run at all.
+expected to be at the others, where no 0.16.0 arm has been run.
+
+**Its patch release, auto-round 0.16.1, writes the same checkpoints as well.**
+It was published on 2026-10-15 and read file by file against 0.16.0. On the path
+these comparisons take, its one new option, a grid search for round-to-nearest,
+is off by default and gated wherever it reaches; its other fixes concern the
+GGUF export and mixture of experts models; and the rest is a pass of a linter
+whose rewrites compute what the code computed before. Run side by side with
+0.16.0 on SmolLM2-135M-Instruct at toy budgets, under both of the reference's
+tunings, in bfloat16 and in float32, and at mixed 2.5, the two releases wrote
+the same checkpoints, byte for byte, and the same scores in the reference's
+scheme search. At the published recipe, row 88's and row 105's reference arms
+produced again under 0.16.1 on the same machine came out the 0.16.0 checkpoints
+to the bit, all 357,826,560 weights; scored against the MRound checkpoint of
+rows 159 and 160, they repeat those rows to the last digit (rows 193 and 194,
+2026-11-05), so the tables here are tables of 0.16.1 too at the point measured.
 
 **How much the release is worth depends on the width, and at 2 bits it is not
 small.** At mixed 2.5 the release has been measured as worth about three
@@ -958,42 +1277,54 @@ their range beside the ratio of the means at 2 bits.
 
 ## What these numbers do not show
 
-They are four models, of three billion parameters at most, on one evaluation
-corpus, scored by perplexity, and five tables of them by a zero shot task
-suite as well (the 4 bit one, and the 2 bit and mixed 2.5 ones against each of
-the reference's two tunings, all on Qwen2.5-0.5B-Instruct); the other tables
-have not been through the suite yet, and on the five that have, the suite
-confirms the perplexity lead clearly only at 2 bits against the reference's
-default tuning: against its own SignRound v2 tuning MRound is 0.49 points
-ahead there and 0.10 at mixed 2.5. Outside three
-tables every reference arm ran AutoRound's default tuning, without the option
-that turns on its own SignRound v2 tuning (The bar). On the three tables
-measured both ways the margin with that option on is 9.25 percent at 2 bits on
-Qwen2.5-0.5B-Instruct, MRound ahead on each of three seeds whose ranges
-overlap, where it is 30.63 with it off; 12.88 percent at mixed 2.5 on the same
-model, the ranges still apart, where it is 20.68; and 1.25 percent at 2 bits on
-Qwen2.5-3B-Instruct, MRound behind on one seed of three and the two level,
-where it is 13.51. In the two Qwen2.5-0.5B-Instruct tables the reference arms
-with the option on were produced under a different operating system release
-from their default twins, and producing both tunings of one seed again on one
-system showed that this moved neither checkpoint; the Qwen2.5-3B-Instruct pairs
-were produced on one system. The other margins have not been measured against
-it. No arm has paired the option with the
-reference's stronger recipe,
-which its documentation recommends at 2 bits, so no margin here says how MRound
-compares with the reference's best configuration at low widths. The largest
-model measured is Qwen2.5-3B, at 13.51 percent over three seeds against the
-reference's default tuning, where Qwen2.5-1.5B shows 12.25, and at 1.25 against
-its own SignRound v2 tuning, where Qwen2.5-0.5B shows 9.25: against the method
-MRound implements the lead shrinks as the model grows on the two sizes
-measured, to a tie at 3 billion, and nothing here should be read as a claim
-about what happens at seven billion. At 1.5 billion MRound's block loop used
-four fifths of the Mac it ran on at the standard recipe; the current tree
-writes the same checkpoint in 19.34 GB (row 121) and the 3B table's in 20.07 GB
-(rows 124 to 126), and in two step memory probes, which are not ledger rows, a
-7B's block loop peaked at 26.28 GB with every step in eight pieces and a 3B
-mixed 2.5 run at 23.95 GB in its scoring pass, so a 7B fits that machine in
-pieces; none has been compared yet.
+They are five models, of seven billion parameters at most, on one evaluation
+corpus, scored by perplexity, and seven tables of them by a zero shot task suite
+as well (the 4 bit one, the mixed 2.5 ones against each of the reference's two
+tunings, and the 2 bit ones against each, on MRound's current checkpoints and on
+those of its earlier rate, all on Qwen2.5-0.5B-Instruct); the other tables have
+not been through the suite yet, and on the seven that have, the suite confirms
+the perplexity lead clearly only at 2 bits against the reference's default
+tuning: against its own SignRound v2 tuning MRound is 0.13 points ahead there on
+its current checkpoints, behind on two seeds of three (0.49 on those of its
+earlier rate, on every seed), and 0.10 at mixed 2.5. Outside six tables every
+reference arm ran AutoRound's default tuning, without the option that turns on
+its own SignRound v2 tuning (The bar). On the six tables measured both ways the
+margin with that option on is, at 2 bits and MRound's current rate, 9.10, 6.38,
+3.43 and 2.05 percent from 0.5 to 7 billion parameters, MRound ahead on every
+seed and the ranges apart only at 1.5 billion, where it is 30.52, 17.21, 15.42
+and 1.96 with the option off; 12.88 percent at mixed 2.5 on
+Qwen2.5-0.5B-Instruct, the ranges still apart, where it is 20.68; and at mixed
+2.5 on Qwen2.5-3B-Instruct, as MRound ships, 2.02 percent on every seed with the
+ranges overlapping, where it is 6.71 with the option off; before MRound's
+default took the reference's gradients at that size it was 3.46 percent behind
+there, on two seeds of three. In the Qwen2.5-0.5B-Instruct and
+Qwen2.5-1.5B-Instruct tables the reference arms with the option on were produced
+under a different operating system release from their default twins, and arms
+produced again on the new system came out the same checkpoints to the bit (both
+tunings of one seed on the CPU, rows 117 and 118, and a default arm on the
+integrated GPU, row 123); the 3 and 7 billion pairs were produced on one system.
+The other margins have not been measured against it. No arm has paired the
+option with the reference's stronger recipe, which its documentation recommends
+at 2 bits, so no margin here says how MRound compares with the reference's best
+configuration at low widths. The largest model measured is Qwen2.5-7B, against
+the reference at 2 bits only: MRound is 1.96 percent ahead of the reference's
+default tuning there and 2.05 ahead of its own SignRound v2 tuning, on every
+seed with the ranges overlapping; at 4 bits it has been set against
+round-to-nearest alone above half a billion parameters, 5.65, 7.17 and 0.75
+percent ahead at 1.5, 3 and 7 billion (rows 235, 236 and 232), which states no
+bar, and against the method MRound implements the lead shrinks as the model
+grows, so nothing here should be read as a claim about larger models, or about 4
+bits above half a billion parameters or mixed precision above three. MRound's
+default chooses its mixed precision scoring gradients by size, and the
+threshold, 2.5 billion weights in the scored layers, lies between the two models
+measured on either side of it, 0.36 and 2.77 billion, with nothing measured
+between them. At 1.5 billion MRound's block loop once used four fifths of the
+Mac it ran on at the standard recipe; the current tree's 2 bit runs peak at
+10.93, 14.14 and 20.07 GB from 0.5 to 3 billion parameters (rows 159, 165 and
+151) and at 28.84 GB at 7 billion with every step in four pieces (rows 171 and
+173), as its 4 bit run did, which took 57,008 s (row 232), on a 32 GB Mac, and a
+3B mixed 2.5 run peaked at 23.95 GB in its scoring pass in a two step memory
+probe, which is not a ledger row.
 
 Cost is not reported as a ratio in any table, as above: every comparison in
 the tables crosses a device or a machine, and the pairs that share one GPU are

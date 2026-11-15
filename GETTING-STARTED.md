@@ -25,9 +25,10 @@ against, and it is the fastest way to understand what the method does.
 
 **You cannot export GGUF or Core ML.** `quantize` refuses any format but MLX
 rather than approximating, and the two exporter modules are stubs that raise.
-Zero-shot task evaluation runs, and five comparisons have been through it so
-far (RESULTS.md: the 4 bit Qwen2.5-0.5B-Instruct table and its 2 bit and mixed
-2.5 bit tables against each of the reference's two tunings).
+Zero-shot task evaluation runs, and seven comparisons have been through it so
+far (RESULTS.md: the 4 bit Qwen2.5-0.5B-Instruct table, its 2 bit and mixed 2.5
+bit tables against each of the reference's two tunings, and the 2 bit pair again
+on MRound's current checkpoints).
 
 ---
 
@@ -100,8 +101,8 @@ layer: 32 x 128, 256 samples
 
  bits  group   round-to-nearest        learned   better by
 ------------------------------------------------------------
-    2    128         5.7794e-02     3.3568e-02      41.0%
-    3    128         1.3174e-02     1.0097e-02      22.2%
+    2    128         5.7794e-02     4.0493e-02      28.8%
+    3    128         1.3174e-02     1.0569e-02      18.6%
     4    128         3.1418e-03     2.6007e-03      17.2%
     8    128         1.1899e-05     1.1755e-05       1.2%
 ```
@@ -152,11 +153,13 @@ mround quantize Qwen/Qwen2.5-7B-Instruct -o ./qwen7b-2bit --bits 2 --micro-batch
 ```
 
 `--dry-run` prints the prediction stage by stage, reading the configuration and
-not the weights, and exits 1 when the run would be refused. `--micro-batches`
-keeps each step the whole batch's, but a run in pieces is slower and its
-checkpoint is another draw, so the check names the fewest pieces that fit.
-`--memory-budget` and `--skip-memory-check` overrule it, and `mround doctor`
-shows the budget.
+not the weights, and exits 1 when the run would be refused. It also says how
+long the run takes at the pace of the 32 GB M5 MacBook Pro that MRound's
+measured runs were made on, which every run says too: on another Mac that figure
+is a reference point, not a prediction. `--micro-batches` keeps each step the
+whole batch's, but a run in pieces is slower and its checkpoint is another draw,
+so the check names the fewest pieces that fit. `--memory-budget` and
+`--skip-memory-check` overrule it, and `mround doctor` shows the budget.
 
 Mixed precision chooses a width per layer from a menu, under an exact size
 budget:

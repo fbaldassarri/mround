@@ -221,6 +221,16 @@ class TestTheCommandLine:
         assert main([*argv, "--memory-budget", "29", "--micro-batches", "4"]) == 0
         assert "within the budget" in capsys.readouterr().out
 
+    def test_a_dry_run_says_how_long_the_run_takes(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        directory = _model_dir(tmp_path, QWEN_7B)
+        argv = ["quantize", str(directory), "-b", "4", "--dry-run", "--micro-batches", "4"]
+        assert main([*argv, "--memory-budget", "29"]) == 0
+        out = capsys.readouterr().out
+        assert "time: predicted" in out
+        assert "28 blocks of" in out
+
     def test_a_dry_run_of_a_model_it_cannot_read_reports(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

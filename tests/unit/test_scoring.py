@@ -379,7 +379,9 @@ class TestScoreWidths:
     def test_progress_counts_every_width_under_own_width_gradients(self) -> None:
         # Under the reference's own schedule the work is the batch count times
         # the candidate count, and the total has to say so or the projection
-        # printed after the first width would be three times optimistic.
+        # printed after the first width would be three times optimistic. Each
+        # width's quantized copy is built between the backwards and reported
+        # as its own stage, with the copies still to come.
         seen: list[Any] = []
         score_widths(
             Toy(),
@@ -390,8 +392,64 @@ class TestScoreWidths:
             progress=seen.append,
         )
         assert [(step.stage, step.index, step.total) for step in seen] == [
-            ("backward", index, 6) for index in range(1, 7)
+            ("width", 1, 3),
+            ("backward", 1, 6),
+            ("backward", 2, 6),
+            ("width", 2, 3),
+            ("backward", 3, 6),
+            ("backward", 4, 6),
+            ("width", 3, 3),
+            ("backward", 5, 6),
+            ("backward", 6, 6),
         ]
+        backwards = [step for step in seen if step.stage == "backward"]
+        assert [step.preparations_left for step in backwards] == [2, 2, 1, 1, 0, 0]
+
+    def test_the_backward_clock_under_own_width_leaves_the_copies_out(self) -> None:
+        # log0288 read 102,194 seconds left at its first backward, against
+        # 3,474 to come: the clock had started with the pass, so the first
+        # width's copy, 523 seconds, was charged to one backward of 11.6. The
+        # backward clock now holds the time since the copy was ready, and the
+        # copies' own clock the time they took.
+        seen: list[Any] = []
+        score_widths(
+            Toy(),
+            [batch_of_tokens(seed=8)],
+            [2, 4],
+            QuantScheme(bits=4, group_size=GROUP),
+            gradient_source="own_width",
+            progress=seen.append,
+        )
+        first_copy, first_backward, second_copy, second_backward = seen
+        assert first_backward.stage_seconds == pytest.approx(
+            first_backward.seconds - first_copy.seconds
+        )
+        assert first_backward.preparation_seconds == pytest.approx(first_copy.seconds)
+        assert second_backward.stage_seconds == pytest.approx(
+            (first_backward.seconds - first_copy.seconds)
+            + (second_backward.seconds - second_copy.seconds)
+        )
+        assert second_backward.remaining_seconds == pytest.approx(0.0)
+
+    def test_the_projection_adds_the_copies_still_to_come(self) -> None:
+        # log0288's first backward with the clock it should have had: 11.6
+        # seconds a backward over 192, and two copies of about 523 seconds
+        # still to build, 3,262 seconds where it printed 102,194.
+        step = ScoringProgress(
+            stage="backward",
+            index=1,
+            total=192,
+            seconds=535.0,
+            peak_memory_bytes=0,
+            stage_seconds=11.6,
+            preparations_left=2,
+            preparation_seconds=523.4,
+        )
+        assert step.projected_seconds == pytest.approx(11.6 * 192)
+        assert step.remaining_seconds == pytest.approx(11.6 * 191 + 2 * 523.4)
+        assert "about 3262s remaining" in step.describe()
+        copy = ScoringProgress(stage="width", index=1, total=3, seconds=523.4, peak_memory_bytes=0)
+        assert "quantized copy 1 of 3 ready at 523s" in copy.describe()
 
     def test_a_progress_line_names_the_stage_and_the_peak(self) -> None:
         seen: list[Any] = []

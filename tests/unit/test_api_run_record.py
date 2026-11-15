@@ -23,8 +23,9 @@ from mlx_lm.models import llama
 from mround import api
 from mround.exceptions import ArchitectureError, CalibrationError, MemoryBudgetError, SchemeError
 from mround.pipeline import loader
-from mround.pipeline.runner import QuantizationRunner
+from mround.pipeline.runner import BlockResult, QuantizationRunner, RunSummary
 from mround.planner.memory import RULE_VERSION, ModelShape, RunShape, predict_memory
+from mround.planner.timing import RULE_VERSION as TIME_RULE_VERSION
 from mround.schemes import QuantScheme, TuningConfig
 
 if TYPE_CHECKING:
@@ -192,6 +193,46 @@ def test_a_mixed_run_tunes_a_fresh_lazy_load_not_the_scored_model(
     assert tuned[0] is not loads[0][0]
 
 
+def _block(index: int, seconds: float, *, reverted: bool = False) -> BlockResult:
+    return BlockResult(
+        index=index,
+        name=f"model.layers.{index}",
+        initial_loss=1.0,
+        final_loss=1.0 if reverted else 0.5,
+        iterations=200,
+        seconds=seconds,
+        peak_memory_bytes=0,
+        reverted=reverted,
+        search_seconds=seconds / 10,
+    )
+
+
+def test_a_reverted_block_says_it_kept_its_untuned_rounding() -> None:
+    # Round-to-nearest only when its scales were not searched, which a run that
+    # searched them (every harness run) would misstate (MEMORY.md, rows 233 to
+    # 236).
+    line = _block(2, 592.4, reverted=True).describe()
+    assert line.endswith("reverted to its untuned rounding")
+    assert "round-to-nearest" not in line
+    assert "reverted" not in _block(3, 596.7).describe()
+
+
+def test_the_loop_s_time_is_recorded_block_by_block() -> None:
+    summary = RunSummary(
+        blocks=[_block(0, 100.0), _block(1, 120.0)],
+        total_seconds=250.0,
+        peak_memory_bytes=0,
+        scheme_by_layer={},
+    )
+    record = summary.timing_record()
+    assert record["loop_seconds"] == 250.0
+    assert record["between_blocks_seconds"] == pytest.approx(30.0)
+    assert record["by_block"] == [
+        {"block": 0, "seconds": 100.0, "search_seconds": 10.0},
+        {"block": 1, "seconds": 120.0, "search_seconds": 12.0},
+    ]
+
+
 def _must_not_load(*_: Any, **__: Any) -> None:
     msg = "the model was loaded for a run the memory check should have refused"
     raise AssertionError(msg)
@@ -214,6 +255,30 @@ class TestTheMemoryCheck:
         assert set(predicted["by_stage_bytes"]) >= {"entrance", "tune", "remainder", "export"}
         assert predicted["model"]["layers"] == CONFIG["num_hidden_layers"]
         assert predicted["run"]["samples"] == TUNING.n_samples
+
+    def test_the_run_record_carries_the_time_beside_the_prediction(
+        self, corpus: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        result = api.quantize(
+            "tiny", output_dir=tmp_path / "out", bits=2, tuning=TUNING, calibration=corpus
+        )
+        assert "time: predicted" in capsys.readouterr().out
+        record = json.loads(result.config_path.read_text(encoding="utf-8"))
+        predicted = record["time_check"]
+        assert predicted["rule"] == TIME_RULE_VERSION
+        assert predicted["blocks"] == CONFIG["num_hidden_layers"]
+        assert predicted["iters"] == TUNING.iters
+        # Two bits: the outlier rule is on, as the block loop resolves it.
+        assert predicted["outlier_rule"] is True
+        timing = record["result"]["timing"]
+        blocks = [entry["seconds"] for entry in timing["by_block"]]
+        assert [entry["block"] for entry in timing["by_block"]] == [0, 1]
+        assert timing["loop_seconds"] == pytest.approx(record["result"]["total_seconds"])
+        assert timing["between_blocks_seconds"] == pytest.approx(
+            timing["loop_seconds"] - sum(blocks)
+        )
+        assert set(timing["after_blocks_seconds"]) == {"remainder", "export"}
+        assert all(seconds >= 0 for seconds in timing["after_blocks_seconds"].values())
 
     def test_the_stages_after_the_loop_are_measured(self, corpus: str, tmp_path: Path) -> None:
         result = api.quantize(
@@ -339,3 +404,229 @@ class TestTheMemoryCheck:
                 calibration=corpus,
                 memory_budget=1,
             )
+
+    def test_the_planner_scores_a_small_model_at_the_widest_width_by_size(
+        self, corpus: str
+    ) -> None:
+        # D-053: nobody named a source, so the planner read the size of what it
+        # scores, far below the threshold, and took the widest width's
+        # gradients; the record says both what was asked and what was read.
+        from mround.planner.sensitivity import OWN_WIDTH_FROM_WEIGHTS  # noqa: PLC0415
+
+        info = api.plan_mixed_precision(
+            "tiny", 3.0, (2, 4), scoring_samples=1, scoring_seq_len=16, calibration=corpus
+        )
+        assert info["gradient_source"] == "widest"
+        assert info["gradient_source_requested"] == "auto"
+        assert 0 < info["scored_weights"] < OWN_WIDTH_FROM_WEIGHTS
+        assert info["describe"].endswith("billion weights")
+        assert "the widest width, by size at" in info["describe"]
+
+    def test_from_the_threshold_up_the_planner_scores_each_width_at_its_own(
+        self, corpus: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from mround.planner import sensitivity  # noqa: PLC0415
+
+        monkeypatch.setattr(sensitivity, "OWN_WIDTH_FROM_WEIGHTS", 1)
+        info = api.plan_mixed_precision(
+            "tiny", 3.0, (2, 4), scoring_samples=1, scoring_seq_len=16, calibration=corpus
+        )
+        assert info["gradient_source"] == "own_width"
+        assert "each own width, by size at" in info["describe"]
+
+    def test_a_named_source_is_taken_and_recorded_as_named(self, corpus: str) -> None:
+        info = api.plan_mixed_precision(
+            "tiny",
+            3.0,
+            (2, 4),
+            scoring_samples=1,
+            scoring_seq_len=16,
+            calibration=corpus,
+            sensitivity_gradients="own_width",
+        )
+        assert info["gradient_source"] == "own_width"
+        assert info["gradient_source_requested"] == "own_width"
+        assert "by size" not in info["describe"]
+
+    def test_an_unknown_source_is_refused_before_scoring(self, corpus: str) -> None:
+        with pytest.raises(SchemeError, match="sensitivity_gradients"):
+            api.plan_mixed_precision(
+                "tiny",
+                3.0,
+                (2, 4),
+                scoring_samples=1,
+                scoring_seq_len=16,
+                calibration=corpus,
+                sensitivity_gradients="fp",
+            )
+
+
+def _plan_layers() -> list[str]:
+    from mround.pipeline.scoring import eligible_block_layers  # noqa: PLC0415
+
+    _, eligible, _, _ = eligible_block_layers(_bundle().model, 64, expected_blocks=2)
+    return sorted(eligible)
+
+
+class TestAGivenPlan:
+    """A mixed run tuned at an allocation it is handed (MEMORY.md Q-016)."""
+
+    def test_the_loop_tunes_at_the_plan_and_nothing_is_scored(
+        self, corpus: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from mround.pipeline import scoring  # noqa: PLC0415
+
+        def must_not_score(*_: Any, **__: Any) -> None:
+            msg = "a run given its plan scored one anyway"
+            raise AssertionError(msg)
+
+        loads: list[str] = []
+
+        def load(*_: Any, **__: Any) -> loader.ModelBundle:
+            loads.append("loaded")
+            return _bundle()
+
+        handed: list[Any] = []
+        run = QuantizationRunner.run
+
+        def recording_run(self: QuantizationRunner, model: Any, *args: Any, **kwargs: Any) -> Any:
+            handed.append(kwargs["scheme_by_layer"])
+            return run(self, model, *args, **kwargs)
+
+        monkeypatch.setattr(scoring, "score_widths", must_not_score)
+        monkeypatch.setattr(loader, "load_model", load)
+        monkeypatch.setattr(QuantizationRunner, "run", recording_run)
+        layers = _plan_layers()
+        plan = {path: 2 if index % 2 else 4 for index, path in enumerate(layers)}
+        result = api.quantize(
+            "tiny",
+            output_dir=tmp_path / "out",
+            average_bits=3.0,
+            candidate_bits=(2, 4),
+            plan=plan,
+            tuning=TUNING,
+            calibration=corpus,
+        )
+        assert result.mixed is not None
+        assert result.mixed["plan"] == "given"
+        assert result.mixed["assignments"] == plan
+        assert result.mixed["scoring_seconds"] == 0.0
+        assert {path: scheme.bits for path, scheme in handed[0].items()} == plan
+        # Nothing was scored, so nothing was read whole, and the one lazy load
+        # is the one the loop tunes.
+        assert loads == ["loaded"]
+
+    def test_a_plan_without_an_average_is_refused_before_the_model_loads(
+        self, corpus: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(loader, "load_model", _must_not_load)
+        with pytest.raises(SchemeError, match="average_bits"):
+            api.quantize(
+                "tiny",
+                output_dir=tmp_path / "out",
+                plan=dict.fromkeys(_plan_layers(), 2),
+                tuning=TUNING,
+                calibration=corpus,
+            )
+
+    def test_a_width_off_the_menu_is_refused_before_the_model_loads(
+        self, corpus: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        layers = _plan_layers()
+        monkeypatch.setattr(loader, "load_model", _must_not_load)
+        with pytest.raises(SchemeError, match="candidate_bits"):
+            api.quantize(
+                "tiny",
+                output_dir=tmp_path / "out",
+                average_bits=3.0,
+                candidate_bits=(2, 4),
+                plan={**dict.fromkeys(layers, 2), layers[0]: 3},
+                tuning=TUNING,
+                calibration=corpus,
+            )
+
+    @pytest.mark.parametrize("change", ["left out", "does not plan over"])
+    def test_a_plan_over_other_layers_is_refused(
+        self, corpus: str, tmp_path: Path, change: str
+    ) -> None:
+        plan = dict.fromkeys(_plan_layers(), 2)
+        if change == "left out":
+            plan.pop(next(iter(plan)))
+        else:
+            plan["model.layers.9.mlp.down_proj"] = 2
+        with pytest.raises(SchemeError, match=change):
+            api.quantize(
+                "tiny",
+                output_dir=tmp_path / "out",
+                average_bits=3.0,
+                candidate_bits=(2, 4),
+                plan=plan,
+                tuning=TUNING,
+                calibration=corpus,
+            )
+
+    def test_the_size_is_reported_against_the_budget_and_not_held_to_it(
+        self, corpus: str, tmp_path: Path
+    ) -> None:
+        result = api.quantize(
+            "tiny",
+            output_dir=tmp_path / "out",
+            average_bits=3.0,
+            candidate_bits=(2, 4),
+            plan=dict.fromkeys(_plan_layers(), 4),
+            tuning=TUNING,
+            calibration=corpus,
+        )
+        assert result.mixed is not None
+        assert result.mixed["achieved_code_bits"] == pytest.approx(4.0)
+        assert result.mixed["allocated_cost_bits"] > result.mixed["budget_bits"]
+        assert "over the budget" in result.mixed["describe"]
+
+
+class TestRoundToNearestCoverage:
+    """Round-to-nearest rounds what a run with the same flag tunes (MEMORY.md D-054).
+
+    It is the baseline a run with no reference arm is set against, and a
+    baseline that rounds the embedding where the run leaves it dense compares
+    two coverages and calls the difference the tuning's.
+    """
+
+    BLOCK_LAYERS = 14  # two blocks of q, k, v, o and the gated MLP's three
+
+    def test_by_default_the_remainder_is_rounded_too(self, corpus: str, tmp_path: Path) -> None:
+        del corpus  # the fixture replaces the host check and the loader
+        result = api.quantize_round_to_nearest("tiny", output_dir=tmp_path / "rtn")
+        assert "model.embed_tokens" in result.quantized
+        assert len(result.quantized) == self.BLOCK_LAYERS + 1
+        assert result.skipped == ()
+
+    def test_a_dense_remainder_rounds_the_block_layers_alone(
+        self, corpus: str, tmp_path: Path
+    ) -> None:
+        del corpus
+        result = api.quantize_round_to_nearest(
+            "tiny", output_dir=tmp_path / "rtn", dense_remainder=True
+        )
+        assert len(result.quantized) == self.BLOCK_LAYERS
+        assert all(path.startswith("model.layers.") for path in result.quantized)
+        assert result.skipped == (
+            ("model.embed_tokens", "dense by request, to match a reference's coverage"),
+        )
+        record = json.loads((tmp_path / "rtn" / "config.json").read_text(encoding="utf-8"))
+        assert "model.embed_tokens" not in json.dumps(record.get("quantization", {}))
+
+    def test_the_layers_rounded_are_the_layers_a_run_tunes(
+        self, corpus: str, tmp_path: Path
+    ) -> None:
+        tuned = api.quantize(
+            "tiny",
+            output_dir=tmp_path / "out",
+            tuning=TUNING,
+            calibration=corpus,
+            dense_remainder=True,
+        )
+        rounded = api.quantize_round_to_nearest(
+            "tiny", output_dir=tmp_path / "rtn", dense_remainder=True
+        )
+        assert set(rounded.quantized) == set(tuned.scheme_by_layer)
+        assert set(rounded.skipped) == set(tuned.skipped)

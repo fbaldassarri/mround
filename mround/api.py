@@ -37,6 +37,7 @@ record the decisions.
 from __future__ import annotations
 
 import dataclasses
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
     from mround.pipeline.runner import BlockResult, RunSummary
     from mround.pipeline.scoring import ScoringProgress
     from mround.planner.memory import MemoryCheck, RunShape
+    from mround.planner.timing import TimePrediction
 
 __all__ = [
     "Coverage",
@@ -306,6 +308,44 @@ def _refuse_unrunnable(export_format: str, holdout_batches: int) -> None:
         raise CalibrationError(msg)
 
 
+def _refuse_unusable_plan(
+    plan: Mapping[str, int] | None,
+    average_bits: float | None,
+    candidate_bits: Sequence[int],
+) -> None:
+    """Refuse a given plan no mixed run can tune at, before anything is loaded.
+
+    Whether it covers the right layers needs the model, and is checked where
+    the model is (:func:`_given_plan`); what needs only the arguments is
+    checked here, so that a plan missing its average or carrying a width off
+    the menu costs no download.
+
+    Raises:
+        SchemeError: If ``plan`` is given without ``average_bits``, is empty,
+            or assigns a width that is not on ``candidate_bits``.
+    """
+    from mround.exceptions import SchemeError  # noqa: PLC0415
+
+    if plan is None:
+        return
+    if average_bits is None:
+        msg = (
+            "a given plan is a mixed run's allocation; pass average_bits too, which the "
+            "plan is reported against and which sets the remainder's width"
+        )
+        raise SchemeError(msg)
+    if not plan:
+        msg = "a given plan must assign a width to every block layer; this one is empty"
+        raise SchemeError(msg)
+    menu = sorted({int(width) for width in candidate_bits})
+    off = sorted({(path, width) for path, width in plan.items() if int(width) not in menu})
+    if off:
+        shown = ", ".join(f"{path} at {width}" for path, width in off[:4])
+        more = f" and {len(off) - 4} more" if len(off) > 4 else ""  # noqa: PLR2004
+        msg = f"a given plan may assign only widths in candidate_bits={menu}; it has {shown}{more}"
+        raise SchemeError(msg)
+
+
 def _require_supported_host() -> None:
     """Refuse a host that cannot run MRound, before anything imports MLX.
 
@@ -332,7 +372,7 @@ def quantize(
     symmetry: Symmetry = Symmetry.SYMMETRIC,
     average_bits: float | None = None,
     candidate_bits: Sequence[int] = (2, 3, 4),
-    sensitivity_gradients: str = "widest",
+    sensitivity_gradients: str = "auto",
     remainder_bits: int | None = None,
     dense_remainder: bool = False,
     scoring_samples: int | None = None,
@@ -345,6 +385,7 @@ def quantize(
     quantized_inputs: bool = True,
     holdout_batches: int = 0,
     per_layer_recipe: bool = False,
+    plan: Mapping[str, int] | None = None,
     scale_init: ScaleInit | str | None = None,
     min_block_coverage: float = MIN_BLOCK_COVERAGE,
     seed: int | None = None,
@@ -367,8 +408,8 @@ def quantize(
         symmetry: Signed or unsigned code range.
         average_bits: Target average code bits per weight over the block
             layers, for mixed precision. Setting this engages the planner: a
-            sensitivity scoring pass (by default one backward per batch at
-            the widest candidate, see ``sensitivity_gradients``), then an exact
+            sensitivity scoring pass (see ``sensitivity_gradients`` for where
+            its gradients are taken), then an exact
             allocation under the size budget the average implies, defined so
             that an integer average competes under exactly the uniform width's
             ceiling. Must lie within the candidate range. The block layers
@@ -388,13 +429,18 @@ def quantize(
             wins. Scoring cost and scoring memory grow linearly with the
             count; averages outside the band need their own menu.
         sensitivity_gradients: Where the scoring gradients come from.
-            ``"widest"``, the default, takes one backward at the widest
-            candidate and scores every width's perturbation against it; it
-            won the A/B on both averages tested and is MRound's measured
+            ``"widest"`` takes one backward at the widest candidate and
+            scores every width's perturbation against it, MRound's measured
             divergence from the reference (MEMORY.md D-034). ``"own_width"``
             is the reference's procedure, each width scored on the model
-            quantized at that width, retained as the reference-faithful
-            control. Ignored without ``average_bits``.
+            quantized at that width. ``"auto"``, the default, takes
+            ``"own_width"`` when the layers the plan scores hold at least
+            :data:`~mround.planner.sensitivity.OWN_WIDTH_FROM_WEIGHTS`
+            weights and ``"widest"`` below (D-053): measured at mixed 2.5,
+            ``"own_width"`` scored 18.1 and 10.9 percent worse than
+            ``"widest"`` on 135 million and 0.5 billion parameter models and
+            5.29 percent better at 3 billion. Ignored without
+            ``average_bits``.
         remainder_bits: Width for the tensors outside the block loop in a
             mixed run, overriding the default of the supported width nearest
             the average, ties toward more bits. The tie direction is a
@@ -439,6 +485,19 @@ def quantize(
             layer arm, 0.75 percent worse at seed 42, so off stays the rule.
             Ignored without ``average_bits``, since a uniform run has one width.
             MEMORY.md D-043.
+        plan: A mixed run's allocation given rather than planned: the width of
+            every block layer, keyed by the dotted paths the run record's
+            ``assignments`` use. The scoring pass and the allocator are
+            skipped, and the block loop tunes each layer at the width given,
+            so that a run can be tuned at another planner's allocation, the
+            reference's for one (MEMORY.md Q-016). Requires ``average_bits``,
+            which the plan is reported against and which still sets the
+            remainder's width; every width must be on ``candidate_bits``, and
+            the plan must name every block layer a scored plan would cover
+            and nothing else. Refused otherwise, the first two before the
+            model loads. A diagnosis rather than a setting: nothing here
+            checks that the plan is a good one, and its size is reported, not
+            held to the budget.
         scale_init: How each group's scale is initialized. ``OBSERVED_RANGE``
             derives it from the group extremes; ``SEARCHED`` runs the v2 grid
             search per group, importance-weighted by the activations each
@@ -490,7 +549,9 @@ def quantize(
 
     Raises:
         PlatformError: If the host is not a supported Apple Silicon Mac.
-        SchemeError: If the requested scheme is malformed.
+        SchemeError: If the requested scheme is malformed, or ``plan`` is
+            given without ``average_bits``, with a width off ``candidate_bits``
+            or over layers other than the ones a scored plan would cover.
         ArchitectureError: If the model cannot be loaded or walked.
         CalibrationError: If the corpus cannot be built, or
             ``holdout_batches`` is negative.
@@ -516,6 +577,7 @@ def quantize(
     from mround.planner.memory import RunShape  # noqa: PLC0415
 
     _refuse_unrunnable(export_format, holdout_batches)
+    _refuse_unusable_plan(plan, average_bits, candidate_bits)
 
     resolved, widths = _resolve_scheme(
         bits=bits,
@@ -550,9 +612,25 @@ def quantize(
         scoring_batch_size=scoring_batch_size,
         dense_remainder=dense_remainder,
     )
+    if plan is not None:
+        # A given plan skips the scoring pass, the stage that sets a mixed
+        # run's peak, so the prediction is the block loop's at the widest
+        # width the plan may assign.
+        run_shape = dataclasses.replace(run_shape, mixed=False)
     config, memory = _check_memory_first(
         model, run_shape, budget=memory_budget, enforce=memory_check
     )
+    # And how long it will take, on the machine the rule for time was fitted
+    # on (ROAD-TO-1.0.md M2, mround/planner/timing.py), from the shape the
+    # memory check read; said, never enforced.
+    timing_args: dict[str, Any] = {
+        "candidate_bits": candidate_bits if average_bits is not None else (),
+        "per_layer_recipe": per_layer_recipe,
+        "scoring_samples": scoring_samples,
+        "scoring_seq_len": scoring_seq_len,
+        "gradient_source": sensitivity_gradients,
+    }
+    timing = _predict_time(memory, run_shape, tuning, resolved.bits, **timing_args)
 
     reset_peak_memory()
     # Lazily: the block loop reads one block's weights at a time and releases
@@ -562,6 +640,8 @@ def quantize(
     memory = _check_memory_loaded(
         bundle, config, memory, run_shape, budget=memory_budget, enforce=memory_check
     )
+    if timing is None:
+        timing = _predict_time(memory, run_shape, tuning, resolved.bits, **timing_args)
 
     _require_coverage(bundle, resolved, min_block_coverage)
 
@@ -580,7 +660,21 @@ def quantize(
     scheme_overrides: dict[str, QuantScheme] | None = None
     plan_info: dict[str, Any] | None = None
     remainder_scheme = resolved
-    if average_bits is not None:
+    if average_bits is not None and plan is not None:
+        # Read off the layers' shapes alone, so the lazily loaded weights stay
+        # on disk and the loop below reads them one block at a time as usual.
+        scheme_overrides, plan_info = _given_plan(
+            bundle,
+            resolved,
+            average_bits,
+            candidate_bits,
+            plan,
+            expected_blocks=bundle.config.get("num_hidden_layers"),
+            remainder_bits=remainder_bits,
+        )
+        remainder_scheme = dataclasses.replace(resolved, bits=int(plan_info["remainder_bits"]))
+        print(f"  {plan_info['describe']}")
+    elif average_bits is not None:
         scheme_overrides, plan_info = _plan_mixed(
             bundle,
             resolved,
@@ -619,7 +713,7 @@ def quantize(
         expected_blocks=bundle.config.get("num_hidden_layers"),
     )
 
-    dense, skipped, after_blocks, after_peak = _finish_checkpoint(
+    dense, skipped, after_blocks, after_peak, after_seconds = _finish_checkpoint(
         bundle,
         destination,
         quantized,
@@ -663,6 +757,8 @@ def quantize(
                 # What the run was predicted to reach before it started, beside
                 # what it reached under "result", so every run checks the rule.
                 "memory_check": None if memory is None else memory.record(enforced=memory_check),
+                # And how long it was predicted to take, beside "timing" below.
+                "time_check": None if timing is None else timing.record(),
                 "result": {
                     "blocks": len(summary.blocks),
                     "reverted": summary.reverted,
@@ -672,6 +768,10 @@ def quantize(
                     # Where the peak was reached, stage by stage and block by
                     # block (runner.BlockResult.stage_peaks), from 2026-10-10.
                     "memory": summary.memory_record(),
+                    # Where the time went, block by block, and the remainder
+                    # and the export after the loop, which no run timed before
+                    # 2026-11-13.
+                    "timing": {**summary.timing_record(), "after_blocks_seconds": after_seconds},
                     "bits_per_weight": storage.bits_per_weight,
                     "stored_bytes": storage.stored_bytes,
                     "skipped": [list(entry) for entry in skipped],
@@ -745,6 +845,7 @@ def quantize_round_to_nearest(
     bits: int = 4,
     group_size: int = 64,
     symmetry: Symmetry = Symmetry.SYMMETRIC,
+    dense_remainder: bool = False,
 ) -> RoundToNearestResult:
     """Quantize a model without learning anything, and write a checkpoint.
 
@@ -753,9 +854,10 @@ def quantize_round_to_nearest(
     learned quantities held at their initial values, which is exactly
     round-to-nearest. Its purpose is to be the number learned rounding has to
     beat, measured on the same model with the same export path. At 4 bits and
-    above the full pipeline starts from the same scales, so an improvement is
-    attributable to the learning; below 4 bits it starts from searched scales
-    (D-046) and the gap includes the search.
+    above :func:`quantize`'s own default starts from the same scales, so an
+    improvement is attributable to the learning; below 4 bits it starts from
+    searched scales (D-046) and the gap includes the search, as it does at any
+    width for a run given ``scale_init="searched"``.
 
     It needs no calibration data and no block loop.
 
@@ -765,6 +867,12 @@ def quantize_round_to_nearest(
         bits: Uniform bit width.
         group_size: Weights sharing one scale, along the input dimension.
         symmetry: Signed or unsigned code range.
+        dense_remainder: Round only the linear layers inside the transformer
+            blocks, the ones :func:`quantize`'s block loop tunes, and leave
+            every tensor outside them at the model's own precision, as
+            :func:`quantize` does with the same flag. Off by default, for the
+            reason :func:`quantize` gives; on, this is the baseline of a run
+            made with it, rounding the same tensors (MEMORY.md D-054).
 
     Returns:
         Where the checkpoint went, and what was and was not quantized.
@@ -791,11 +899,26 @@ def quantize_round_to_nearest(
 
     quantized: dict[str, QuantizedLayer] = {}
     skipped: list[tuple[str, str]] = []
-    for path, layer, reason in _round_to_nearest_layers(bundle, scheme):
+    inside = _block_linear_paths(bundle) if dense_remainder else None
+    outside: set[str] = set()
+    if inside is not None:
+        from mround.pipeline.blocks import iter_quantizable_modules  # noqa: PLC0415
+
+        outside = {
+            path for path, _, _ in iter_quantizable_modules(bundle.model, group_size=group_size)
+        } - inside
+    for path, layer, reason in _round_to_nearest_layers(bundle, scheme, skip=outside):
         if layer is None:
             skipped.append((path, reason))
         else:
             quantized[path] = layer
+    if inside is not None:
+        # Reported as skips with their reason, as a run with the same flag
+        # reports its remainder, so the two checkpoints say the same thing.
+        skipped.extend(
+            (path, reason)
+            for path, _, reason in _round_to_nearest_layers(bundle, scheme, skip=inside, dense=True)
+        )
 
     if not quantized:
         msg = (
@@ -828,7 +951,7 @@ def plan_mixed_precision(
     scale_init: ScaleInit | str | None = None,
     scheme: QuantScheme | None = None,
     calibration: str = "auto",
-    sensitivity_gradients: str = "widest",
+    sensitivity_gradients: str = "auto",
     remainder_bits: int | None = None,
     scoring_samples: int | None = None,
     scoring_seq_len: int | None = None,
@@ -862,8 +985,8 @@ def plan_mixed_precision(
             predicts score the same grid.
         scheme: A complete scheme, overriding the four fields above.
         calibration: Corpus identifier, or ``"auto"`` for the project default.
-        sensitivity_gradients: ``"widest"`` or ``"own_width"``; see
-            :func:`mround.pipeline.scoring.score_widths`.
+        sensitivity_gradients: ``"auto"``, the default, ``"widest"`` or
+            ``"own_width"``; see :func:`quantize`.
         remainder_bits: Width for the tensors outside the block stack, or
             ``None`` for the supported width nearest the average.
         scoring_samples: Sequences drawn for scoring, or ``None`` for
@@ -1269,6 +1392,47 @@ def _check_memory_loaded(
     )
 
 
+def _predict_time(
+    memory: MemoryCheck | None,
+    run: RunShape,
+    tuning: TuningConfig,
+    bits: int,
+    *,
+    candidate_bits: Sequence[int],
+    per_layer_recipe: bool,
+    scoring_samples: int | None,
+    scoring_seq_len: int | None,
+    gradient_source: str,
+) -> TimePrediction | None:
+    """Predict the run's time from the shape the memory check read, and say it.
+
+    Returns:
+        The prediction, or ``None`` when there is no shape to read, where the
+        memory check said so already.
+
+    Raises:
+        SchemeError: If a mixed run names a scoring gradient source that
+            does not exist, which the planner would refuse later.
+    """
+    from mround.planner.timing import predict_run_time  # noqa: PLC0415
+
+    if memory is None:
+        return None
+    prediction = predict_run_time(
+        memory.prediction.model,
+        run,
+        tuning,
+        bits,
+        candidate_bits=candidate_bits,
+        per_layer_recipe=per_layer_recipe,
+        scoring_samples=scoring_samples,
+        scoring_seq_len=scoring_seq_len,
+        gradient_source=gradient_source,
+    )
+    print(f"  {prediction.describe()}", flush=True)
+    return prediction
+
+
 def _refuse_remote_code(config: Mapping[str, Any]) -> None:
     """Refuse a model whose Python has to travel with its weights.
 
@@ -1312,7 +1476,7 @@ def _plan_mixed(
     corpus: str,
     *,
     expected_blocks: int | None,
-    gradient_source: str = "widest",
+    gradient_source: str = "auto",
     remainder_bits: int | None = None,
     scoring_samples: int | None = None,
     scoring_seq_len: int | None = None,
@@ -1321,13 +1485,14 @@ def _plan_mixed(
 ) -> tuple[dict[str, QuantScheme], dict[str, Any]]:
     """Score, allocate, and return per-layer schemes plus what was decided.
 
-    The procedure is DOCUMENTATION.md 1.5's: by default one causal-LM backward
-    per batch at the widest candidate, scoring every width's perturbation
-    against it (D-034; the reference's own-width backward stays available as
-    the control), the cancellation-free DeltaLoss per layer, and the exact
-    allocator under the budget the average implies. The scoring draw comes from
-    the same corpus and seed as the main calibration, so the plan's identity is
-    fixed by the run configuration alone.
+    The procedure is DOCUMENTATION.md 1.5's: the gradients from one causal-LM
+    backward per batch at the widest candidate (D-034) or from one per width
+    on the model quantized at that width, the reference's procedure, chosen by
+    the size of what is scored unless the caller names one
+    (``gradient_source``, D-053), the cancellation-free DeltaLoss per layer,
+    and the exact allocator under the budget the average implies. The scoring
+    draw comes from the same corpus and seed as the main calibration, so the
+    plan's identity is fixed by the run configuration alone.
 
     **The scoring size is an argument, and its default is the measured one.**
     D-031 first took the reference's own 16 sequences of 256 tokens; the
@@ -1376,7 +1541,9 @@ def _plan_mixed(
     Raises:
         SchemeError: If there are no candidates, a candidate is unsupported,
             the average lies outside the candidate range, which no allocation
-            can reach, or ``scoring_batch_size`` is below 1.
+            can reach, ``scoring_batch_size`` is below 1, or
+            ``gradient_source`` is none of ``"auto"``, ``"own_width"`` and
+            ``"widest"``.
     """
     import math  # noqa: PLC0415
 
@@ -1385,11 +1552,12 @@ def _plan_mixed(
         DEFAULT_SEED,
         build_calibration_set,
     )
-    from mround.pipeline.scoring import score_widths  # noqa: PLC0415
+    from mround.pipeline.scoring import eligible_block_layers, score_widths  # noqa: PLC0415
     from mround.planner.allocator import allocate_bits  # noqa: PLC0415
     from mround.planner.sensitivity import (  # noqa: PLC0415
         SENSITIVITY_SAMPLES,
         SENSITIVITY_SEQ_LEN,
+        gradient_source_for,
         mixed_budget_bits,
         score_layer_options,
     )
@@ -1415,6 +1583,16 @@ def _plan_mixed(
     if scoring_batch_size is not None and int(scoring_batch_size) < 1:
         msg = f"scoring_batch_size must be at least 1, or None; got {scoring_batch_size}"
         raise SchemeError(msg)
+    # The size rule reads the layers' shapes alone, which on a lazily loaded
+    # model touches no weight.
+    _, eligible, _, _ = eligible_block_layers(
+        bundle.model, base.group_size, expected_blocks=expected_blocks
+    )
+    scored_weights = sum(
+        int(layer.weight.shape[0]) * int(layer.weight.shape[1]) for layer in eligible.values()
+    )
+    requested_source = gradient_source
+    gradient_source = gradient_source_for(requested_source, scored_weights)
     samples = SENSITIVITY_SAMPLES if scoring_samples is None else int(scoring_samples)
     sequence = SENSITIVITY_SEQ_LEN if scoring_seq_len is None else int(scoring_seq_len)
     batch = (
@@ -1494,6 +1672,10 @@ def _plan_mixed(
         # unaffected.
         "scoring_batch_size": batch,
         "gradient_source": gradient_source,
+        # What was asked for, and what the size rule read, so that a source
+        # the rule chose is told apart from one a caller named (D-053).
+        "gradient_source_requested": requested_source,
+        "scored_weights": scored_weights,
         # The full per-layer map, because the first measured allocation was
         # only diagnosable by digging it back out of the checkpoint config.
         "assignments": {path: int(width) for path, width in sorted(allocation.by_layer.items())},
@@ -1503,6 +1685,118 @@ def _plan_mixed(
             f"scored {samples}x{sequence} in {scored.seconds:.1f}s with "
             f"gradients at "
             f"{'the widest width' if gradient_source == 'widest' else 'each own width'}"
+            + (
+                f", by size at {scored_weights / 1e9:.2f} billion weights"
+                if requested_source == "auto"
+                else ""
+            )
+        ),
+    }
+    return overrides, info
+
+
+def _given_plan(
+    bundle: ModelBundle,
+    base: QuantScheme,
+    average_bits: float,
+    candidate_bits: Sequence[int],
+    plan: Mapping[str, int],
+    *,
+    expected_blocks: int | None,
+    remainder_bits: int | None = None,
+) -> tuple[dict[str, QuantScheme], dict[str, Any]]:
+    """Schemes per layer from a plan someone else made, and what it amounts to.
+
+    The counterpart of :func:`_plan_mixed` for a run that is handed its
+    allocation, the reference's for one, instead of scoring and allocating its
+    own (MEMORY.md Q-016 asks whether MRound's allocation or its tuning is
+    what trails the reference's own SignRound v2 at mixed 2.5 on 3B, and the
+    two can only be separated by tuning at the other side's plan). The layers
+    are the ones a scored plan would cover, found the same way
+    (:func:`mround.pipeline.scoring.eligible_block_layers`), and the plan must
+    name exactly those. Its size is computed with the planner's own cost model
+    and reported against the budget the average implies, never held to it: the
+    plan is the experiment's input, and refusing one a bit over would refuse
+    the comparison it exists for.
+
+    Returns:
+        The same two things :func:`_plan_mixed` returns, the summary with the
+        same keys, its scoring fields empty, and ``"plan": "given"``.
+
+    Raises:
+        SchemeError: If the plan names a layer the run does not plan over, or
+            leaves one out.
+    """
+    import math  # noqa: PLC0415
+
+    from mround.exceptions import SchemeError  # noqa: PLC0415
+    from mround.pipeline.scoring import eligible_block_layers  # noqa: PLC0415
+    from mround.planner.sensitivity import mixed_budget_bits, storage_bits  # noqa: PLC0415
+
+    widths = sorted({int(width) for width in candidate_bits})
+    _, eligible, _, _ = eligible_block_layers(
+        bundle.model, base.group_size, expected_blocks=expected_blocks
+    )
+    unknown = sorted(set(plan) - set(eligible))
+    missing = sorted(set(eligible) - set(plan))
+    if unknown or missing:
+        parts = []
+        if unknown:
+            parts.append(f"{len(unknown)} the run does not plan over, the first {unknown[0]}")
+        if missing:
+            parts.append(f"{len(missing)} left out, the first {missing[0]}")
+        msg = (
+            "a given plan must name exactly the block layers a scored plan would cover; "
+            "this one names " + " and ".join(parts)
+        )
+        raise SchemeError(msg)
+
+    shapes = {
+        path: (int(layer.weight.shape[0]), int(layer.weight.shape[1]))
+        for path, layer in eligible.items()
+    }
+    dtype_bits = 16 if str(bundle.dtype).endswith(("float16", "bfloat16")) else 32
+    by_layer = {path: int(plan[path]) for path in eligible}
+    cost = sum(
+        storage_bits(shapes[path], width, base.group_size, dtype_bits=dtype_bits)
+        for path, width in by_layer.items()
+    )
+    budget = mixed_budget_bits(shapes, average_bits, base.group_size, dtype_bits=dtype_bits)
+    elements = sum(out * inner for out, inner in shapes.values())
+    metadata = sum(
+        2 * out * base.groups_per_row(inner) * dtype_bits for out, inner in shapes.values()
+    )
+    achieved = (cost - metadata) / elements
+    counts = {width: sum(1 for chosen in by_layer.values() if chosen == width) for width in widths}
+    # The remainder's width the same way a scored plan sets it: nearest the
+    # average, ties toward more bits (D-034), unless overridden.
+    if remainder_bits is None:
+        remainder = min(8, max(2, math.floor(average_bits + 0.5)))
+    else:
+        remainder = int(remainder_bits)
+        dataclasses.replace(base, bits=remainder)
+    overrides = {path: dataclasses.replace(base, bits=width) for path, width in by_layer.items()}
+    summary = ", ".join(f"{count} layers at {width} bits" for width, count in counts.items())
+    over = "" if cost <= budget else f", {cost - budget} bits over the budget"
+    info: dict[str, Any] = {
+        "average_bits": average_bits,
+        "candidate_bits": widths,
+        "achieved_code_bits": achieved,
+        "layers_by_width": {str(width): count for width, count in counts.items()},
+        "remainder_bits": remainder,
+        "budget_bits": budget,
+        "allocated_cost_bits": cost,
+        "predicted_loss": None,
+        "scoring_seconds": 0.0,
+        "scoring_samples": None,
+        "scoring_seq_len": None,
+        "scoring_batch_size": None,
+        "gradient_source": None,
+        "plan": "given",
+        "assignments": dict(sorted(by_layer.items())),
+        "describe": (
+            f"given a plan of {summary}; {achieved:.3f} code bits per weight against a "
+            f"target of {average_bits:g}{over}, remainder at {remainder} bits, no scoring pass"
         ),
     }
     return overrides, info
@@ -1516,7 +1810,7 @@ def _finish_checkpoint(
     *,
     dense_remainder: bool,
     model: str | Path,
-) -> tuple[dict[str, Any], list[tuple[str, str]], dict[str, int], int]:
+) -> tuple[dict[str, Any], list[tuple[str, str]], dict[str, int], int, dict[str, float]]:
     """Round the tensors outside the blocks, write the checkpoint, and measure both.
 
     Every linear layer and embedding outside the block stack: the embeddings
@@ -1530,7 +1824,9 @@ def _finish_checkpoint(
 
     Returns:
         The tensors left dense, the skips with their reasons, the peak of each
-        stage (``remainder`` and ``export``), and the largest figure seen.
+        stage (``remainder`` and ``export``), the largest figure seen, and the
+        seconds of each stage, which the run records from 2026-11-13 so that
+        the rule for time can add them (``mround/planner/timing.py``).
 
     Raises:
         ArchitectureError: If nothing at all could be quantized.
@@ -1540,6 +1836,7 @@ def _finish_checkpoint(
 
     meter = StageMeter()
     skipped: list[tuple[str, str]] = []
+    started = time.perf_counter()
     with meter.stage("remainder"):
         for path, layer, reason in _round_to_nearest_layers(
             bundle, remainder_scheme, skip=set(quantized), dense=dense_remainder
@@ -1553,9 +1850,28 @@ def _finish_checkpoint(
             f"nothing in {model!r} could be quantized at group_size={remainder_scheme.group_size}."
         )
         raise ArchitectureError(msg)
+    rounded = time.perf_counter()
     with meter.stage("export"):
         dense = _write_checkpoint(bundle, destination, quantized)
-    return dense, skipped, meter.take(), meter.peak
+    seconds = {"remainder": rounded - started, "export": time.perf_counter() - rounded}
+    return dense, skipped, meter.take(), meter.peak, seconds
+
+
+def _block_linear_paths(bundle: ModelBundle) -> set[str]:
+    """Every linear layer inside the transformer blocks, by dotted path.
+
+    The block loop's view of the model, walked as :func:`block_coverage` walks
+    it: what a run tunes, and so what its round-to-nearest baseline has to
+    round when the run leaves everything else dense. Reads module names only.
+    """
+    from mround.pipeline.blocks import discover_blocks, iter_quantizable_linears  # noqa: PLC0415
+
+    blocks = discover_blocks(bundle.model, expected=bundle.config.get("num_hidden_layers"))
+    return {
+        f"{block.name}.{name}"
+        for block in blocks
+        for name, _ in iter_quantizable_linears(block.module)
+    }
 
 
 def _round_to_nearest_layers(

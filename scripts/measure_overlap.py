@@ -84,12 +84,12 @@ MIN_TOKENS = 60
 
 # The default gate. At the calibrated floor nothing in MRound reaches 0.79
 # against any tree measured, related or not (0.788 against auto-round 0.14.2,
-# 0.749 against 0.15.0 and 0.15.1, 0.732 against 0.16.0), while an actual
-# transcription scores above 0.95 on a view that cannot see renaming. Sitting
-# the gate at 0.85 leaves six hundredths of headroom for ordinary drift in
-# either codebase and still fires long before a copied function could hide.
-# Anything reaching it wants a human reading the pair side by side, not an
-# automatic verdict.
+# 0.749 against 0.15.0 and 0.15.1, 0.735 against 0.16.0 and 0.16.1, measured
+# again on 2026-11-04), while an actual transcription scores above 0.95 on a
+# view that cannot see renaming. Sitting the gate at 0.85 leaves six hundredths
+# of headroom for ordinary drift in either codebase and still fires long before
+# a copied function could hide. Anything reaching it wants a human reading the
+# pair side by side, not an automatic verdict.
 THRESHOLD = 0.85
 
 # How many of the closest pairs to print. Enough to see the shape of the top of

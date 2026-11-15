@@ -104,10 +104,19 @@ class RunRecord:
             are all ``None``, and must drop every row a retraction names.
             ``zeroshot``, from 2026-09-28, is the task suite scored on the
             three checkpoints of one head to head row, which its
-            ``evaluation`` names as ``head_to_head_row`` (MEMORY.md D-049); a
-            reader averaging perplexities skips it too, since its perplexity
-            field is ``None`` and its scheme, tuning and calibration repeat
-            the row it cites.
+            ``evaluation`` names as ``head_to_head_row`` (MEMORY.md D-049), or
+            from 2026-11-15 of one ``parity-rtn`` row, named as ``rtn_row``,
+            its ``tasks`` keyed ``original``, ``rtn`` and ``quantized``
+            (MEMORY.md D-056); a reader averaging perplexities skips it too,
+            since its perplexity field is ``None`` and its scheme, tuning and
+            calibration repeat the row it cites. ``parity-rtn``, from
+            2026-11-09, is written by the same harness as
+            ``parity-reference``, for an MRound checkpoint with no reference
+            arm: set against round-to-nearest, built at the same width, group
+            size and coverage, and against the original, its perplexity keyed
+            ``original``, ``rtn`` and ``quantized`` (MEMORY.md D-054). It
+            states no bar, so a reader of head to head rows filters it out by
+            kind.
         model: Hugging Face id or path of the model measured.
         scheme: Bits, group size, symmetry, as a plain mapping.
         tuning: The tuning configuration, or ``None`` for round-to-nearest.
@@ -121,9 +130,9 @@ class RunRecord:
             requested count, 65536, where 65504 were scored), ``seq_len``,
             ``stride``, and from row 45 ``requested_tokens`` and ``dtype``.
             ``generate`` and ``zeroshot`` rows carry keys of their own; a
-            ``zeroshot`` row names ``head_to_head_row``, the suite, the
-            ``lm_eval`` release, the requests and scored tokens per arm, and
-            from row 98 ``mlx_device``.
+            ``zeroshot`` row names ``head_to_head_row`` or ``rtn_row``, the
+            suite, the ``lm_eval`` release, the requests and scored tokens per
+            arm, and from row 98 ``mlx_device``.
         perplexity: Measured perplexities by label, such as ``original`` and
             ``quantized``. Row 9, the backfilled parity row, keys MRound's
             side ``mround`` where the live rows key it ``quantized``.
@@ -134,7 +143,9 @@ class RunRecord:
             seconds, the hosts and, on mixed rows from row 38,
             ``mround_scoring_seconds`` on head to head rows, whose peaks are
             under ``memory`` from schema 2; tokens per second and a peak in GB
-            on ``generate`` rows; ``seconds`` per arm on ``zeroshot`` rows.
+            on ``generate`` rows; ``seconds`` per arm on ``zeroshot`` rows;
+            MRound's seconds and ``rtn_seconds``, the baseline's build, on
+            ``parity-rtn`` rows.
         environment: Machine and software versions where the row was
             written, which for a head to head row is the scoring machine and
             not the machine that produced the reference arm. Its ``packages``

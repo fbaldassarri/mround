@@ -362,8 +362,19 @@ class TestProjectLedger:
         + ("parity-reference",) * 3  # rows 124 to 126
         + ("parity-reference",) * 3  # rows 127 to 129
     )
+    # ``parity-rtn`` from row 230 (MEMORY.md D-054): a run with no reference
+    # arm set against round-to-nearest, which no head to head reader takes in.
     KINDS = frozenset(
-        {"rtn", "quantize", "generate", "parity-reference", "provenance", "retraction", "zeroshot"}
+        {
+            "rtn",
+            "quantize",
+            "generate",
+            "parity-reference",
+            "parity-rtn",
+            "provenance",
+            "retraction",
+            "zeroshot",
+        }
     )
 
     def test_rows_55_to_129_are_schema_2_and_keep_their_kinds(self) -> None:
@@ -971,11 +982,20 @@ class TestProjectLedger:
             if row["kind"] == "zeroshot"
         ]
         assert len(zero_shot) >= 8, "rows 97 to 104"
+        # From D-056 a zero shot row may cite a row set against round-to-nearest
+        # instead, under its own key and with round-to-nearest's arm.
+        cites = {
+            "head_to_head_row": ("parity-reference", {"original", "reference", "quantized"}),
+            "rtn_row": ("parity-rtn", {"original", "rtn", "quantized"}),
+        }
         for number, row in zero_shot:
-            cited = row["evaluation"]["head_to_head_row"]
+            named = [key for key in cites if key in row["evaluation"]]
+            assert len(named) == 1, f"row {number} names {named}"
+            kind, arms = cites[named[0]]
+            cited = row["evaluation"][named[0]]
             assert 1 <= cited < number, f"row {number} cites a later row"
             original = entries[cited - 1]
-            assert original["kind"] == "parity-reference", f"row {number} cites row {cited}"
+            assert original["kind"] == kind, f"row {number} cites row {cited}"
             assert cited not in retracted, f"row {number} cites a retracted row"
             assert re.search(rf"\brow {cited}\b", row["notes"]), f"row {number}"
             for field in ("model", "scheme", "calibration", "tuning"):
@@ -983,6 +1003,6 @@ class TestProjectLedger:
             assert row["perplexity"] is None
             assert original.get("tasks") is None
             tasks = row.get("tasks") or {}
-            assert set(tasks) == {"original", "reference", "quantized"}, f"row {number}"
+            assert set(tasks) == arms, f"row {number}"
             for arm in tasks.values():
                 assert set(arm) == set(row["evaluation"]["suite"]), f"row {number}"

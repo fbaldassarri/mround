@@ -186,13 +186,14 @@ def test_the_entry_points_leave_the_scale_initialization_to_resolution() -> None
 
 def test_the_mixed_precision_levers_default_to_the_measured_values() -> None:
     # D-035: the candidate menu and the gradient source are measured decisions,
-    # and the CLI must defer to them rather than restate them.
+    # and the CLI must defer to them rather than restate them. The gradient
+    # source's default is D-053's size rule, which the planner resolves.
     for entry_point in (api.quantize, api.plan_mixed_precision):
         candidates = _keyword_default(entry_point, "candidate_bits")
         assert isinstance(candidates, tuple)
         assert candidates == (2, 3, 4)
-    assert _keyword_default(api.quantize, "sensitivity_gradients") == "widest"
-    assert _keyword_default(api.plan_mixed_precision, "sensitivity_gradients") == "widest"
+    assert _keyword_default(api.quantize, "sensitivity_gradients") == "auto"
+    assert _keyword_default(api.plan_mixed_precision, "sensitivity_gradients") == "auto"
     parsed = build_parser().parse_args(["quantize", "a-model", "-o", "out"])
     assert tuple(int(width) for width in parsed.options.split(",")) == (2, 3, 4)
 

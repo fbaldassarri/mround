@@ -110,8 +110,9 @@ class BlockResult:
     Attributes:
         index: Block position.
         name: Dotted path from the model root.
-        initial_loss: Reconstruction loss before tuning, which is what
-            round-to-nearest achieves.
+        initial_loss: Reconstruction loss before tuning: the block rounded to
+            nearest at its initial scales, which are round-to-nearest's own
+            unless the scheme searched them (DOCUMENTATION.md 5.10).
         final_loss: Reconstruction loss after tuning.
         iterations: Optimization steps actually run.
         seconds: Wall-clock time.
@@ -119,10 +120,11 @@ class BlockResult:
             block.
         tuned: Layer names within the block that were tuned.
         skipped: Layer names left dense, with the reason.
-        reverted: Whether tuning made this block worse and round-to-nearest was
-            kept instead. Counting these is how a recipe that is quietly not
-            working announces itself: a run where most blocks revert has a
-            learning rate or an objective problem, not a marginal result.
+        reverted: Whether tuning made this block worse and its untuned
+            rounding was kept instead. Counting these is how a recipe that is
+            quietly not working announces itself: a run where most blocks
+            revert has a learning rate or an objective problem, not a marginal
+            result.
         generalization_gap: How much better tuning did on its own batches than
             on held-out ones, as a difference of fractional improvements.
             ``None`` when nothing was held out, in which case overfitting is
@@ -157,11 +159,11 @@ class BlockResult:
 
     @property
     def improvement(self) -> float:
-        """Fractional loss reduction against round-to-nearest.
+        """Fractional loss reduction against the block's untuned rounding.
 
-        The honest per-block measure of whether learned rounding earned its
+        The honest per block measure of whether learned rounding earned its
         cost. Exactly zero means the block reverted, which is the floor: tuning
-        cannot make a block worse than the baseline, it can only fail to help.
+        cannot make a block worse than its start, it can only fail to help.
         """
         if self.initial_loss <= 0.0:
             return 0.0
@@ -169,7 +171,9 @@ class BlockResult:
 
     def describe(self) -> str:
         """One line for a progress log."""
-        note = "  reverted to round-to-nearest" if self.reverted else ""
+        # Its untuned rounding, which is round-to-nearest only when the scales
+        # were not searched (MEMORY.md, "Rows 233 to 236").
+        note = "  reverted to its untuned rounding" if self.reverted else ""
         if self.stage_peaks:
             stage = max(self.stage_peaks, key=self.stage_peaks.__getitem__)
             note = f"  peak {self.stage_peaks[stage] / 1e9:.2f} GB in {stage}{note}"
@@ -226,7 +230,7 @@ class RunSummary:
 
     @property
     def reverted(self) -> int:
-        """Blocks where tuning did not beat round-to-nearest and was discarded."""
+        """Blocks where tuning did not beat the untuned rounding and was discarded."""
         return sum(1 for block in self.blocks if block.reverted)
 
     @property
@@ -263,6 +267,29 @@ class RunSummary:
             "by_stage_bytes": self.stage_peaks(),
             "by_block_bytes": [
                 {"block": block.index, **block.stage_peaks} for block in self.blocks
+            ],
+        }
+
+    def timing_record(self) -> dict[str, Any]:
+        """The loop's time, for the run record: the whole, and block by block.
+
+        A block's seconds are its own tuning, as its progress line reports
+        them, the search included; the rest of the loop is the entrance and
+        the passes that make each block's targets and advance the stream. The
+        rule for time predicts both (``mround/planner/timing.py``), and until
+        2026-11-13 only the logs held the blocks.
+        """
+        blocks = sum(block.seconds for block in self.blocks)
+        return {
+            "loop_seconds": self.total_seconds,
+            "between_blocks_seconds": self.total_seconds - blocks,
+            "by_block": [
+                {
+                    "block": block.index,
+                    "seconds": block.seconds,
+                    "search_seconds": block.search_seconds,
+                }
+                for block in self.blocks
             ],
         }
 
@@ -372,11 +399,13 @@ def block_recipe(
     difference between them is MEMORY.md D-043. ``per_layer`` off is what every
     published mixed run but row 47 was produced with: the block loop resolves
     both the learning rate constant and the outlier rule once from the run's
-    base ``bits``, so a 2 bit layer inside a 4 bit base run is tuned at
-    ``1.0/iters`` with no outlier mask, where the uniform 2 bit arm of the same
-    comparison uses ``2.0/iters`` with the mask on. ``per_layer`` on reads the
-    section the way it is written, giving every layer the rate its own
-    assigned width implies.
+    base ``bits``, so a 2 bit layer inside a 4 bit base run is tuned with no
+    outlier mask, where the uniform 2 bit arm of the same comparison has the
+    mask on. The rates part only at 1000 steps or more, where the constant
+    doubles below 4 bits; until MEMORY.md D-052 it doubled at every budget, so
+    the published mixed runs tuned such a layer at ``1.0/iters`` where the
+    uniform arm used ``2.0/iters``. ``per_layer`` on reads the section the way
+    it is written, giving every layer the rate its own assigned width implies.
 
     The outlier rule cannot be per layer in the same way, because the objective
     is one loss over the whole block rather than one loss per layer. It is

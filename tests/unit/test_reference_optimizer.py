@@ -71,7 +71,7 @@ class TestLinearDecay:
 class TestExcursionBudget:
     """The property that makes the schedule the real constraint on rounding.
 
-    DOCUMENTATION.md section 5.4 and MEMORY.md D-010.
+    DOCUMENTATION.md section 5.4, MEMORY.md D-010 and D-052.
     """
 
     @pytest.mark.parametrize("iters", [50, 200, 500, 1000, 4000])
@@ -86,12 +86,21 @@ class TestExcursionBudget:
         expected = 0.5 * (1 + 1 / iters)
         assert total_excursion(config.resolved_lr(4), iters) == pytest.approx(expected, rel=1e-9)
 
-    @pytest.mark.parametrize("iters", [200, 1000])
-    def test_low_bit_widths_get_twice_the_budget(self, iters: int) -> None:
+    @pytest.mark.parametrize("iters", [1000, 4000])
+    def test_low_bit_widths_get_twice_the_budget_from_1000_steps(self, iters: int) -> None:
         config = TuningConfig(iters=iters)
         low = total_excursion(config.resolved_lr(2), iters)
         high = total_excursion(config.resolved_lr(4), iters)
         assert low == pytest.approx(2 * high, rel=1e-9)
+
+    @pytest.mark.parametrize("iters", [50, 200, 999])
+    def test_below_1000_steps_every_width_gets_the_half_code_budget(self, iters: int) -> None:
+        # The reference's rule, and MRound's since D-052: at the standard 200
+        # steps a 2 bit layer travels as far as a 4 bit one, half a code.
+        config = TuningConfig(iters=iters)
+        low = total_excursion(config.resolved_lr(2), iters)
+        assert low == pytest.approx(V_BOUND * (1 + 1 / iters), rel=1e-9)
+        assert low == total_excursion(config.resolved_lr(4), iters)
 
     def test_the_four_bit_budget_equals_the_half_code_bound(self) -> None:
         # The reason the coupling exists: at 4 bits and above, total travel is

@@ -6,6 +6,183 @@ Notable changes to MRound, newest first. The format follows
 caveat that public interfaces may change between pre-release versions without a
 major bump. Each version is dated by its release tag.
 
+## 0.1.0a6
+
+The release that matches the reference's learning rate at 2 bits and scores a
+mixed precision run's layers by the size of what it scores, and in which every
+run says how long it will take before it starts. At the reference's rate
+MRound's 2 bit result on Qwen2.5-7B-Instruct moved from about six percent behind
+both of the reference's tunings to about two percent ahead of each, on every
+seed; scoring as the reference does from 2.5 billion weights in the scored
+layers up, MRound's own allocation at mixed 2.5 bits on Qwen2.5-3B-Instruct
+leads both of the reference's tunings on every seed, where it trailed the
+reference's own SignRound v2. The ledger grows from 129 rows to 238, appended
+and never edited: every 2 bit table measured again at the new rate on one tree,
+the task suite on the new 0.5B checkpoints, mixed 2.5 bits at three billion
+parameters and the gradient comparison behind the new default, the controls for
+auto-round 0.16.1, and MRound against round-to-nearest at 4 bits from 0.5 to 7
+billion parameters and at 8 and 3 bits, with the memory and time of every size.
+
+### Added
+
+New public names, every new argument and field defaulting to what the code did
+before: `mround.planner.timing` with `predict_time`, `predict_run_time` and the
+`TimePrediction` they return; `mround.planner.sensitivity.gradient_source_for`,
+the rule `sensitivity_gradients="auto"` applies; `RunSummary.timing_record`, the
+loop's time for the run record; and `ScoringProgress`'s `preparations_left` and
+`preparation_seconds`, which the corrected estimate below reads.
+
+RESULTS.md has a section on 8 and 3 bits: Qwen2.5-0.5B-Instruct at each width
+against round-to-nearest, level at 8 bits, where round-to-nearest is already
+within 0.02 percent of the original, and 56.33 percent ahead at 3 bits, taking
+back 86.0 percent of what rounding loses (ledger rows 237 and 238).
+
+Every run says how long it will take before it starts, beside its predicted
+memory, and `mround quantize --dry-run` says it too: the seconds the run records
+at the pace of the 32 GB M5 MacBook Pro that MRound's measured runs were made
+on, by a rule fitted on fifty five of them (`mround/planner/timing.py`), which
+took 0.91 to 1.35 times what it predicts. On another Mac the figure is that
+machine's, a reference point. `mround_run.json` records the prediction as
+`time_check`, and under `result.timing` each block's seconds and search seconds,
+the time between the blocks, and the seconds of the remainder and the export,
+which no run timed before.
+
+RESULTS.md sets Qwen2.5-1.5B-Instruct and Qwen2.5-3B-Instruct at 4 bits against
+round-to-nearest too: MRound 5.65 and 7.17 percent ahead, taking back 57.9 and
+68.0 percent of what rounding loses, so across the four sizes the share follows
+round-to-nearest's own loss rather than the size (ledger rows 234 to 236). The
+Qwen2.5-0.5B-Instruct row at 4 bits is the current tree's: it writes the
+published checkpoint again to the byte (row 233). The README states peak memory
+and time from 0.5 to 7 billion parameters for the first time.
+
+RESULTS.md sets Qwen2.5-7B-Instruct at 4 bits against round-to-nearest at the
+same width, group size and coverage, where no reference arm exists: 7.5829
+against 7.6402, the original 7.3308, MRound 0.75 percent ahead and taking back
+18.5 percent of what rounding loses, where on Qwen2.5-0.5B-Instruct it takes
+back 74.3 percent; it states no bar. The run took 57,008 s on a 32 GB Mac and
+peaked at 28.84 GB, its checkpoint the first written in two shards. At 2 bits
+round-to-nearest scores 3,306.87 on the same model (ledger rows 230 to 232).
+
+`quantize_round_to_nearest` takes `dense_remainder`: it then rounds only the
+linear layers inside the transformer blocks, the ones `quantize`'s block loop
+tunes, and leaves every tensor outside them at the model's own precision, as
+`quantize` does with the same flag, so that a run made with it has a
+round-to-nearest baseline that rounds the same tensors. Off by default, as in
+`quantize`.
+
+RESULTS.md and the README state, for the first time, the Qwen2.5-1.5B-Instruct
+table at 2 bits against the reference's own SignRound v2 tuning and the
+Qwen2.5-7B-Instruct table at 2 bits against both of the reference's tunings.
+
+RESULTS.md and the README say what auto-round 0.16.1, the reference's patch
+release of 2026-10-15, changes on the path the comparisons take: nothing that
+computes a number, by a reading of every file it changed and by the two
+releases run side by side at toy budgets, and at the published recipe its two
+arms are the 0.16.0 checkpoints to the bit.
+
+RESULTS.md and the README state the Qwen2.5-3B-Instruct table at mixed 2.5 bits
+against both of the reference's tunings, with MRound tuned at its own
+allocation, which trails the reference's SignRound v2 tuning, and at the
+reference's, which leads both tunings on the means: there the allocator is what
+MRound loses on.
+
+They state a third such table, MRound's own allocation scored with `quantize`'s
+`sensitivity_gradients="own_width"`, a gradient at each width's own quantized
+point as the reference scores, which leads both of the reference's tunings on
+every seed: the default's gradients, taken once at the widest width, were what
+MRound lost on there. It is now what MRound produces at that size by default
+(Changed, below), and the first table is what it produced before.
+
+RESULTS.md states both gradient sources at mixed 2.5 bits on
+SmolLM2-135M-Instruct and Qwen2.5-0.5B-Instruct, three seeds each on one tree
+(ledger rows 207 to 224), which decided the change below. It says that the
+widest width's gradients, run again on the current tree, reproduce the published
+SmolLM2-135M-Instruct table exactly and score 0.85 percent higher than the
+published Qwen2.5-0.5B-Instruct table on its mean, MRound's lead there moving
+from 20.68 to 20.00 percent against the reference's default tuning and from
+12.88 to 12.13 against its own SignRound v2. It no longer calls the reference's
+leaving its widest option unused a property of the two allocators: given the
+reference's gradients, MRound's allocator leaves it almost unused too.
+
+`quantize` takes a mixed run's allocation as `plan`, a width per block layer,
+with `average_bits`: the run skips its scoring pass and the allocator and tunes
+each layer at the width given, refusing a plan that leaves out a layer a scored
+plan would cover, names one it would not, or uses a width off the menu, and it
+reports the plan's size against the budget rather than holding it there.
+`mround.pipeline.scoring.eligible_block_layers` names those layers. Tuning at
+another planner's allocation, the reference's for one, tells the two planners
+apart from the two tunings.
+
+### Changed
+
+A block whose tuning did not lower its loss now says it "reverted to its untuned
+rounding" where it said "reverted to round-to-nearest": a run that searched its
+scales, as every run below 4 bits does by default, keeps nearest rounding at the
+searched scales, which is not round-to-nearest.
+
+A mixed precision run takes its scoring gradients by the size of what it scores.
+`quantize` and `plan_mixed_precision` default to `sensitivity_gradients="auto"`:
+from 2.5 billion weights in the scored layers up, a gradient at each width's own
+quantized point, as the reference scores (`"own_width"`), and below, one
+gradient per batch at the widest width with every width's perturbation scored
+against it (`"widest"`), the default until now; either can still be named, and
+anything else is refused. Measured at mixed 2.5 bits on three seeds, each
+width's own gradients score 18.1 percent worse than the widest width's on
+SmolLM2-135M-Instruct and 10.9 on Qwen2.5-0.5B-Instruct, on every seed, and 5.29
+percent better on Qwen2.5-3B-Instruct, whose scored layers hold 2.77 billion
+weights (ledger rows 207 to 224, and 181 to 186 against 201 to 206). Every
+published mixed table at 135 million and half a billion parameters is unchanged,
+and at 3 billion the table of MRound as it ships is the one that leads both of
+the reference's tunings on every seed. Qwen2.5-1.5B-Instruct, at 1.31 billion,
+takes the widest gradients and Qwen2.5-7B-Instruct the other, neither measured
+at mixed precision. A plan's record names the source it took, the one asked for
+and the weights it counted (`gradient_source`, `gradient_source_requested`,
+`scored_weights`), and `examples/tune_model.py`'s `--scoring-gradients` takes
+`auto`, its default.
+
+Below 4 bits the learning rate follows the reference's rule: the constant in
+`lr = c / iters` doubles to 2.0 only at a budget of 1000 steps or more, where
+MRound doubled it at every budget. At the standard 200 steps a 2 or 3 bit run
+now starts at 0.005, the reference's rate, where it started at 0.01; at 1000
+steps or more, at 4 bits and above, and in a mixed precision run at its default
+reading, which takes the rate from its 4 bit base, nothing changes. Measured
+with the outlier suppressed loss on, the reference's rate is the better one: on
+Qwen2.5-7B-Instruct at seed 43 it scores 12.7227, ahead of both of the
+reference's tunings (13.0874 and 12.9913), where the earlier rate scored 13.6403
+(ledger rows 153, 154 and 137), and on Qwen2.5-3B-Instruct it is 2.20 percent
+better on the mean of three seeds (rows 151 to 158 against rows 124 to 126). The
+uniform 2 bit tables were measured again at the new rate, every seed of every
+size on one tree (rows 151 to 174), and RESULTS.md and the README lead with
+them: MRound is ahead of the reference's default tuning by 30.52, 17.21, 15.42
+and 1.96 percent from Qwen2.5-0.5B-Instruct to Qwen2.5-7B-Instruct and of its
+own SignRound v2 tuning by 9.10, 6.38, 3.43 and 2.05, on every seed; the earlier
+rate's tables stay in RESULTS.md as its record. `examples/first_quantization.py`
+prints 28.8 and 18.6 percent at 2 and 3 bits where it printed 41.0 and 22.2: on
+its one synthetic layer the doubled rate learned more, and GETTING-STARTED.md
+shows the new table.
+
+RESULTS.md names the basis of the longer recipe's effect: it helps the reference
+about three times as much as it helps MRound in relative terms, 9.30 percent
+against 2.93, and about four times as much in absolute perplexity, 2.65 points
+against 0.67, where it had said "three times" without saying on which.
+
+RESULTS.md and the README state the zero shot task suite on MRound's current 2
+bit checkpoints of Qwen2.5-0.5B-Instruct (ledger rows 175 to 180): on the mean
+of twelve tasks MRound is 1.70 points ahead of the reference's default tuning,
+on every seed, and 0.13 ahead of its own SignRound v2 tuning, behind on two
+seeds of three, which the suite calls a tie. The checkpoints of the earlier rate
+scored 2.05 and 0.49 points ahead, both on every seed, and their tables stay as
+their record.
+
+### Fixed
+
+The scoring pass's estimate of the time left under `own_width` counted each
+width's quantized copy as backward time, so its first line read 102,194 s left
+on a Qwen2.5-3B-Instruct pass that took 4,009, and 3,851 to 14,993 s on
+SmolLM2-135M-Instruct and Qwen2.5-0.5B-Instruct passes of 263 to 694. It now
+projects the backwards alone and adds the copies still to come at the rate the
+built ones took, and the log says when each copy is ready.
+
 ## 0.1.0a5
 
 The release that fixes what took the first full run of a 7 billion parameter

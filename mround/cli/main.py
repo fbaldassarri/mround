@@ -588,14 +588,16 @@ def _dry_run(
     symmetry: Symmetry,
     budget: int | None,
 ) -> int:
-    """Predict the run's peak memory against the budget, and stop.
+    """Predict the run's peak memory against the budget, and its time, and stop.
 
     Returns:
         Zero when the run fits the budget, one when it would be refused, so
         that a script can ask before it commits a machine for hours.
     """
     from mround import api  # noqa: PLC0415
+    from mround.planner.timing import predict_run_time  # noqa: PLC0415
 
+    tuning = _tuning(args)
     check = api.predict_memory(
         args.model,
         bits=args.bits,
@@ -604,13 +606,21 @@ def _dry_run(
         average_bits=args.average_bits,
         candidate_bits=candidates,
         remainder_bits=args.remainder_bits,
-        tuning=_tuning(args),
+        tuning=tuning,
         memory_budget=budget,
     )
     print(f"  {check.describe()}")
     stages = check.prediction.stages
     for stage, reached in sorted(stages.items(), key=lambda item: -item[1]):
         print(f"    {stage:<{_LABEL - 2}}{reached / 1e9:.2f} GB")
+    timing = predict_run_time(
+        check.prediction.model,
+        check.prediction.run,
+        tuning,
+        args.bits,
+        candidate_bits=candidates if args.average_bits is not None else (),
+    )
+    print(f"  {timing.describe()}")
     if check.fits:
         return 0
     print(f"mround: {check.explain()}", file=sys.stderr)

@@ -1,6 +1,6 @@
 # MRound Technical Documentation
 
-**Version: 0.1.0a5. Last updated: 2026-10-18.**
+**Version: 0.1.0a6. Last updated: 2026-11-15.**
 
 This document specifies what MRound does and how it is built. It is the
 authoritative technical reference; where it disagrees with a comment in the
@@ -184,15 +184,32 @@ proxy is the v2 paper's, not yet MRound's; it is a hypothesis this project shoul
 test rather than an established result.
 
 How the score is obtained is part of the specification, because each item
-changes the numbers. The gradients come, by default, from one backward pass
-per batch taken at the widest candidate width, and every width's perturbation
-is scored against them; this is a measured divergence from the reference
-(MEMORY.md D-034), because the reference's procedure, a backward per candidate
-on the model quantized at that width, sends the low widths' gradients through
-a network their own grid has destroyed and measurably starves the late blocks.
-The reference procedure remains available as the ``own_width`` control, where
-the gradient is evaluated at each width's own quantized operating point. In
-either mode the loss is the mean shifted
+changes the numbers. The gradients come from one of two procedures, chosen by
+the size of what is scored (MEMORY.md D-053). Below 2.5 billion weights in the
+scored layers, they come from one backward pass per batch taken at the widest
+candidate width, and every width's perturbation is scored against them
+(``widest``); this is a measured divergence from the reference (D-034), because
+the reference's procedure, a backward per candidate on the model quantized at
+that width, sends the low widths' gradients through a network their own grid has
+damaged, which on the model D-034 measured starved the late blocks. From 2.5
+billion up, they come from the reference's procedure (``own_width``), the
+gradient evaluated at each width's own quantized operating point. Both ends are
+measured at mixed 2.5 on the means of three seeds, every seed alike:
+``own_width`` scores 18.1 percent worse than ``widest`` on
+SmolLM2-135M-Instruct, whose scored layers hold 106 million weights, and 10.9
+worse on Qwen2.5-0.5B-Instruct, 358 million (Q-018); on Qwen2.5-3B-Instruct,
+2.77 billion, it scores 5.29 percent better and puts MRound's own allocation
+ahead of both of the reference's tunings on every seed, where with ``widest``
+the allocation was what lost to the reference's (Q-016, Q-017). Nothing between
+0.36 and 2.77 billion has been measured, so the threshold sits just below the
+one size measured on ``own_width``'s side: Qwen2.5-1.5B-Instruct, 1.31 billion,
+takes ``widest``, and Qwen2.5-7B-Instruct, 6.53 billion, takes ``own_width``,
+neither measured. `quantize` and `plan_mixed_precision` take the choice as
+`sensitivity_gradients`: ``"auto"``, the default, applies the rule, and
+``"widest"`` or ``"own_width"`` overrides it; the plan's record names the source
+taken, the one asked for and the weights counted (`gradient_source`,
+`gradient_source_requested`, `scored_weights`).
+In either mode the loss is the mean shifted
 causal cross-entropy, labels being the inputs themselves, on a small
 calibration draw whose defaults are 128 sequences of 1024 tokens, the budget of
 every mixed head to head from ledger row 38 on (D-031 amended; the reference's
@@ -230,7 +247,15 @@ the reachable integer costs with Pareto pruning; an earlier draft specified a
 discretized budget axis, and MEMORY.md D-012 records why exact integer state
 replaced it. The storage cost of a choice counts the packed codes and the scale
 metadata, the same accounting the export path reports. Measured cost: a few
-hundred layers allocate in seconds against a tuning run that costs hours.
+hundred layers allocate in seconds against a tuning run that costs hours. A run
+can instead be handed its allocation, a width per block layer as `plan` with
+`average_bits`: `quantize` then skips the scoring pass and the allocator and
+tunes each layer at the width given, refusing a plan that leaves out a layer a
+scored plan would cover, names one it would not, or uses a width off the menu,
+and reporting the plan's size against the budget rather than holding it there.
+It exists to tune at the reference's allocation, which separates the two
+planners from the two tunings (MEMORY.md Q-016, where at Qwen2.5-3B-Instruct's
+mixed 2.5 the planner was the gap).
 
 ---
 
@@ -293,7 +318,16 @@ particular is embarrassingly parallel across groups. But Apple GPUs have less
 raw throughput than datacenter parts, so the correct expectation is that MRound
 quantizes larger models than a consumer discrete GPU can, not that it quantizes
 them faster than a datacenter GPU does. The value proposition is capability and
-accessibility, not peak speed.
+accessibility, not peak speed. On the M5 MacBook Pro with 32 GB every MRound run
+in the ledger was made on, the standard recipe takes about an hour at
+Qwen2.5-0.5B, two and a half at 1.5B, four and a half at 3B and thirteen to
+eighteen hours at 7B, whose step runs in four pieces there. Since 2026-11-13 a
+run says how long before it starts, from the model's configuration alone, by a
+rule fitted on fifty five of those runs (`planner/timing.py`): the pace of that
+machine undisturbed, which the runs took 0.91 to 1.35 times, the slow ones
+slowed by the machine and not by the work. It is that machine's time, and on any
+other Mac a reference point; every run records the prediction beside its block
+times, so each one checks it.
 
 **The framework is lazily evaluated and functional.** MLX builds a graph and
 evaluates on demand, and its arrays are immutable. This is a genuine
@@ -371,7 +405,9 @@ and costs and produces an allocation. It is testable with hand-computed
 examples, including adversarial ones where greedy allocation is provably
 suboptimal. It also predicts what a run will hold, from the model's
 configuration and the run's settings alone (`planner/memory.py`), which is
-what lets a run that would not fit be refused before anything is loaded.
+what lets a run that would not fit be refused before anything is loaded, and
+how long it will take on the machine the rule was fitted on
+(`planner/timing.py`), which is said and never enforced.
 
 **The pipeline layer holds all model-specific knowledge**, so adding an
 architecture touches one layer.
@@ -399,12 +435,13 @@ mround/
 │   ├── importance.py      importance matrix accumulation
 │   ├── sensitivity.py     DeltaLoss definition, storage costs, option assembly
 │   ├── memory.py          a run's peak memory, predicted before it starts
+│   ├── timing.py          a run's time, predicted before it starts
 │   └── allocator.py       multiple-choice knapsack via DP
 ├── pipeline/
 │   ├── loader.py          model loading, architecture detection
 │   ├── blocks.py          block discovery, activation capture
 │   ├── calibration.py     dataset handling, batching
-│   ├── scoring.py         whole-model DeltaLoss, backward at the widest width
+│   ├── scoring.py         whole-model DeltaLoss, gradients by model size
 │   ├── device.py          peak and device memory as the array framework reports them
 │   └── runner.py          orchestration, memory discipline
 ├── formats/
@@ -658,15 +695,20 @@ The learning rate is derived from the step budget so that the total distance a
 parameter can travel is independent of how many steps are taken:
 
 ```
-    lr = c / iters        c = 1.0  for b >= 4
-                          c = 2.0  for b < 4
+    lr = c / iters        c = 2.0  for b < 4 and iters >= 1000
+                          c = 1.0  otherwise
 ```
 
 Since every step moves a parameter with a nonzero gradient by exactly `lr` and
 the rate decays linearly to zero, the total possible excursion is about `c/2`.
-For `b >= 4` that is 0.5, exactly the width of `v`'s permitted range in one
+For `c = 1.0` that is 0.5, exactly the width of `v`'s permitted range in one
 direction, which is the property that makes this scaling the right one. Low bit
-widths get the larger constant because they need to explore more of that range.
+widths get the larger constant at a budget of 1000 steps or more, the
+reference's higher quality recipe, where they explore more of that range; at
+the standard 200 steps every width starts at `lr = 0.005`. This is the
+reference's rule (`auto_round/algorithms/quantization/sign_round/config.py`,
+the same from 0.14.2 to 0.16.1), and MRound's since 2026-10-31 (MEMORY.md
+D-052).
 
 Decay is linear from `lr` to exactly zero over the budget, stepped once per
 iteration. The clipping coefficients share `v`'s learning rate; the reference
@@ -698,16 +740,28 @@ parameters, which round to nearest at its initial scale. In effect that is the
 reference's switch for keeping the last step's parameters, always on, plus a
 revert: a recorded divergence (MEMORY.md D-026).
 
-Two divergences from the reference in this rule are deliberate and recorded.
-The reference applies `c = 2.0` only when `iters >= 1000` as well as
-`b <= 3`; MRound applies it at every step budget below 4 bits, so at the
-standard 200 iterations a 2 bit run here starts at `lr = 0.01` where the
-reference starts at `0.005` (MEMORY.md D-010 and the audit entry of
-2026-09-17). And in a mixed precision run the block loop resolves `b` from the
-run's base `bits`, once per block, rather than per layer from the width the
-planner assigned; every published mixed run but row 47 was produced that way,
-and D-043 keeps it by measurement: the per layer reading, available as
-`per_layer_recipe=True`, scored 0.75 percent worse at seed 42 (row 47).
+Until 2026-10-31 MRound applied `c = 2.0` at every step budget below 4 bits, so
+at the standard 200 iterations a 2 bit run started at `lr = 0.01` where the
+reference starts at `0.005` (MEMORY.md D-010 and the audit entry of 2026-09-17).
+Measured with the outlier suppressed loss on, the reference's rate was the
+better one: on Qwen2.5-7B-Instruct at seed 43 it scored 12.7227 against 13.6403,
+ahead of both of the reference's tunings, and on Qwen2.5-3B-Instruct 2.20
+percent better on the mean of three seeds (ledger rows 151 to 158 against rows
+124 to 129, 137 and 138; MEMORY.md D-052). Every uniform 2 and 3 bit result
+published before then was tuned at the earlier rate; the mixed runs, except row
+47, were not, since they take the rate from their 4 bit base. The 2 bit tables
+were then measured again at this rule, every size from 0.5B to 7B ahead of both
+of the reference's tunings on every seed (ledger rows 151 to 174). One
+divergence in this rule remains, deliberate and recorded: in a mixed precision
+run the block loop resolves `b` from the run's base `bits`, once per block,
+rather than per layer from the width the planner assigned; every published mixed
+run but rows 47 and 187 to 192 was produced that way, and D-043 keeps it by
+measurement: the per layer reading, available as `per_layer_recipe=True`, scored
+0.75 percent worse at seed 42 (row 47). At the standard 200 steps the two
+readings now give every layer the same rate and differ only in the outlier rule,
+and measured that way, at mixed 2.5 bits on Qwen2.5-3B-Instruct, the per layer
+reading scored 0.43 to 2.23 percent worse on each of three seeds (rows 187 to
+192 against rows 181 to 186).
 
 Default step budget: 200 iterations per block, batch size 8, sequence length
 2048, 128 calibration samples; group size 64 by default, in `QuantScheme`,
@@ -1098,9 +1152,16 @@ codes, the fraction of rounding decisions that differ, and layer output error.
 generator have not been written. What exists instead is a model level
 comparison harness, which quantizes one model with both implementations under
 matched settings and scores both with one evaluator (MEMORY.md D-037), and
-`scripts/check_mlx.sh`. Seed-matched
-trajectory comparison across frameworks is explicitly not attempted, because
-it is not achievable and pursuing it wastes effort.
+`scripts/check_mlx.sh`. Where a run has no
+reference arm, as a 7B at 4 bits has none, the same harness sets its checkpoint
+against round-to-nearest at the same width, group size and coverage
+(`quantize_round_to_nearest`, with `dense_remainder` where the run left the
+remainder dense) and against the original, all three scored by one evaluator,
+and records a `parity-rtn` row, which states no bar (MEMORY.md D-054); the task
+suite on its three checkpoints is a `zeroshot` row like a head to head row's,
+naming it as `rtn_row`, with round-to-nearest in the reference's place (D-056).
+A trajectory comparison matched seed for seed across frameworks is explicitly
+not attempted, because it is not achievable and pursuing it wastes effort.
 
 **Integration tests.** *(Planned.)* End to end on models small enough to run
 in continuous integration. `tests/integration/` is empty; the end to end path
